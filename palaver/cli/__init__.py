@@ -22,11 +22,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from palaver.cli import diagnose
+from palaver.cli import diagnose, fixture_lint
 from palaver.logging_setup import setup_logging
 
 #: Every registered subcommand module, in help-listing order.
-SUBCOMMANDS = (diagnose,)
+SUBCOMMANDS = (diagnose, fixture_lint)
 
 
 def build_parser() -> argparse.ArgumentParser:
