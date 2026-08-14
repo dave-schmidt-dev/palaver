@@ -91,8 +91,8 @@ rationale: Measured, not assumed. Spike run 1: E4B extracted 17/17 user decision
   be waiting on them — the single most costly error this system can make.
 
 ### INV-8 — Human-typed input and harness-injected content are distinguished at ingest
-area: ["palaver/ingest/normalize.py", "palaver/ingest/adapters/**/*.py"]
-gate_test: tests/test_normalize.py::test_injected_content_is_not_tier_one
+area: ["palaver/extract/normalize.py", "palaver/extract/quote_gate.py", "palaver/ingest/adapters/**/*.py"]
+gate_test: tests/test_extraction.py::test_injected_content_is_not_tier_one
 threshold: 3
 rationale: Tier-1 provenance means "the user said this", and it is the tier every other tier defers
   to under INV-5, so a mis-tagged channel corrupts the memory store by construction. This is not
