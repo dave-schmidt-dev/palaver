@@ -1586,8 +1586,10 @@ def test_supersede_guards_are_added_by_migration_5_not_migration_1(tmp_path):
     every store created before it permanently unprotected.
     """
     db_path = tmp_path / "palaver.db"
-    pre_v5 = tuple(m for m in SCHEMA_MIGRATIONS if m.version <= 4)
-    migrate(db_path, migrations=pre_v5)
+    # `target_version=4` rather than a filtered migration tuple: the runner
+    # still holds the real SCHEMA_MIGRATIONS and merely stops early, which is
+    # what a store created before migration 5 shipped actually looks like.
+    assert migrate(db_path, target_version=4) == 4
 
     conn = connect(db_path)
     try:
@@ -1663,6 +1665,37 @@ def test_supersede_guards_are_added_by_migration_5_not_migration_1(tmp_path):
         )
         conn.commit()
         assert successor_of(conn, memory_id) == successor_id
+        # The derived view now names the predecessor, on the upgraded store.
+        assert conn.execute("SELECT memory_id FROM superseded_memories").fetchall() == [
+            (memory_id,)
+        ]
+
+        # A second successor for that same predecessor is refused here too.
+        second_correction = (
+            project_id,
+            session_id,
+            "fixture: a rival correction after migration 5",
+            "observer",
+            TIER_USER_INSTRUCTION,
+            memory_id,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="at most one successor"):
+            conn.execute(
+                "INSERT INTO memories"
+                "(project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                second_correction,
+            )
+        # ...and the refusal survives losing the trigger, because migration 5
+        # gave this upgraded store the real partial unique index as well.
+        conn.execute("DROP TRIGGER memories_one_successor_guard")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            conn.execute(
+                "INSERT INTO memories"
+                "(project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                second_correction,
+            )
     finally:
         conn.close()
 
