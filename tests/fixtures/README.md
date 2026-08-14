@@ -134,29 +134,23 @@ time, so withholding it keeps the corroboration column reproducible.
 
 - **case:** QUESTION
 - **ground truth:** AWAITING_HUMAN
-- **derived today:** WORKING
+- **derived today:** AWAITING_HUMAN
 - **phase 3 target:** QUESTION
-- **boundary basis:** unresolved_tool_use
+- **boundary basis:** unresolved_human_blocking_tool_use
 - **last message-bearing record:** line 2, an `assistant` record
 - **unresolved tool_use:** yes — `tu-1`, an `AskUserQuestion` call, never answered
 - **latest tool outcome:** none in the window
 - **channel:** line 1 is human-channel
 - **derivation:** The last message-bearing record is line 2, an `assistant`
   record whose only content block is a `tool_use` named `AskUserQuestion`,
-  with no `tool_result` for `tu-1` after it. The walk reaches that block and
-  stops with `ended = FALSE`, so rule 4 returns WORKING.
-- **divergence:** Ground truth is AWAITING_HUMAN; the derivation above returns
-  WORKING, and the derivation is what the code does. An unresolved
+  with no `tool_result` for `tu-1` after it. `AskUserQuestion` is in
+  `HUMAN_BLOCKING_TOOL_NAMES`, read from that block's `name`, so the walk
+  treats the call as resolved by the human rather than by a `tool_result`
+  and stops with `ended = TRUE`, returning AWAITING_HUMAN. An unresolved
   `AskUserQuestion` is not an agent that is busy — it is an agent that has
-  stopped and put a prompt in front of its human. `derive_turn_boundary` tests
-  only whether a `tool_use` block *exists*, never which tool it names, so it
-  cannot tell this apart from an unresolved `Bash` call. The error runs in the
-  costly direction: it reports WORKING for a session that needs its human, and
-  the human sees no reason to look. The deciding evidence is already in the
-  record at `message.content[0].name` and is simply not read, which makes this
-  a fix Phase 3.6 can make structurally rather than one that needs a model.
-  This fixture is the reason the corpus tracks ground truth separately from
-  the derived value; do not close the gap by relabelling it.
+  stopped and put a prompt in front of its human, and the fix keys on the
+  tool name rather than merely inverting the unresolved-`tool_use` rule: an
+  unresolved `Bash` call in the same shape still returns WORKING.
 
 ### `finished-session.jsonl`
 

@@ -24,10 +24,14 @@ tests assert derived status against labels in `tests/fixtures/README.md`, and
 assert that those labels state checkable structural facts rather than
 authorial intent — "constructed to be WORKING" is circular and is rejected.
 
-Ground truth and the derived value are tracked as separate columns on purpose.
-One fixture diverges: an unresolved `AskUserQuestion` is a session blocked on
-its human that Phase 1 reports as WORKING. The divergence set is asserted to
-be *exactly* that one fixture, so a future regression cannot quietly join it.
+Ground truth and the derived value are tracked as separate columns on
+purpose, and `KNOWN_DIVERGENCES` is currently empty: an unresolved
+`AskUserQuestion` used to be a session blocked on its human that Phase 1
+reported as WORKING, until `derive_turn_boundary` started reading the
+`tool_use` block's `name` (task 4). The divergence set is still asserted to
+be *exactly* `KNOWN_DIVERGENCES` — now the empty set — rather than dropped,
+so a future regression that makes any fixture's derived status stop matching
+its ground truth fails loudly here instead of being silently absorbed.
 
 No real session store (`~/.claude/`, `~/.codex/`,
 `~/.local/share/opencode/`) is opened, globbed, or read by this module or by
@@ -72,11 +76,15 @@ REQUIRED_CASES = frozenset(
     }
 )
 
-#: The one fixture whose ground truth and derived status disagree, named
-#: exhaustively. Asserting the set is *equal* to this — not that it contains
-#: it — is what stops a future regression from being absorbed into "known
-#: divergence" without anyone deciding to accept it.
-KNOWN_DIVERGENCES = frozenset({"question-askuserquestion-unresolved.jsonl"})
+#: Fixtures whose ground truth and derived status disagree, named
+#: exhaustively. Empty today — `question-askuserquestion-unresolved.jsonl`
+#: was the one entry until task 4 fixed the underlying defect (an unresolved
+#: `AskUserQuestion` derived WORKING instead of AWAITING_HUMAN). Kept as a
+#: named, asserted-equal set rather than deleted: asserting the set is
+#: *equal* to this — not that it contains it, and not just dropping the
+#: check now that it is empty — is what stops a future regression from being
+#: absorbed into "known divergence" without anyone deciding to accept it.
+KNOWN_DIVERGENCES = frozenset()
 
 
 # --- fixture corpus helpers --------------------------------------------------
@@ -562,25 +570,29 @@ def test_ground_truth_matches_derived_status_except_for_known_divergences():
             assert entry["ground truth"] == _status(_records(FIXTURES / name)).value
 
 
-def test_unresolved_askuserquestion_is_reported_as_working_and_recorded_as_a_defect():
-    """Pins the one known-wrong answer so a fix is visible as a test change.
+def test_unresolved_askuserquestion_is_reported_as_awaiting_human():
+    """Pins the fix: an unresolved `AskUserQuestion` now reports AWAITING_HUMAN.
 
     An unresolved `AskUserQuestion` is a session that has stopped and put a
-    prompt in front of its human. Phase 1 checks only that a `tool_use` block
-    exists, never which tool it names, so it reports WORKING — the costly
-    direction, because the human sees no reason to look. The evidence needed
-    is already in the record, so this is a Phase 3.6 fix and not a model
-    problem, and it is asserted rather than hidden.
+    prompt in front of its human, not one still busy. Before task 4,
+    `derive_turn_boundary` checked only that a `tool_use` block exists, never
+    which tool it names, and reported WORKING — the costly direction, because
+    the human saw no reason to look. The fix reads the tool name straight off
+    the block, so this fixture's ground truth and derived status now agree
+    and it no longer belongs in `KNOWN_DIVERGENCES`.
     """
     name = "question-askuserquestion-unresolved.jsonl"
     entry = _metadata()[name]
     assert entry["ground truth"] == Status.AWAITING_HUMAN.value
-    assert entry["derived today"] == Status.WORKING.value
+    assert entry["derived today"] == Status.AWAITING_HUMAN.value
     assert entry["phase 3 target"] == Status.QUESTION.value
-    assert _status(_records(FIXTURES / name)) is Status.WORKING
+    assert name not in KNOWN_DIVERGENCES
 
-    # The tool name is present in the record: the fix needs no new evidence.
     records = _records(FIXTURES / name)
+    assert _status(records) is Status.AWAITING_HUMAN
+
+    # Non-vacuity: the tool name really is what the record carries, and it is
+    # what the fix reads — not a relabelled fixture with the evidence gone.
     assert records[-1]["message"]["content"][0]["name"] == "AskUserQuestion"
 
 

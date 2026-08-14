@@ -32,6 +32,7 @@ from palaver.observer.turn_boundary import (
     BASIS_SOURCE_UNREADABLE,
     BASIS_TOOL_RESULT_PENDING,
     BASIS_UNDECODABLE_RECORD,
+    BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE,
     BASIS_UNRESOLVED_TOOL_USE,
     derive_turn_boundary,
     observe_session,
@@ -277,6 +278,57 @@ def test_no_message_bearing_record_is_unknown(tmp_path):
     assert _status(bookkeeping) is Status.UNKNOWN
 
     assert _observe(conversational).signals.agent_turn_ended is Tri.FALSE
+
+
+# --- an unresolved human-blocking tool_use ends the turn, by name only ------
+
+
+def test_unresolved_human_blocking_tool_use_ends_the_turn_by_name(tmp_path):
+    """The tool's name, not merely a `tool_use` block's presence, decides.
+
+    An unresolved `AskUserQuestion` is an agent that has stopped and put a
+    prompt in front of its human — the turn already ended even though the
+    call itself never got a `tool_result`. The control is the identical
+    shape with `Bash` in place of `AskUserQuestion`: it must stay WORKING,
+    which is what proves the fix keys on the tool name rather than simply
+    inverting the unresolved-`tool_use` rule (that would flip both cases).
+    """
+    question = _session(tmp_path, "question", [_human(), _tool_use("AskUserQuestion")])
+    bash = _session(tmp_path, "bash", [_human(), _tool_use("Bash")])
+
+    question_observation = _observe(question)
+    assert question_observation.signals.agent_turn_ended is Tri.TRUE
+    assert question_observation.boundary.basis == BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE
+    assert derive_status(question_observation.signals) is Status.AWAITING_HUMAN
+
+    # Positive control: the same shape with an ordinary tool stays WORKING.
+    bash_observation = _observe(bash)
+    assert bash_observation.signals.agent_turn_ended is Tri.FALSE
+    assert bash_observation.boundary.basis == BASIS_UNRESOLVED_TOOL_USE
+    assert derive_status(bash_observation.signals) is Status.WORKING
+
+
+def test_resolved_askuserquestion_is_awaiting_human_from_the_ordinary_rule(tmp_path):
+    """Over-trigger control: a resolved `AskUserQuestion` must not take the new path.
+
+    A fix that matched the tool name anywhere in the record, rather than only
+    on an *unresolved* `tool_use` block, would still land here by accident
+    once the question is answered and the agent replies. This fixture answers
+    it and lets the agent reply, so it must derive AWAITING_HUMAN through the
+    ordinary `assistant_final` basis, not the human-blocking one.
+    """
+    path = _session(
+        tmp_path,
+        "answered",
+        [_human(), _tool_use("AskUserQuestion"), _tool_result(), _assistant()],
+    )
+
+    observation = _observe(path)
+
+    assert observation.signals.agent_turn_ended is Tri.TRUE
+    assert observation.boundary.basis == BASIS_ASSISTANT_FINAL
+    assert observation.boundary.basis != BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE
+    assert derive_status(observation.signals) is Status.AWAITING_HUMAN
 
 
 # --- corroboration is never a dependency -------------------------------------

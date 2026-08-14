@@ -30,7 +30,7 @@ from `WORKING` to `AWAITING_HUMAN` (say "look at this session" about one that
 is actually busy) but never the reverse, so its failure mode costs attention
 rather than silence.
 
-The four cases the backwards walk resolves, in the order it tests them:
+The five cases the backwards walk resolves, in the order it tests them:
 
 1. A `user` record carrying `tool_result` blocks — a tool outcome, not a
    human turn. Checked *structurally, before* classification: a tool result
@@ -38,9 +38,18 @@ The four cases the backwards walk resolves, in the order it tests them:
    classify as the human channel by accident.
 2. A human-channel `user` record — the human spoke and the agent owes a
    reply, so the agent holds the turn.
-3. An `assistant` record with a `tool_use` block — nothing conversational
-   follows it, so the call is unresolved and the agent is mid-turn.
-4. An `assistant` record with no `tool_use` block — every call resolved,
+3. An `assistant` record with an unresolved `tool_use` block naming a
+   *human-blocking* tool (`HUMAN_BLOCKING_TOOL_NAMES`, e.g.
+   `AskUserQuestion`) — the call never resolved, but the tool itself only
+   resolves by a human answering it. An agent that stopped to ask is not
+   busy; it put a prompt in front of its human and control is already back
+   with them, so `ended = TRUE` despite the open call. Checked by *name*,
+   read from `message.content[…].name` — not by whether a `tool_use` block
+   merely exists, which is what let this case fall into the next one before.
+4. An `assistant` record with an unresolved `tool_use` block naming any
+   other tool — nothing conversational follows it, so the call is
+   unresolved and the agent is mid-turn.
+5. An `assistant` record with no `tool_use` block — every call resolved,
    nothing after it: control is back with the human.
 
 Anything else (no conversational record at all, or a record that did not
@@ -79,11 +88,22 @@ logger = logging.getLogger(__name__)
 #: boundary itself (see `_corroborate`).
 DEFAULT_ACTIVE_WITHIN = timedelta(minutes=5)
 
+#: Tool names whose call can only ever be resolved by the human — the agent
+#: has stopped and put a prompt in front of them, not started work it will
+#: report back on. An unresolved call naming one of these means the turn
+#: ended (`Tri.TRUE`) even though the `tool_use` block itself never got a
+#: `tool_result`. Read from `message.content[…].name`, already present on
+#: every `tool_use` block; no new evidence is needed to check it. Phase 1
+#: reports this as `AWAITING_HUMAN` (there is no reachable `QUESTION` yet —
+#: see `palaver.observer.signals`); Phase 3.6 may refine it further.
+HUMAN_BLOCKING_TOOL_NAMES = frozenset({"AskUserQuestion"})
+
 # Why the boundary came out the way it did. Reported rather than inferred by a
 # caller, so `palaver diagnose --coverage` can show *which* structure carried
 # each session and a regression shows up as a shift in that distribution.
 BASIS_ASSISTANT_FINAL = "assistant_final"
 BASIS_UNRESOLVED_TOOL_USE = "unresolved_tool_use"
+BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE = "unresolved_human_blocking_tool_use"
 BASIS_TOOL_RESULT_PENDING = "tool_result_pending"
 BASIS_HUMAN_MESSAGE_PENDING = "human_message_pending"
 BASIS_NO_CONVERSATIONAL_RECORD = "no_conversational_record"
@@ -95,6 +115,7 @@ BASIS_SOURCE_UNREADABLE = "source_unreadable"
 BASIS_NAMES: tuple[str, ...] = (
     BASIS_ASSISTANT_FINAL,
     BASIS_UNRESOLVED_TOOL_USE,
+    BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE,
     BASIS_TOOL_RESULT_PENDING,
     BASIS_HUMAN_MESSAGE_PENDING,
     BASIS_NO_CONVERSATIONAL_RECORD,
@@ -227,9 +248,21 @@ def derive_turn_boundary(
             # Harness-injected: not a conversational turn. Look through it.
             continue
 
-        if _blocks_of_type(record, "tool_use"):
-            # Nothing conversational follows this call, so it is unresolved.
-            ended, basis, boundary_index = Tri.FALSE, BASIS_UNRESOLVED_TOOL_USE, index
+        tool_use_blocks = _blocks_of_type(record, "tool_use")
+        if tool_use_blocks:
+            if any(block.get("name") in HUMAN_BLOCKING_TOOL_NAMES for block in tool_use_blocks):
+                # The call never resolved, but the tool itself only resolves
+                # by the human answering it: the agent stopped and put a
+                # prompt in front of them, so control is already back with
+                # the human despite the open call.
+                ended, basis, boundary_index = (
+                    Tri.TRUE,
+                    BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE,
+                    index,
+                )
+            else:
+                # Nothing conversational follows this call, so it is unresolved.
+                ended, basis, boundary_index = Tri.FALSE, BASIS_UNRESOLVED_TOOL_USE, index
             break
 
         ended, basis, boundary_index = Tri.TRUE, BASIS_ASSISTANT_FINAL, index
