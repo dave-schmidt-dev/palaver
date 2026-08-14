@@ -48,6 +48,7 @@ markers = [
     "inv3: INV-3 — the OpenCode account and credential tables stay unreachable",
     "inv4: INV-4 — memory is append-only; no DELETE path anywhere in palaver/memory",
     "inv5: INV-5 — memory tier is assigned at insert and immutable thereafter",
+    "inv6: INV-6 — every memory carries at least one evidence anchor, enforced at write time",
     "inv8: INV-8 — injected content never reaches a user-authored channel",
     "inv9: INV-9 — no outbound HTTP client exists in the Phase 1 import graph",
 ]

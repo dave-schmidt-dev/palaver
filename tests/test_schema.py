@@ -292,8 +292,8 @@ def test_memory_evidence_requires_a_transcript_or_event_link(tmp_path):
 
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO memory_evidence(memory_id, quote) VALUES (?, ?)",
-                (memory_id, "a quote with no evidence link"),
+                "INSERT INTO memory_evidence(memory_id, start_offset, end_offset) VALUES (?, ?, ?)",
+                (memory_id, 0, 5),
             )
     finally:
         conn.close()

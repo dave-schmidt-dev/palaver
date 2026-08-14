@@ -5,6 +5,9 @@ external-content search over `transcript_chunks`, `events`, and `memories`.
 Migration 3 adds `memories_tier_immutable`, a trigger enforcing INV-5's
 "tier is assigned at insert and never changes" rule at the database layer
 (see `palaver/memory/write.py` for why a Python-only guard is not enough).
+Migration 4 rebuilds `memory_evidence` to carry `start_offset`/`end_offset`
+span anchors instead of a copied `quote` string (see
+`palaver/memory/evidence.py`).
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -227,6 +230,35 @@ _V3_STATEMENTS = (
     """,
 )
 
+# INV-6: a memory's evidence is a pointer into stored raw transcript, never a
+# copied string — task 2.2 (palaver/memory/evidence.py). `quote` is replaced
+# by `start_offset`/`end_offset`, a span resolved live against the current
+# content of the referenced transcript_chunks or events row, so a quote can
+# never silently drift from its source between write time and read time.
+# SQLite has no ALTER TABLE that swaps a NOT NULL TEXT column for two NOT
+# NULL INTEGER columns in place, so this drops and recreates the table under
+# its own name rather than copying rows forward: any memory_evidence row
+# written before this migration carries only a `quote` string, with no
+# offsets to backfill from, so there is no lossless copy path — and no real
+# deployment exists yet for this pre-release project to make that a live
+# concern. The `transcript_chunk_id IS NOT NULL OR event_id IS NOT NULL`
+# CHECK carries forward unchanged from migration 1.
+_V4_STATEMENTS = (
+    "DROP TABLE memory_evidence",
+    f"""
+    CREATE TABLE memory_evidence (
+        id INTEGER PRIMARY KEY,
+        memory_id INTEGER NOT NULL REFERENCES memories(id),
+        transcript_chunk_id INTEGER REFERENCES transcript_chunks(id),
+        event_id INTEGER REFERENCES events(id),
+        start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+        end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+        created_at TEXT NOT NULL {_CREATED_AT_DEFAULT},
+        CHECK (transcript_chunk_id IS NOT NULL OR event_id IS NOT NULL)
+    )
+    """,
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -248,6 +280,14 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
         version=3,
         description="memories_tier_immutable trigger: tier can never be UPDATEd (INV-5)",
         statements=_V3_STATEMENTS,
+    ),
+    Migration(
+        version=4,
+        description=(
+            "memory_evidence rebuilt: start_offset/end_offset span anchors replace the "
+            "copied quote column (INV-6)"
+        ),
+        statements=_V4_STATEMENTS,
     ),
 )
 
