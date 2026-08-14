@@ -41,6 +41,7 @@ always-include rule a bounded tail seek instead of a full-archive scan.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -50,6 +51,8 @@ from pathlib import Path
 from typing import BinaryIO
 
 from palaver.ingest.cursors import Cursor
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SINCE = timedelta(hours=24)
 DEFAULT_OUTER_WINDOW = timedelta(days=7)
@@ -98,8 +101,13 @@ class TailResult:
         events: Canonical events read since the passed-in cursor, in file
             order. Empty if nothing new and complete was available.
         cursor: The cursor to persist and pass in next time. Always at or
-            past the input cursor's offset, and never past the last
-            complete record read.
+            past the input cursor's offset and never past the last complete
+            record read — *except* when the source has shrunk below the
+            input cursor's offset (truncated, rotated, or replaced), in
+            which case the returned cursor is repaired to a position within
+            the file's current length, which is necessarily behind the
+            input cursor. See `read_complete_records` for why that repair
+            is the deliberate choice rather than a bug.
     """
 
     events: tuple[Event, ...]
@@ -134,19 +142,67 @@ def read_complete_records(path: str | Path, start_offset: int) -> tuple[list[byt
     a later call, once complete) rather than lost or handed to a JSON
     parser half-written.
 
+    Shrink recovery. These stores are expected to only ever grow between
+    calls; a seek to `start_offset` assumes that. If `path` is now shorter
+    than `start_offset` — truncated in place, or a different, shorter file
+    swapped in under the same path (log rotation, or a store that recycles
+    filenames) — that assumption is false, and a plain seek would land past
+    the new end-of-file. `read()` from there returns `b""`, `new_offset`
+    would stay pinned at the stale `start_offset` forever, and every future
+    call would repeat the same past-EOF seek: the session goes silent with
+    no error, which is exactly the failure INV-7's `UNKNOWN` status exists
+    to catch further up the stack (this function has no status to set; it
+    is below that stack, so the only tool it has is not doing this).
+    Instead, a size check before the seek (`os.stat`, not an `open` — INV-2
+    is unaffected) detects the shrink, logs it at WARNING so the recovery
+    is visible in the log rather than a silent behavior change, and reads
+    from offset 0 as if `path` had never been read before. Offset 0 is the
+    deliberate choice, not the only possible one: a truncated-in-place file
+    could in principle be resynchronized by scanning forward for a known
+    record boundary, but a swapped-in file has no relationship at all to
+    what the old offset pointed into, and the two cases are indistinguishable
+    from a stat alone. Treating both as "unknown content, read it all" costs
+    a bounded, one-time re-ingest of records already seen under the old
+    cursor (the consuming adapter sees them again) — the cheaper failure
+    next to the alternative, which is silently losing every record the
+    replacement file ever writes for the rest of the session's life. The
+    residual race — the file shrinks again between this `stat` and the
+    `seek`/`read` moments later — is not specially handled; it self-heals on
+    the next call, which will detect the (now further) shrink the same way.
+
     Args:
         path: Path to the JSONL source file.
         start_offset: Byte offset to start reading from (a cursor's offset).
 
     Returns:
         A `(records, new_offset)` pair. `records` is the list of complete
-        line payloads (without their trailing newline), in file order.
-        `new_offset` is where the caller's cursor should advance to; it is
-        always `start_offset` plus the byte length of exactly the complete
-        records returned, so it never points past the last complete record.
+        line payloads (without their trailing newline), in file order; empty
+        if nothing new and complete was available, including immediately
+        after a shrink recovery where the replacement file is itself empty
+        or not yet a complete line — that is not a returned failure, since
+        `new_offset` is still repaired to a valid position and the next call
+        will pick up whatever the replacement file gains. `new_offset` is
+        where the caller's cursor should advance to: normally `start_offset`
+        plus the byte length of exactly the complete records returned, so it
+        never points past the last complete record; after a detected shrink,
+        the same computation runs from 0 instead of `start_offset`, so the
+        returned offset can be *less* than `start_offset` — it is always,
+        though, within `path`'s current length at the time of the read.
     """
+    size = os.stat(path).st_size
+    effective_offset = start_offset
+    if size < start_offset:
+        logger.warning(
+            "%s shrank below its cursor (offset %d > size %d); treating as "
+            "truncated or replaced and re-ingesting from 0",
+            path,
+            start_offset,
+            size,
+        )
+        effective_offset = 0
+
     with open_source_readonly(path) as f:
-        f.seek(start_offset)
+        f.seek(effective_offset)
         raw = f.read()
 
     lines = raw.split(b"\n")
@@ -157,7 +213,7 @@ def read_complete_records(path: str | Path, start_offset: int) -> tuple[list[byt
     complete = [line for line in lines if line]
 
     consumed = len(raw) - len(trailing_partial)
-    new_offset = start_offset + consumed
+    new_offset = effective_offset + consumed
     return complete, new_offset
 
 

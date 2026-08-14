@@ -10,6 +10,16 @@ other half — never advancing past a torn, not-yet-complete write — lives in
 `palaver.ingest.adapters.base.read_complete_records`, which is what actually
 produces the offsets this module persists.
 
+That no-re-ingest guarantee has one deliberate exception, and it lives in
+`read_complete_records` rather than here: if a source file shrinks below a
+stored offset — truncated in place, or replaced by a shorter file under the
+same path — the offset no longer refers to anything, and reading from it
+would return empty forever while the session went silently dark. Recovery
+re-reads from zero, re-ingesting once, because a bounded duplicate is
+recoverable and a permanently invisible session is not. A cursor handed back
+after that repair is *behind* the one passed in, which is the only case where
+that happens.
+
 A cursor is written to its own file, one per session, so one session's
 write can never corrupt another's. Each write goes to a temp file in the
 same directory and is atomically renamed into place with `os.replace`, so a

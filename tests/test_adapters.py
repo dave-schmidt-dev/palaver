@@ -13,6 +13,7 @@ trailing `tool_use`.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -243,6 +244,72 @@ def test_tail_cursor_advances_only_past_complete_record_with_partial_trailing(tm
 
     assert len(second_result.events) == 1
     assert second_result.events[0].payload == {"kind": "message", "seq": 2}  # not re-seen
+
+
+def test_tail_recovers_when_source_shrinks_below_stored_cursor(tmp_path, caplog):
+    """A source shorter than the stored cursor is detected and recovered, not
+    read as silence forever (Task 3, TASKS.md).
+
+    Before this fix, seeking to an offset past a shrunk file's new EOF read
+    as an empty tail with the cursor pinned at the stale offset: the session
+    would go permanently silent with no error on every future tail, since
+    `new_offset` never advances past a past-EOF seek. This truncates the
+    fixture in place to simulate the shrink (rotation or replacement takes
+    the same path, since the mechanism keys on size, not the file's inode
+    history) and asserts the very next tail both surfaces the replacement's
+    content and repairs the cursor into the new file, rather than repeating
+    the silent-empty result the old code would have produced forever after.
+    """
+    caplog.set_level(logging.WARNING)
+    store = tmp_path / "store"
+    store.mkdir()
+    path = store / "session-1.jsonl"
+
+    _write_records(path, [{"kind": "message", "seq": n} for n in range(1, 20)])
+    adapter = FixtureAdapter(store)
+    grown_result = adapter.tail(path, Cursor())
+    stale_cursor = grown_result.cursor
+    assert stale_cursor.offset == path.stat().st_size  # sanity: cursor caught all the way up
+
+    # Shrink the file far below the stale cursor, as if a new, shorter
+    # session's content had landed under the same path/key.
+    _write_records(path, [{"kind": "message", "seq": 1}])
+    assert path.stat().st_size < stale_cursor.offset  # the shrink this test targets
+
+    recovered = adapter.tail(path, stale_cursor)
+
+    assert len(recovered.events) == 1  # not silently empty forever
+    assert recovered.events[0].payload == {"kind": "message", "seq": 1}
+    assert recovered.cursor.offset <= path.stat().st_size  # repaired within the file's new length
+    assert any("shrank below its cursor" in r.message for r in caplog.records)
+
+
+def test_tail_shrink_recovery_does_not_fire_on_an_ordinary_caught_up_retail(tmp_path, caplog):
+    """Positive control for the shrink check: keying on `offset > size`, not on
+    every re-tail with a nonzero cursor.
+
+    Without this control, a shrink-recovery implementation that (incorrectly)
+    triggered on any cursor offset other than 0 — rather than specifically
+    on the cursor being past the file's current size — would still pass the
+    test above, since that scenario also has a nonzero cursor. Re-tailing a
+    file that has not grown since the cursor was last saved must stay a
+    plain, silent no-op: no new events, cursor unchanged, and critically no
+    shrink warning logged, proving the branch above did not run.
+    """
+    caplog.set_level(logging.WARNING)
+    store = tmp_path / "store"
+    store.mkdir()
+    path = store / "session-1.jsonl"
+    _write_records(path, [{"kind": "message", "seq": 1}])
+    adapter = FixtureAdapter(store)
+    caught_up = adapter.tail(path, Cursor())
+    assert caught_up.cursor.offset == path.stat().st_size
+
+    steady = adapter.tail(path, caught_up.cursor)
+
+    assert steady.events == ()
+    assert steady.cursor.offset == caught_up.cursor.offset
+    assert caplog.records == []
 
 
 def test_cursor_resumes_after_restart_without_reingest_or_skip(tmp_path):
