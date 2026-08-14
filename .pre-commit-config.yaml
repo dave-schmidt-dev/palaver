@@ -1,0 +1,19 @@
+# Pre-commit hooks: fast checks only (lint + dead-code detection).
+#
+# The heavy suite belongs in a pre-push hook, but that hook is NOT wired yet:
+# the Phase 1 gate is `pytest -q tests/ && ruff check . && palaver status
+# --once`, and `palaver status` does not exist until plan task 1.9. The
+# pre-push stage is added there, against the real gate command, rather than
+# stubbed here against a command that would fail on every push until then.
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (lint + dead-code)
+        entry: uv run ruff check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+        stages: [pre-commit]

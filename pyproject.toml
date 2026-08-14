@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "palaver"
+version = "0.1.0"
+description = "Local-first observer, memory, and situational awareness"
+requires-python = ">=3.14"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["palaver*"]
+exclude = ["tests*", "spikes*"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "pytest>=7.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "F",  # pyflakes — the dead-code family: unused imports (F401) and
+          # variables (F841), plus undefined names and f-strings with no
+          # placeholders. Selected whole rather than rule-by-rule so a new
+          # class of dead code is caught by default instead of by amendment.
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "I",  # import sorting — deterministic order keeps diffs small
+]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
