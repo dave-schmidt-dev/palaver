@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / JS
+node_modules/
+*.tsbuildinfo
+
+# Secrets / local state (never commit)
+etc/bws-config.txt
+etc/*.local.yaml
+*.local
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Build / logs
+dist/
+build/
+*.log
+.logs/
+
+# Working docs kept local — HISTORY/TASKS accumulate operational detail
+# (real names, amounts, dates) that must not enter git history. Both cases.
+HISTORY.md
+TASKS.md
+history.md
+tasks.md
+
+# Agent workflow byproducts (created by :verify / :contrarian / :overnight / :spike)
+verifications/
+overnight-log.md
+overnight-report.html
+.verifier_prompt.md
+spikes/
+
+# Personal opencode agent-permission config (not shared team config)
+opencode.jsonc
+
+# Harness scratch (Claude Code session state, not project config)
+.claude/scheduled_tasks.lock
+
+# Design notes stay local (owner decision 2026-08-14): brief, research, and
+# architecture notes quote real agent-session structure and real project names
+# on this machine, which is exactly the INV-9 surface. The public repo ships
+# code, README, and INVARIANTS only.
+docs/
