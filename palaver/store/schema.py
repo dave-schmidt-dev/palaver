@@ -2,6 +2,9 @@
 
 Migration 1 creates the nine core tables. Migration 2 adds FTS5
 external-content search over `transcript_chunks`, `events`, and `memories`.
+Migration 3 adds `memories_tier_immutable`, a trigger enforcing INV-5's
+"tier is assigned at insert and never changes" rule at the database layer
+(see `palaver/memory/write.py` for why a Python-only guard is not enough).
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -88,9 +91,11 @@ _V1_STATEMENTS = (
     # ("Supersession as a derived view, never a stored flag") derives current
     # status from whether some other row's `supersedes` points at it. `tier`
     # encodes the INV-5 provenance ordering (1 = highest, explicit user
-    # instruction, down to 5 = observer speculation); the CHECK/trigger that
-    # enforces a lower tier can never supersede a higher one is task 2.1's
-    # responsibility in palaver/memory/, per the INV-5 gate test area.
+    # instruction, down to 5 = observer speculation); migration 3 below adds
+    # the trigger that makes `tier` immutable once written (task 2.1). The
+    # separate rule that a lower tier can never *supersede* a higher one —
+    # i.e. a CHECK/trigger on the `supersedes` link itself — is task 2.4's,
+    # per tests/test_memory.py::test_lower_tier_cannot_supersede_higher_tier.
     f"""
     CREATE TABLE memories (
         id INTEGER PRIMARY KEY,
@@ -202,6 +207,26 @@ _V2_STATEMENTS = tuple(
     for statement in _fts_statements(source_table, text_column)
 )
 
+# INV-5: tier is assigned once, at insert, and never changes. A Python-only
+# guard (e.g. in palaver/memory/write.py) is bypassed by the next module
+# that opens its own connection to the same database file, so the actual
+# enforcement is this trigger, not application code. `BEFORE UPDATE OF tier`
+# fires whenever an UPDATE statement's SET clause names `tier` at all —
+# including a no-op UPDATE that sets it to its existing value — so there is
+# no shape of UPDATE that can touch this column and succeed. It is
+# deliberately scoped to `tier` alone: full-row immutability for a
+# superseded predecessor (any column, once superseded) is task 2.4's
+# trigger, layered on top of this one, not a replacement for it.
+_V3_STATEMENTS = (
+    """
+    CREATE TRIGGER memories_tier_immutable
+    BEFORE UPDATE OF tier ON memories
+    BEGIN
+        SELECT RAISE(ABORT, 'memories.tier is immutable; insert a superseding row instead (INV-5)');
+    END
+    """,
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -218,6 +243,11 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
             "memories, with backfill of pre-existing rows"
         ),
         statements=_V2_STATEMENTS,
+    ),
+    Migration(
+        version=3,
+        description="memories_tier_immutable trigger: tier can never be UPDATEd (INV-5)",
+        statements=_V3_STATEMENTS,
     ),
 )
 
