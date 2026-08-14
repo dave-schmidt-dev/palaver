@@ -1,0 +1,5 @@
+HUMAN: refactor the auth module
+AGENT: the auth module is refactored
+SYSTEM(compaction): earlier notes trimmed
+HUMAN: widen the retry window
+AGENT: the retry window is now thirty seconds
