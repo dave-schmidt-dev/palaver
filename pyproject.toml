@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Local-first observer, memory, and situational awareness"
 requires-python = ">=3.14"
 
+[project.scripts]
+palaver = "palaver.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["palaver*"]

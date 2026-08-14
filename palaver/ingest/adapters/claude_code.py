@@ -172,6 +172,29 @@ def _has_unresolved_tool_use(record: dict) -> bool:
     return any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
 
 
+def _has_tool_result(record: dict) -> bool:
+    content = _message_content(record)
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+
+
+def _is_transparent_injection(record: dict) -> bool:
+    """Report whether `record` is harness-injected content, not a real turn.
+
+    A `type: "user"` record that carries `tool_result` blocks is a tool
+    outcome and is never transparent — that check is structural and comes
+    first, because a tool result carries no text and would otherwise fall
+    through `classify_channel`'s prefix table into the human channel by
+    accident rather than by evidence.
+    """
+    if record.get("type") != "user":
+        return False
+    if _has_tool_result(record):
+        return False
+    return classify_channel(record) == CHANNEL_INJECTED
+
+
 def _tool_result_errors(record: dict) -> list[dict]:
     content = _message_content(record)
     if not isinstance(content, list):
@@ -271,14 +294,42 @@ class ClaudeCodeAdapter(Adapter):
                 last = record
         return last
 
+    def last_conversational_record(self, path: Path) -> dict | None:
+        """Return the last message-bearing record that is a real turn, or `None`.
+
+        Like `last_message_bearing_record`, but reading role *through* INV-8's
+        channel classification: a harness-injected `type: "user"` record (hook
+        output, a skill preamble, a system reminder) carries the human's role
+        without being anything the human said, so it is transparent here and
+        the walk looks past it to the last record that is genuinely
+        conversational.
+        """
+        records, _ = read_complete_records(path, 0)
+        last: dict | None = None
+        for raw in records:
+            record = _parse_record(raw, path)
+            if record is None or record.get("type") not in MESSAGE_RECORD_TYPES:
+                continue
+            if _is_transparent_injection(record):
+                continue
+            last = record
+        return last
+
     def has_unresolved_trailing_tool_use(self, path: Path) -> bool:
-        """Report whether the last message-bearing record is an unresolved `tool_use`.
+        """Report whether the last conversational record is an unresolved `tool_use`.
 
         True only when that record is an `assistant` record whose content
         includes at least one `tool_use` block — a tool call the transcript
-        never shows a result for, because nothing message-bearing follows it.
+        never shows a result for, because nothing conversational follows it.
+
+        Harness-injected records do not resolve a tool call, so they are read
+        past (`last_conversational_record`). Reading raw role instead would
+        report a session as resolved the moment a hook fired after its last
+        tool call, and `discover_sessions` would then drop that session
+        entirely once it aged past the recency floor — an actively-working
+        session vanishing from `palaver status` because a hook ran.
         """
-        record = self.last_message_bearing_record(path)
+        record = self.last_conversational_record(path)
         if record is None or record.get("type") != "assistant":
             return False
         return _has_unresolved_tool_use(record)
