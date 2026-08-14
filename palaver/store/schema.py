@@ -7,7 +7,10 @@ Migration 3 adds `memories_tier_immutable`, a trigger enforcing INV-5's
 (see `palaver/memory/write.py` for why a Python-only guard is not enough).
 Migration 4 rebuilds `memory_evidence` to carry `start_offset`/`end_offset`
 span anchors instead of a copied `quote` string (see
-`palaver/memory/evidence.py`).
+`palaver/memory/evidence.py`). Migration 5 makes supersession a derived
+view rather than a stored flag, and closes the `REPLACE`-shaped holes
+through which a row could still be destroyed or rewritten (see
+`palaver/memory/supersede.py`).
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -90,15 +93,15 @@ _V1_STATEMENTS = (
     )
     """,
     # memories has no stored status/superseded column: INV-4 requires
-    # supersession to never mutate or delete a row, and the plan's task 2.4
-    # ("Supersession as a derived view, never a stored flag") derives current
-    # status from whether some other row's `supersedes` points at it. `tier`
-    # encodes the INV-5 provenance ordering (1 = highest, explicit user
-    # instruction, down to 5 = observer speculation); migration 3 below adds
-    # the trigger that makes `tier` immutable once written (task 2.1). The
-    # separate rule that a lower tier can never *supersede* a higher one —
-    # i.e. a CHECK/trigger on the `supersedes` link itself — is task 2.4's,
-    # per tests/test_memory.py::test_lower_tier_cannot_supersede_higher_tier.
+    # supersession to never mutate or delete a row, so current status is
+    # derived from whether some other row's `supersedes` points at it —
+    # migration 5's `superseded_memories` view. `tier` encodes the INV-5
+    # provenance ordering (1 = highest, explicit user instruction, down to
+    # 5 = observer speculation); migration 3 below adds the trigger that
+    # makes `tier` immutable once written, and migration 5 adds the rule
+    # that a lower-confidence tier can never *supersede* a higher-confidence
+    # one, per
+    # tests/test_memory.py::test_lower_tier_cannot_supersede_higher_tier.
     f"""
     CREATE TABLE memories (
         id INTEGER PRIMARY KEY,
@@ -259,6 +262,138 @@ _V4_STATEMENTS = (
     """,
 )
 
+# INV-4/INV-5, task 2.4: supersession is a derived view, never a stored flag.
+# A stored `superseded` boolean on the predecessor would mean writing to a row
+# INV-4 declares immutable, so the successor row carries the whole edge
+# (`memories.supersedes`) and `superseded_memories` derives the predecessor set
+# from it.
+#
+# Uniqueness is a partial index, not a rebuilt table. Adding a table-level
+# `UNIQUE (supersedes)` to an existing SQLite table means the 12-step
+# ALTER-TABLE rebuild: create a new table, copy every row, drop the old one,
+# rename. That would DROP a table holding live `memories` rows — the exact
+# operation INV-4 exists to forbid — and would invalidate the migration-2 FTS5
+# external-content index, whose `content_rowid` points at those rowids. A
+# `CREATE UNIQUE INDEX ... WHERE supersedes IS NOT NULL` gives the identical
+# guarantee (SQLite already treats NULLs as distinct in a UNIQUE index, so the
+# partial predicate only keeps the index small and its intent explicit) with no
+# rebuild, no row copy, and no FTS invalidation.
+#
+# The trigger set below closes three `REPLACE`-shaped holes, all of them
+# measured against a real migrated store rather than reasoned about:
+#
+#   1. `INSERT OR REPLACE` on an existing `memories.id` silently rewrote tier
+#      from 4 to 1. `REPLACE` is a DELETE followed by an INSERT, so the
+#      migration-3 `BEFORE UPDATE OF tier` trigger never fires.
+#   2. `INSERT OR REPLACE` conflicting on the new `supersedes` unique index
+#      deleted the existing successor row and took its place.
+#   3. `UPDATE OR REPLACE ... SET rowid = <other row's id>` deleted the row it
+#      collided with, and a trigger written as `BEFORE UPDATE OF id` does not
+#      fire for the `rowid`/`_rowid_` spelling of the same column.
+#
+# A `BEFORE DELETE` trigger does NOT close any of them on its own: measured,
+# `memories_no_delete` blocks a plain `DELETE` but does not fire during
+# REPLACE conflict resolution unless `PRAGMA recursive_triggers` is ON, and
+# that pragma is per connection — the next module that opens its own
+# connection would silently escape the guarantee. So the enforcement is
+# `BEFORE INSERT`/`BEFORE UPDATE` triggers, which fire regardless of any
+# pragma; `memories_no_delete` is kept for the plain-DELETE case it does
+# cover. For the same reason `memories_supersedes_must_exist` exists rather
+# than leaning on the `REFERENCES memories(id)` foreign key: FK enforcement
+# needs `PRAGMA foreign_keys=ON`, and on a connection without it a `supersedes`
+# naming no row was accepted — which also made the tier comparison below
+# vacuous, since `NEW.tier > (SELECT tier FROM ... )` is NULL, not true, when
+# the subquery finds nothing.
+_V5_STATEMENTS = (
+    """
+    CREATE UNIQUE INDEX memories_one_successor_per_predecessor
+    ON memories(supersedes) WHERE supersedes IS NOT NULL
+    """,
+    # The derived view. One row per superseded predecessor; no DISTINCT is
+    # needed because the index above already makes duplicates impossible.
+    # Column named `memory_id` rather than `supersedes` because from the
+    # view's side it *is* a memory id, and `SELECT ... WHERE supersedes = ?`
+    # against a view of predecessors reads like the opposite of what it means.
+    """
+    CREATE VIEW superseded_memories AS
+    SELECT supersedes AS memory_id FROM memories WHERE supersedes IS NOT NULL
+    """,
+    """
+    CREATE TRIGGER memories_no_delete
+    BEFORE DELETE ON memories
+    BEGIN
+        SELECT RAISE(ABORT, 'memories rows are append-only; supersede, never delete (INV-4)');
+    END
+    """,
+    """
+    CREATE TRIGGER memories_id_never_reused
+    BEFORE INSERT ON memories
+    WHEN EXISTS (SELECT 1 FROM memories WHERE id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'memories.id is never reused; REPLACE would destroy a row (INV-4)');
+    END
+    """,
+    # Written against NEW.id/OLD.id rather than `BEFORE UPDATE OF id`, so it
+    # fires for the `rowid` and `_rowid_` spellings of the same column too.
+    """
+    CREATE TRIGGER memories_id_immutable
+    BEFORE UPDATE ON memories
+    WHEN NEW.id IS NOT OLD.id
+    BEGIN
+        SELECT RAISE(ABORT, 'memories.id is immutable; a rowid rewrite destroys a row (INV-4)');
+    END
+    """,
+    """
+    CREATE TRIGGER memories_supersedes_immutable
+    BEFORE UPDATE OF supersedes ON memories
+    BEGIN
+        SELECT RAISE(ABORT, 'memories.supersedes is immutable; write a successor row (INV-4)');
+    END
+    """,
+    """
+    CREATE TRIGGER memories_supersedes_must_exist
+    BEFORE INSERT ON memories
+    WHEN NEW.supersedes IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM memories WHERE id = NEW.supersedes)
+    BEGIN
+        SELECT RAISE(ABORT, 'memories.supersedes must name an existing memory (INV-4)');
+    END
+    """,
+    # Says UNIQUE in its message because it enforces the same rule as the
+    # partial index above, one step earlier: a BEFORE INSERT trigger fires
+    # even under `INSERT OR REPLACE`, where the index's own conflict
+    # resolution would delete the incumbent successor instead of raising.
+    """
+    CREATE TRIGGER memories_one_successor_guard
+    BEFORE INSERT ON memories
+    WHEN NEW.supersedes IS NOT NULL
+     AND EXISTS (SELECT 1 FROM memories WHERE supersedes = NEW.supersedes)
+    BEGIN
+        SELECT RAISE(ABORT, 'UNIQUE constraint: a memory has at most one successor (INV-4)');
+    END
+    """,
+    """
+    CREATE TRIGGER memories_supersedes_tier_order
+    BEFORE INSERT ON memories
+    WHEN NEW.supersedes IS NOT NULL
+     AND NEW.tier > (SELECT tier FROM memories WHERE id = NEW.supersedes)
+    BEGIN
+        SELECT RAISE(ABORT, 'a lower-confidence tier may not supersede a higher one (INV-5)');
+    END
+    """,
+    # Tests `memories` directly rather than the `superseded_memories` view: an
+    # INV-4 guard that depends on a view definition is one view edit away from
+    # being silently disabled.
+    """
+    CREATE TRIGGER memories_superseded_row_immutable
+    BEFORE UPDATE ON memories
+    WHEN EXISTS (SELECT 1 FROM memories WHERE supersedes = OLD.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'a superseded memory is immutable; see its successor (INV-4)');
+    END
+    """,
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -288,6 +423,15 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
             "copied quote column (INV-6)"
         ),
         statements=_V4_STATEMENTS,
+    ),
+    Migration(
+        version=5,
+        description=(
+            "Supersession as a derived view: one-successor-per-predecessor unique index, "
+            "superseded_memories view, and the triggers that make a memories row "
+            "undeletable and unrewritable including via REPLACE (INV-4/INV-5)"
+        ),
+        statements=_V5_STATEMENTS,
     ),
 )
 
