@@ -1,0 +1,5 @@
+{"type": "user", "sessionId": "fixture-finished-session", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "run the test suite"}]}}
+{"type": "assistant", "sessionId": "fixture-finished-session", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "run the test suite"}}]}}
+{"type": "user", "sessionId": "fixture-finished-session", "isMeta": false, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu-1", "is_error": false, "content": "ok"}]}}
+{"type": "assistant", "sessionId": "fixture-finished-session", "message": {"role": "assistant", "content": [{"type": "text", "text": "the test suite is green"}]}}
+{"type": "ai-title", "sessionId": "fixture-finished-session", "title": "test suite run"}

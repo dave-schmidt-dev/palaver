@@ -1,0 +1,2 @@
+{"type": "user", "sessionId": "fixture-working-mid-tool-use", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "run the test suite"}]}}
+{"type": "assistant", "sessionId": "fixture-working-mid-tool-use", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "run the test suite"}}]}}

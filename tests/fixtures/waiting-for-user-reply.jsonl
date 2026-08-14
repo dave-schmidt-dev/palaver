@@ -1,0 +1,4 @@
+{"type": "user", "sessionId": "fixture-waiting-for-user-reply", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "refactor the auth module"}]}}
+{"type": "assistant", "sessionId": "fixture-waiting-for-user-reply", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu-1", "name": "Edit", "input": {}}]}}
+{"type": "user", "sessionId": "fixture-waiting-for-user-reply", "isMeta": false, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu-1", "is_error": false, "content": "ok"}]}}
+{"type": "assistant", "sessionId": "fixture-waiting-for-user-reply", "message": {"role": "assistant", "content": [{"type": "text", "text": "should i also rename the helper?"}]}}

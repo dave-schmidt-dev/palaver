@@ -1,0 +1,3 @@
+{"type": "user", "sessionId": "fixture-ended-with-stop-hook", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "deploy status?"}]}}
+{"type": "assistant", "sessionId": "fixture-ended-with-stop-hook", "message": {"role": "assistant", "content": [{"type": "text", "text": "the deploy finished"}]}}
+{"type": "system", "subtype": "stop_hook_summary", "sessionId": "fixture-ended-with-stop-hook", "summary": "hook ran"}

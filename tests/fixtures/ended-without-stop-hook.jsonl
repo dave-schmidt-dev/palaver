@@ -1,0 +1,2 @@
+{"type": "user", "sessionId": "fixture-ended-without-stop-hook", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "deploy status?"}]}}
+{"type": "assistant", "sessionId": "fixture-ended-without-stop-hook", "message": {"role": "assistant", "content": [{"type": "text", "text": "the deploy finished"}]}}

@@ -1,0 +1,5 @@
+{"type": "user", "sessionId": "fixture-compaction-boundary", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "refactor the auth module"}]}}
+{"type": "assistant", "sessionId": "fixture-compaction-boundary", "message": {"role": "assistant", "content": [{"type": "text", "text": "the auth module is refactored"}]}}
+{"type": "system", "subtype": "compact_boundary", "sessionId": "fixture-compaction-boundary", "content": "earlier notes trimmed"}
+{"type": "user", "sessionId": "fixture-compaction-boundary", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "widen the retry window"}]}}
+{"type": "assistant", "sessionId": "fixture-compaction-boundary", "message": {"role": "assistant", "content": [{"type": "text", "text": "the retry window is now thirty seconds"}]}}

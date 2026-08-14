@@ -1,0 +1,3 @@
+{"type": "user", "sessionId": "fixture-slash-command-after-reply", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "refactor the auth module"}]}}
+{"type": "assistant", "sessionId": "fixture-slash-command-after-reply", "message": {"role": "assistant", "content": [{"type": "text", "text": "the auth module is refactored"}]}}
+{"type": "user", "sessionId": "fixture-slash-command-after-reply", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "<command-name>/status</command-name>"}]}}
