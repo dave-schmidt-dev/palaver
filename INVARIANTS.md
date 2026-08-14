@@ -9,7 +9,7 @@
 
 ### INV-1 — Every network call, subprocess, model inference, and stall-prone IO surfaces live progress
 area: ["palaver/**/*.py"]
-gate_test: tests/test_progress.py::test_observer_tick_emits_status
+gate_test: tests/test_scheduler.py::test_observer_tick_emits_status
 threshold: 3
 rationale: Palaver is a
   watcher whose whole value is telling a human what is happening; a Palaver operation that itself
@@ -32,7 +32,7 @@ rationale: The brief's first non-goal is autonomous control of coding agents, an
 
 ### INV-3 — Third-party session stores are opened read-only through an explicit allowlist
 area: ["palaver/ingest/adapters/**/*.py"]
-gate_test: tests/test_adapters.py::test_opencode_credential_tables_unreachable
+gate_test: tests/test_invariants.py::test_opencode_credential_tables_unreachable
 threshold: 3
 rationale: `~/.local/share/opencode/opencode.db` contains `account` and `credential` tables holding
   plaintext `access_token` and `refresh_token`. Palaver has no use for either. The OpenCode adapter
@@ -105,7 +105,7 @@ rationale: Tier-1 provenance means "the user said this", and it is the tier ever
 
 ### INV-9 — Observed-session content never leaves this machine
 area: ["palaver/**/*.py", "pyproject.toml", "tests/fixtures/**"]
-gate_test: tests/test_local_only.py::test_no_outbound_http_clients
+gate_test: tests/test_invariants.py::test_no_outbound_http_clients
 gate_test: tests/test_fixture_lint.py::test_unclassified_record_fails
 threshold: 3
 rationale: The brief's first engineering preference and the reason the whole design tolerates a 4B
