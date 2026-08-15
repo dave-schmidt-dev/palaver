@@ -69,7 +69,9 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 
 Palaver's database aggregates the full, unredacted content of every observed session across every project on the machine. That is a strictly higher-value target than any single agent's transcript, because it is the join of all of them. Consequently: no egress beyond localhost, no telemetry, no crash reporting, no non-local model API. The database is gitignored and must never sit in a cloud-synced path.
 
-Test fixtures are transcripts, so the corpus is sanitized under an **allowlist**: a record ships only if it matches a structural shape carrying no free text, or its free-text payload was replaced with prose written for the fixture. A linter enforces this and fails on any record it cannot classify.
+Test fixtures are transcripts, so the corpus is sanitized under an **allowlist**: a record ships only if it matches a structural shape carrying no free text, or its free-text payload was replaced with prose written for the fixture. `palaver fixture-lint` enforces this and fails on any record it cannot classify.
+
+It checks *every* file under `tests/fixtures/`, not every `.jsonl`. Discovery was a `*.jsonl` glob until 2026-08-15, which left seven committed files unopened — among them a golden output holding verbatim `HUMAN:`/`AGENT:` lines. An extension no checker claims is now a rejection rather than a skip, so a fixture cannot arrive in a new format and be counted as passing.
 
 ## Open questions
 

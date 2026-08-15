@@ -27,6 +27,29 @@ phrasebook. A record it cannot classify is a failure, not a warning. Adding
 prose to this corpus therefore requires editing `palaver/cli/fixture_lint.py`,
 which is the point — the gate is that edit, and the edit shows up in review.
 
+**Every file here is checked, not every `.jsonl`.** Until 2026-08-15 discovery
+was a `*.jsonl` glob, so seven committed files were never opened — including
+`golden/compaction-boundary.normalized.txt`, which is literally `HUMAN:` and
+`AGENT:` transcript lines. They were clean, but clean by *derivation* from the
+linted records rather than by any check, and this file's sibling
+`eval/labels.json` asserted in its own `$comment` that the allowlist already
+applied tree-wide. It did not. Four regimes now divide the tree, and a file
+extension no regime claims is a rejection rather than a skip:
+
+| Kind | Checked how |
+|---|---|
+| `.jsonl` | Every record against a declared shape and the phrasebook. |
+| `.json` | Every string, keys included, against the phrasebook or a structural-token rule. No key opts out. |
+| `.txt` | Each golden line's label by shape, its text against the phrasebook. |
+| `.md` | Fenced blocks and backtick spans as above; the authored English around them is scanned for real-store markers only. |
+
+That last row is the one asymmetry, and it is deliberate: a README's purpose
+*is* authored English, and a 17 KB one cannot be equality-checked against
+anything but itself. So narrative is not proven invented here, only proven
+free of the artefacts a real store leaves — a bare UUID, a `toolu_` id, an
+absolute home path, an email address. Quoted content, which is how a real
+record would actually arrive in a README, gets the full allowlist.
+
 The fixtures also carry no `uuid`, `parentUuid`, `timestamp`, `cwd`,
 `gitBranch`, or `version` keys, and their `sessionId` values are all
 `fixture-*` rather than UUIDs. Nothing in the observer reads those fields, and

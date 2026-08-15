@@ -109,6 +109,33 @@ RULE_BAD_VALUE = "bad-value"
 RULE_UNALLOWLISTED_TEXT = "unallowlisted-text"
 RULE_UNTERMINATED_FILE = "unterminated-file"
 
+#: A file under the corpus whose extension no checker claims. Rejected rather
+#: than skipped, which is the whole point: until 2026-08-15 discovery was
+#: `rglob("*.jsonl")`, so seven committed files — two of them carrying
+#: session-shaped prose — were never opened by the gate that exists to read
+#: them, and nothing said so. A corpus cannot be checked by a linter that
+#: decides for itself which files count.
+RULE_UNKNOWN_FILE_TYPE = "unknown-file-type"
+
+#: A quoted string outside a `.jsonl` record — a JSON string value, a markdown
+#: code span or fenced line, or the text half of a golden line — that is
+#: neither phrasebook nor a structural token. The record analogue is
+#: `RULE_UNALLOWLISTED_TEXT`; kept separate so a rejection names which surface
+#: it came from.
+RULE_UNALLOWLISTED_SPAN = "unallowlisted-span"
+
+#: Text of any kind carrying a marker only a real session store produces — a
+#: bare UUID, an opaque `toolu_`/`msg_` id, an absolute home path, an email
+#: address. This is the only check applied to authored narrative, and it is a
+#: marker scan rather than an allowlist because a 17 KB README cannot be
+#: equality-checked against anything but itself.
+RULE_PROVENANCE_MARKER = "provenance-marker"
+
+#: A golden-output line whose label is not label-shaped. The text half is
+#: checked against the phrasebook like any other quoted string; this rule
+#: covers the half that names the channel.
+RULE_BAD_GOLDEN_LABEL = "bad-golden-label"
+
 #: Every rule `classify_record` and `lint_tree` can report, for the report
 #: legend and for the tests' "this rule exists" assertions.
 RULE_NAMES: tuple[str, ...] = (
@@ -125,6 +152,10 @@ RULE_NAMES: tuple[str, ...] = (
     RULE_BAD_VALUE,
     RULE_UNALLOWLISTED_TEXT,
     RULE_UNTERMINATED_FILE,
+    RULE_UNKNOWN_FILE_TYPE,
+    RULE_UNALLOWLISTED_SPAN,
+    RULE_PROVENANCE_MARKER,
+    RULE_BAD_GOLDEN_LABEL,
 )
 
 #: The corpus phrasebook: every free-text string any committed fixture may
@@ -1099,15 +1130,419 @@ class LintReport:
 
     Attributes:
         root: Directory the corpus was read from.
-        files: How many `.jsonl` fixtures were read.
-        records: How many records were classified.
-        rejections: Every record the allowlist refused, in file order.
+        files: How many files were read — every file under `root`, not every
+            file of some extension. A count that moved when a checker was
+            added would hide the thing this field is for.
+        records: How many `.jsonl` records were classified.
+        strings: How many quoted strings, golden lines, and code spans were
+            checked on the non-record surfaces. Reported beside `records`
+            because a regime that silently checked nothing would otherwise
+            look identical to one that passed.
+        rejections: Everything the allowlist refused, in file order.
     """
 
     root: Path
     files: int
     records: int
+    strings: int
     rejections: tuple[Rejection, ...]
+
+
+# ---------------------------------------------------------------------------
+# Surfaces that are not JSONL records.
+#
+# Discovery was `rglob("*.jsonl")` until 2026-08-15, so seven committed files
+# were never opened: three corpus READMEs, three JSON label/measurement files,
+# and one golden normalizer output that is literally `HUMAN:` / `AGENT:`
+# transcript lines. They were clean, but clean *by derivation* from the linted
+# `.jsonl` sources — an argument, not a gate. `tests/fixtures/eval/labels.json`
+# even asserted in its own `$comment` that "fixture-lint's allowlist applies
+# tree-wide", which was false, sitting inside the corpus the gate is meant to
+# cover, on a public remote.
+#
+# Everything under the corpus root is now checked, under one of three regimes,
+# and an extension no regime claims is a rejection rather than a skip.
+# ---------------------------------------------------------------------------
+
+#: Characters ordinary English prose does not use, and which therefore mark a
+#: quoted string as a structural token — a field path, a JSON literal, a
+#: comparison, a filename — rather than something a person said.
+#:
+#: `.` `-` `?` `!` `,` `'` `(` `)` are deliberately absent. Prose uses all of
+#: them, so admitting them would make this a heuristic that passes real
+#: sentences, which is exactly what `SYNTHESIZED_TEXT`'s "equality, not
+#: pattern" comment warns against. The price is that `palaver fixture-lint`
+#: and `palaver diagnose --coverage` contain no structural character at all;
+#: those are covered by `COMMAND_SPAN` rather than by widening this set,
+#: because "it is a documented command line" is a different claim from "it is
+#: not a sentence" and should not be smuggled in as one.
+STRUCTURAL_CHARACTERS = frozenset('_:=/<>{}[]"|*\\')
+
+#: How many words a structural-character span may run to before it stops being
+#: a token and starts being a sentence.
+#:
+#: Without this the rule is exactly the heuristic `SYNTHESIZED_TEXT` warns
+#: about, and it failed on the first real file it met: the 80-word `$comment`
+#: in `tests/fixtures/eval/labels.json` passed as "structural" because the
+#: paragraph happens to contain a `/`. Any prose mentioning a path or a
+#: `key: value` pair would have done the same.
+#:
+#: Six is twice the observed maximum. Every span in this corpus that actually
+#: relies on the structural rule is three words or fewer
+#: (`message.data.finish == "stop"`, `session_meta.payload.{id, session_id}`),
+#: and the longest legitimate multi-word quotes are command lines, which
+#: `COMMAND_SPAN` handles separately. The gap between 3 and 80 is what makes a
+#: cap here decisive rather than arbitrary.
+STRUCTURAL_MAX_WORDS = 6
+
+#: A documented `palaver` invocation. The corpus READMEs quote commands a
+#: reader is meant to run, and those are neither phrasebook utterances nor
+#: structural tokens. Anchored and restricted to lowercase subcommand and flag
+#: shapes so it cannot be satisfied by a sentence that happens to open with
+#: the word "palaver".
+#: Every token after the subcommand must be a flag or a path. An earlier
+#: version allowed any lowercase word there, which made "palaver watches the
+#: sessions you run" a valid command line — a sentence passing as a command is
+#: the same failure as a sentence passing as a structural token, and its own
+#: test caught it.
+COMMAND_SPAN = re.compile(
+    r"^(?:uv run )?palaver [a-z][a-z-]*"
+    r"(?:\s(?:--[a-z][a-z-]*|[a-z0-9_*-]*[./][a-z0-9_.*/-]*))*$"
+)
+
+#: The channel label on a line of normalizer golden output — `HUMAN`, `AGENT`,
+#: `SYSTEM(compaction)`, `result`. Matched by shape rather than against a
+#: hardcoded vocabulary so the linter does not have to be edited every time
+#: `palaver.extract.normalize` learns a new record kind; the *text* half of the
+#: line is what carries session content, and that is phrasebook-checked.
+GOLDEN_LINE = re.compile(r"^(?P<label>[A-Za-z][A-Za-z_]*(?:\([a-z_]+\))?)(?:: |> )(?P<text>.*)$")
+
+#: Markers only a real session store produces. This is a marker scan rather
+#: than an allowlist, and that is a real difference in strength: it answers
+#: "does this carry an artefact of a real machine", not "was every word of
+#: this invented". It is the only check applied to authored narrative, because
+#: a 17 KB README cannot be equality-checked against anything but itself —
+#: every other surface gets the allowlist as well.
+PROVENANCE_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "a bare UUID, which is the shape of a real Claude Code session id",
+        re.compile(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+        ),
+    ),
+    ("an opaque tool-use id from a real transcript", re.compile(r"\btoolu_[A-Za-z0-9]{6,}")),
+    ("an opaque message id from a real transcript", re.compile(r"\bmsg_[A-Za-z0-9]{10,}")),
+    (
+        "an absolute home path, which names a real machine and a real user",
+        re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"),
+    ),
+    ("an email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    (
+        "a Claude Code project directory key, which encodes a real path",
+        re.compile(r"-(?:Users|home)-[A-Za-z0-9]+-"),
+    ),
+)
+
+#: Which regime reads which extension. Exhaustive by construction: `lint_tree`
+#: rejects any suffix absent from this mapping, so adding a `.yaml` fixture is
+#: a decision someone has to make here rather than a file that quietly ships
+#: unchecked.
+#: Filesystem droppings that are not fixtures and never will be. Matched by
+#: **exact name**, not by a dotfile or wildcard rule: `.DS_Store` appears the
+#: moment anyone opens the corpus in Finder, and failing the gate on it would
+#: train people to reach for a skip. Any other unexpected file — including any
+#: other dotfile — is still a rejection, so this exemption cannot grow by
+#: accident the way a `.*` pattern would.
+IGNORED_NAMES = frozenset({".DS_Store"})
+
+RECORD_SUFFIXES = frozenset({".jsonl"})
+DATA_SUFFIXES = frozenset({".json"})
+GOLDEN_SUFFIXES = frozenset({".txt"})
+NARRATIVE_SUFFIXES = frozenset({".md"})
+KNOWN_SUFFIXES = RECORD_SUFFIXES | DATA_SUFFIXES | GOLDEN_SUFFIXES | NARRATIVE_SUFFIXES
+
+
+#: Local-model output over the sanitized corpus, kept in a **third** namespace
+#: for the same reason `ANNOTATION_TEXT` is kept out of `SYNTHESIZED_TEXT`: a
+#: model's paraphrase of a fixture is not fixture content, and letting one
+#: satisfy a transcript record's text check would blur the only distinction
+#: this allowlist exists to draw.
+#:
+#: These are the extraction results in `tests/fixtures/eval/e4b_snapshot.json`,
+#: which the eval harness produced by running the local model over the linted
+#: `.jsonl` corpus. They are paraphrases rather than quotes — the model
+#: capitalized and re-tensed ("run the test suite" became "Running the test
+#: suite"), which is exactly why they fail an equality check against the
+#: phrasebook and why they cannot simply be added to it.
+#:
+#: Reachable only from `lint_data_file`. A README cannot quote one, and no
+#: `.jsonl` record can carry one, because `classify_record` never consults
+#: this set.
+EXTRACTION_TEXT = frozenset(
+    {
+        "Running the test suite",
+        "Refactor the auth module",
+        "The user requested the agent run the test suite.",
+    }
+)
+
+#: Prose that documents the corpus from *inside* a data file — today just the
+#: `$comment` in `tests/fixtures/eval/labels.json`.
+#:
+#: A fourth namespace rather than a fifteenth `ANNOTATION_TEXT` entry, because
+#: that set has a narrower documented meaning (commentary carried by
+#: `codex_role_label` records, with a mechanical overlap analysis over exactly
+#: 14 strings) and a test that re-derives it. Adding an unrelated paragraph
+#: there would falsify both.
+#:
+#: Allowlisted by equality rather than by exempting the `$comment` key. A key
+#: exemption is an escape hatch inside the strict regime: the next string
+#: someone would rather not justify becomes a `$comment` too. Equality means
+#: editing this paragraph is a two-file change that shows up in review, which
+#: is the deliberate act INV-9's git clause is about.
+DOCUMENTATION_TEXT = frozenset(
+    {
+        "Ground truth for task 3.5's eval harness. `path` is relative to "
+        "tests/fixtures/. Most entries reuse Phase 1's existing labelled-fixture "
+        "corpus (chosen over authoring a parallel transcript corpus, since those "
+        "fixtures are already vetted); only decision-database-choice.jsonl is new, "
+        "added here under tests/fixtures/eval/ because no existing fixture "
+        "demonstrates a resolved user decision. forbidden_quote_substrings names "
+        "text a correct extractor must never cite as a user decision's quote -- "
+        "either because it is INJECTED-channel (misattribution) or AGENT-channel "
+        "(fabrication), never HUMAN-channel. An earlier version of this note said "
+        "fixture-lint's allowlist applied tree-wide. That was false when written: "
+        "discovery was rglob(*.jsonl), so this file was one of seven the linter "
+        "never opened. It became true on 2026-08-15, when every file under "
+        "tests/fixtures/ was brought under a checker and an unclaimed extension "
+        "became a rejection rather than a skip."
+    }
+)
+
+
+def provenance_markers(text: str) -> tuple[str, ...]:
+    """Every real-store marker `text` carries, as human-readable reasons.
+
+    Args:
+        text: Any string from any corpus surface.
+
+    Returns:
+        One reason per marker found, empty when the text is clean.
+    """
+    return tuple(reason for reason, pattern in PROVENANCE_MARKERS if pattern.search(text))
+
+
+def check_span(span: str, where: str, *, extra: frozenset[str] = frozenset()) -> Verdict:
+    """Judge one quoted string from a non-record surface.
+
+    Accepts, in order: phrasebook or annotation text by equality, a documented
+    command line, a single whitespace-free token (an identifier by shape — a
+    field name, filename, or path cannot be a sentence), and a multi-word
+    string carrying a structural character. Everything else is a rejection.
+
+    The marker scan runs first and applies to all of them, so a span that
+    would otherwise pass as a harmless identifier still fails if it is a real
+    session's UUID.
+
+    Args:
+        span: The string to judge.
+        where: Human-readable location, used only in the rejection detail.
+        extra: An additional equality allowlist for surfaces that carry a
+            content class the phrasebook does not cover. Passed only by
+            `lint_data_file`, and only `EXTRACTION_TEXT` — a parameter rather
+            than a module-level union so that widening it for one surface
+            cannot widen it for every surface.
+
+    Returns:
+        `ACCEPTED`, or a rejecting `Verdict` naming the rule.
+    """
+    stripped = span.strip()
+    if not stripped:
+        return ACCEPTED
+    markers = provenance_markers(stripped)
+    if markers:
+        return _reject(RULE_PROVENANCE_MARKER, f"{where} carries {markers[0]}: {stripped[:40]!r}")
+    if stripped in SYNTHESIZED_TEXT or stripped in ANNOTATION_TEXT or stripped in extra:
+        return ACCEPTED
+    if COMMAND_SPAN.match(stripped):
+        return ACCEPTED
+    if not any(character.isspace() for character in stripped):
+        return ACCEPTED
+    if STRUCTURAL_CHARACTERS & set(stripped) and len(stripped.split()) <= STRUCTURAL_MAX_WORDS:
+        return ACCEPTED
+    return _reject(
+        RULE_UNALLOWLISTED_SPAN,
+        f"{where} is neither phrasebook text nor a structural token: {stripped[:40]!r}",
+    )
+
+
+def _line_of(raw: str, needle: str) -> int:
+    """Best-effort source line for a string found inside a parsed file.
+
+    `json.loads` discards positions, so a rejection in a `.json` fixture would
+    otherwise have to report line 1 and leave the reader searching. Falls back
+    to 1 when the string cannot be located verbatim (it was escaped, or spans
+    a line break).
+    """
+    index = raw.find(needle)
+    if index < 0:
+        return 1
+    return raw.count("\n", 0, index) + 1
+
+
+def _walk_strings(value: object, path: str = "$") -> list[tuple[str, str]]:
+    """Every string in a decoded JSON document, with its dotted location."""
+    if isinstance(value, str):
+        return [(value, path)]
+    if isinstance(value, dict):
+        found: list[tuple[str, str]] = []
+        for key, item in value.items():
+            found.append((key, f"{path} key"))
+            found.extend(_walk_strings(item, f"{path}.{key}"))
+        return found
+    if isinstance(value, list):
+        found = []
+        for index, item in enumerate(value):
+            found.extend(_walk_strings(item, f"{path}[{index}]"))
+        return found
+    return []
+
+
+def lint_data_file(path: Path) -> tuple[int, list[Rejection]]:
+    """Check every string in a `.json` fixture — keys included.
+
+    Labels, eval snapshots, and measurement files are data, not prose, so they
+    get the strict regime: each string must be phrasebook, a command, or a
+    structural token. There is deliberately no key that opts a string out.
+    `tests/fixtures/eval/labels.json` carries a long `$comment`, and it is
+    allowlisted by *equality* in `ANNOTATION_TEXT` rather than by a wildcard
+    on the key name, because a wildcard is an escape hatch inside the strict
+    regime and the next person who wants to dodge the phrasebook adds one.
+    """
+    raw = path.read_text()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return 0, [Rejection(path=path, line=1, rule=RULE_UNDECODABLE, detail=str(exc))]
+    rejections: list[Rejection] = []
+    strings = _walk_strings(document)
+    for value, where in strings:
+        verdict = check_span(value, where, extra=EXTRACTION_TEXT | DOCUMENTATION_TEXT)
+        if not verdict.ok:
+            rejections.append(
+                Rejection(
+                    path=path,
+                    line=_line_of(raw, value),
+                    rule=verdict.rule,
+                    detail=verdict.detail,
+                )
+            )
+    return len(strings), rejections
+
+
+def lint_golden_file(path: Path) -> tuple[int, list[Rejection]]:
+    """Check a `.txt` golden output line by line.
+
+    Each line is a channel label and a text half. The label is checked by
+    shape and the text by the phrasebook, because the text half is the part
+    that came out of a transcript.
+    """
+    rejections: list[Rejection] = []
+    lines = path.read_text().splitlines()
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        match = GOLDEN_LINE.match(line)
+        if match is None:
+            rejections.append(
+                Rejection(
+                    path=path,
+                    line=number,
+                    rule=RULE_BAD_GOLDEN_LABEL,
+                    detail=f"line is not <label>: <text>: {line[:40]!r}",
+                )
+            )
+            continue
+        text = match.group("text")
+        if text.strip() and text.strip() not in SYNTHESIZED_TEXT:
+            rejections.append(
+                Rejection(
+                    path=path,
+                    line=number,
+                    rule=RULE_UNALLOWLISTED_SPAN,
+                    detail=f"golden text is not phrasebook: {text[:40]!r}",
+                )
+            )
+    return len(lines), rejections
+
+
+def lint_narrative_file(path: Path) -> tuple[int, list[Rejection]]:
+    """Check a `.md` file: quoted content strictly, authored English by marker.
+
+    A README's purpose *is* authored English, so narrative is the default here
+    and quoted content is the exception — the inverse of every other regime.
+    The risk a corpus README actually carries is a real record pasted in as an
+    example, so fenced blocks and backtick spans go through `check_span` like
+    any other quoted string, while the prose around them gets the marker scan.
+
+    That asymmetry is the honest scope of this check and is stated rather than
+    hidden: narrative is not proven invented, only proven free of real-store
+    artefacts.
+    """
+    rejections: list[Rejection] = []
+    checked = 0
+    in_fence = False
+    # Narrative is reassembled into one document before the backtick split,
+    # because an inline span may wrap a line: this corpus contains both
+    # `palaver/cli/\nfixture_lint.py` and `session_meta.payload.{id,\n
+    # session_id}`. Splitting per line puts the opening and closing backticks
+    # in different splits, which inverts odd/even from that point on and hands
+    # the *prose* to `check_span` while the real span goes unchecked — a
+    # false rejection and a silent miss from the same bug.
+    narrative: list[str] = []
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            narrative.append("")
+            continue
+        if in_fence:
+            checked += 1
+            narrative.append("")
+            verdict = check_span(line, f"fenced line {number}")
+            if not verdict.ok:
+                rejections.append(
+                    Rejection(path=path, line=number, rule=verdict.rule, detail=verdict.detail)
+                )
+            continue
+        narrative.append(line)
+
+    body = "\n".join(narrative)
+    # Inline spans are the odd-index segments of a backtick split. Matching
+    # the pattern `` `[^`]*` `` instead would also match the gap *between* two
+    # adjacent spans and report the prose in it as quoted content.
+    offset = 0
+    for index, segment in enumerate(body.split("`")):
+        if index % 2 == 1:
+            checked += 1
+            line_number = body.count("\n", 0, offset) + 1
+            verdict = check_span(segment, f"code span on line {line_number}")
+            if not verdict.ok:
+                rejections.append(
+                    Rejection(path=path, line=line_number, rule=verdict.rule, detail=verdict.detail)
+                )
+        offset += len(segment) + 1
+
+    for number, line in enumerate(body.splitlines(), start=1):
+        for reason in provenance_markers(line):
+            rejections.append(
+                Rejection(
+                    path=path,
+                    line=number,
+                    rule=RULE_PROVENANCE_MARKER,
+                    detail=f"narrative carries {reason}",
+                )
+            )
+    return checked, rejections
 
 
 def lint_file(
@@ -1166,11 +1601,19 @@ def lint_tree(
     classify: Callable[[object], Verdict] | None = None,
     on_status: Callable[[str], None] | None = None,
 ) -> LintReport:
-    """Classify every record of every `.jsonl` fixture under `root`.
+    """Check every file under `root`, routing each to its regime by extension.
+
+    Discovery is `rglob("*")` rather than `rglob("*.jsonl")`, and a suffix no
+    regime claims is reported as `RULE_UNKNOWN_FILE_TYPE`. Those two together
+    are the property worth having: the set of files this function reads equals
+    the set of files present, so a fixture cannot be added in a format the
+    linter does not understand and be counted as passing.
 
     Args:
-        root: Corpus directory (or a single `.jsonl` file).
-        classify: Classifier override; defaults to `classify_record`.
+        root: Corpus directory, or a single fixture file of any known type.
+        classify: Record-classifier override; defaults to `classify_record`.
+            Applies to `.jsonl` only — the other regimes have no per-record
+            classifier to substitute.
         on_status: Progress channel, called once per file before it is read
             (INV-1). Never writes to stdout.
 
@@ -1178,16 +1621,50 @@ def lint_tree(
         A `LintReport` over everything read.
     """
     root = Path(root)
-    paths = [root] if root.is_file() else sorted(root.rglob("*.jsonl"))
+    paths = (
+        [root]
+        if root.is_file()
+        else sorted(p for p in root.rglob("*") if p.is_file() and p.name not in IGNORED_NAMES)
+    )
     records = 0
+    strings = 0
     rejections: list[Rejection] = []
     for index, path in enumerate(paths, start=1):
         if on_status is not None:
             on_status(f"linting {index}/{len(paths)}: {path.name}")
-        counted, found = lint_file(path, classify=classify)
-        records += counted
+        suffix = path.suffix
+        if suffix in RECORD_SUFFIXES:
+            counted, found = lint_file(path, classify=classify)
+            records += counted
+        elif suffix in DATA_SUFFIXES:
+            counted, found = lint_data_file(path)
+            strings += counted
+        elif suffix in GOLDEN_SUFFIXES:
+            counted, found = lint_golden_file(path)
+            strings += counted
+        elif suffix in NARRATIVE_SUFFIXES:
+            counted, found = lint_narrative_file(path)
+            strings += counted
+        else:
+            found = [
+                Rejection(
+                    path=path,
+                    line=1,
+                    rule=RULE_UNKNOWN_FILE_TYPE,
+                    detail=(
+                        f"no checker claims {suffix or 'a file with no suffix'}; "
+                        f"known types are {sorted(KNOWN_SUFFIXES)}"
+                    ),
+                )
+            ]
         rejections.extend(found)
-    return LintReport(root=root, files=len(paths), records=records, rejections=tuple(rejections))
+    return LintReport(
+        root=root,
+        files=len(paths),
+        records=records,
+        strings=strings,
+        rejections=tuple(rejections),
+    )
 
 
 def render_report(report: LintReport) -> str:
@@ -1197,6 +1674,7 @@ def render_report(report: LintReport) -> str:
         f"corpus: {report.root}",
         f"files: {report.files}",
         f"records: {report.records}",
+        f"strings: {report.strings}",
         f"rejected: {len(report.rejections)}",
     ]
     if report.rejections:
@@ -1216,7 +1694,9 @@ def render_report(report: LintReport) -> str:
             [
                 "",
                 "every record matched an allowlisted shape and carried only",
-                "phrasebook text.",
+                "phrasebook text; every quoted string on every other surface was",
+                "phrasebook, a command, or a structural token, and no file was",
+                "skipped for its extension.",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -1266,7 +1746,7 @@ def run(
 
     report = lint_tree(root, on_status=on_status)
     if report.files == 0:
-        print(f"palaver fixture-lint: no .jsonl fixtures under {root}", file=sys.stderr)
+        print(f"palaver fixture-lint: no files under {root}", file=sys.stderr)
         return 2
 
     out.write(render_report(report))
