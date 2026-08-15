@@ -69,7 +69,16 @@ SELFTEST_LABEL = "com.zerodelta.palaver.observe.selftest"
 SELFTEST_INTERVAL = "5"
 
 #: Seconds to wait for a freshly bootstrapped job to have a pid.
-STARTUP_WINDOW_SECONDS = 10.0
+#:
+#: One throttle interval plus margin, and derived from the constant rather
+#: than written as a number, because the two are not independent. launchd
+#: throttles per *label*, and every live test in this file bootstraps the
+#: same selftest label — so by the time the last of them runs, the label's
+#: throttle accounting is warm and a start can be held for most of an
+#: interval before the job ever execs. This was 10.0, i.e. exactly one
+#: interval with no margin, which passed this file in isolation and failed
+#: roughly one whole-suite run in three.
+STARTUP_WINDOW_SECONDS = THROTTLE_INTERVAL_SECONDS + 10.0
 
 #: How long the no-KeepAlive control waits before concluding that nothing is
 #: coming back. Longer than one throttle interval, because a job that *would*
@@ -518,7 +527,9 @@ def test_the_observe_agent_loads_and_launchctl_print_reports_it(loaded_selftest_
 def test_killing_the_observe_daemon_brings_back_a_different_pid(loaded_selftest_agent):
     """The done-when's restart check, against the real daemon and real launchd."""
     original = _await_pid(SELFTEST_LABEL)
-    assert original is not None, "the job never started"
+    assert original is not None, (
+        f"the job never reached a signalable pid within {STARTUP_WINDOW_SECONDS}s of bootstrap"
+    )
 
     os.kill(original, signal.SIGKILL)
     restarted = wait_for_new_pid(SELFTEST_LABEL, original, on_status=lambda _message: None)
@@ -549,7 +560,11 @@ def test_an_agent_without_keepalive_stays_dead_when_killed(tmp_path):
     assert bootstrap(plist).returncode == 0
     try:
         original = _await_pid(SELFTEST_LABEL)
-        assert original is not None, "the job never started"
+        assert original is not None, (
+            f"the control job never reached a signalable pid within "
+            f"{STARTUP_WINDOW_SECONDS}s of bootstrap, so the kill below would "
+            f"prove nothing"
+        )
         os.kill(original, signal.SIGKILL)
         revived = wait_for_new_pid(
             SELFTEST_LABEL,
