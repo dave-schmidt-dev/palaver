@@ -299,7 +299,7 @@ def single_writer(
     *,
     on_status: StatusFn | None = None,
     timeout: float = DEFAULT_TIMEOUT,
-    backlog: int = 16,
+    backlog: int = 128,
 ) -> Iterator[socket_module.socket | None]:
     """Claim the writer role, yielding the socket to accept requests on.
 
@@ -315,7 +315,14 @@ def single_writer(
         on_status: INV-1 progress channel. Called with a human-readable line
             at each step that can block or fail.
         timeout: Seconds to allow the connect probe.
-        backlog: `listen()` backlog.
+        backlog: `listen()` backlog. Sized against the tick interval rather
+            than against expected concurrency: this daemon accepts only in
+            the idle window *between* ticks (see `serve_until`), so every
+            request arriving during a 30-second extraction queues here until
+            it finishes. Sixteen is a handful of MCP reads. A queue slot
+            costs almost nothing, and the request that overflows it is
+            dropped — silently, from the client's side, if it was a query
+            event (task 6.4).
 
     Yields:
         A bound, listening `AF_UNIX` socket — or `None` when the store sits
@@ -533,7 +540,13 @@ def request(db_path: Path, payload: Mapping[str, Any], *, timeout: float = DEFAU
 #: schema's own triggers (`memories_no_delete`, `memories_id_immutable`, and
 #: the rest) are the second layer, and they are what would catch a future
 #: operation added here carelessly.
-WRITE_OPERATIONS = frozenset({"correct"})
+#:
+#: `query` is here despite not being a write a *user* asked for: it is
+#: Palaver recording its own retrievals (task 6.4). It travels this path
+#: because the MCP process is read-only and this machine has exactly one
+#: writer — the alternative was a second writable connection, opened for
+#: telemetry, which is the thing this module exists to make impossible.
+WRITE_OPERATIONS = frozenset({"correct", "query"})
 
 #: What `palaver_correct` records as a memory's origin, so a correction is
 #: distinguishable from an extraction in any later read.
@@ -571,6 +584,8 @@ def apply_request(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
                 "append-only (INV-4): a correction is a new row that supersedes the "
                 "old one, and the old row is never modified or removed."
             )
+        if op == "query":
+            return _record_query(conn, payload)
         return _correct(conn, payload)
     except Exception as exc:  # noqa: BLE001 - the reply *is* the error channel
         log.warning("write request %r refused: %s", op, exc)
@@ -630,6 +645,55 @@ def _correct(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
     return {"ok": True, "memory_id": successor_id, "supersedes": memory_id}
 
 
+def _record_query(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
+    """Record one retrieval: what was asked, and which memories came back.
+
+    Validated as strictly as a correction is, for a reason that is not
+    symmetry. A query event is written on behalf of a caller who never sees
+    the reply (see `palaver.mcp.query_events`), so a malformed one that were
+    let through would land as a bad row nobody is watching. The strictness
+    is what turns that into a WARNING in the daemon's log instead.
+    """
+    tool = payload.get("tool")
+    scope_kind = payload.get("scope_kind")
+    scope_value = payload.get("scope_value")
+    result_count = payload.get("result_count")
+    memory_ids = payload.get("memory_ids", [])
+
+    if not isinstance(tool, str) or not tool.strip():
+        raise ValueError(f"tool must be a non-empty string, got {tool!r}")
+    if scope_kind not in {"project", "session"}:
+        raise ValueError(f"scope_kind must be 'project' or 'session', got {scope_kind!r}")
+    if not isinstance(scope_value, str) or not scope_value.strip():
+        raise ValueError(f"scope_value must be a non-empty string, got {scope_value!r}")
+    if result_count is not None and (
+        not isinstance(result_count, int) or isinstance(result_count, bool) or result_count < 0
+    ):
+        raise ValueError(
+            f"result_count must be a non-negative integer or null, got {result_count!r}"
+        )
+    if not isinstance(memory_ids, list) or not all(
+        isinstance(memory_id, int) and not isinstance(memory_id, bool) for memory_id in memory_ids
+    ):
+        raise ValueError(f"memory_ids must be a list of integers, got {memory_ids!r}")
+
+    event_id = conn.execute(
+        "INSERT INTO query_events (tool, scope_kind, scope_value, result_count) "
+        "VALUES (?, ?, ?, ?) RETURNING id",
+        (tool.strip(), scope_kind, scope_value.strip(), result_count),
+    ).fetchone()[0]
+    # `dict.fromkeys` rather than `set`: a page cannot repeat a memory, but
+    # if one ever did, the composite primary key would abort the whole event
+    # — losing the parent row to a duplicate in the child list. Order is
+    # kept because it is the order the agent was shown them in.
+    conn.executemany(
+        "INSERT INTO query_event_memories (query_event_id, memory_id) VALUES (?, ?)",
+        [(event_id, memory_id) for memory_id in dict.fromkeys(memory_ids)],
+    )
+    conn.commit()
+    return {"ok": True, "query_event_id": event_id, "memory_ids": len(set(memory_ids))}
+
+
 def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> bool:
     """Accept one connection, apply its request, and reply.
 
@@ -640,8 +704,15 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
     Returns:
         True if a request was served. False if the connection carried
         nothing — which is what the startup liveness probe leaves behind,
-        and what `daemon_alive` does on every read. Those must not be logged
-        as malformed requests; they are the mechanism working.
+        and what `daemon_running` does on every read. Those must not be
+        logged as malformed requests; they are the mechanism working.
+
+        A request that was applied but whose reply could not be delivered
+        still counts as served. A query event is posted fire-and-forget
+        (see `palaver.mcp.query_events`) and its sender is usually gone
+        before the acknowledgement is written; returning False there would
+        make the daemon's own count of what it did disagree with what is in
+        the database.
     """
     client, _ = server.accept()
     try:
@@ -658,6 +729,7 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
         if not body:
             return False
 
+        payload: Any = None
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
@@ -665,7 +737,13 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
         else:
             reply = apply_request(conn, payload)
 
-        client.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+        try:
+            client.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+        except (ConnectionError, BrokenPipeError) as exc:
+            # Narrower than the handler below, and deliberately after the
+            # request has been applied and committed: the work is done and
+            # durable, and only the receipt had nowhere to go.
+            log.debug("reply to %r went unread: %s", payload, exc)
         return True
     except (TimeoutError, ConnectionError, BrokenPipeError) as exc:
         # One client that hangs up or stalls is not the daemon's failure.

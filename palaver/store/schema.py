@@ -20,7 +20,9 @@ ADD COLUMN`, not by editing migration 1's `_V1_STATEMENTS` in place: the
 test suite builds every other test database fresh from the latest
 migration, so an in-place edit would pass every test here while leaving any
 already-migrated store (this project has none yet, but the next one won't
-get a second chance) permanently missing both columns.
+get a second chance) permanently missing both columns. Migration 7 adds
+`query_events` and `query_event_memories`, recording which memories an MCP
+client actually retrieved (see `palaver/mcp/query_events.py`, task 6.4).
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -417,6 +419,51 @@ _V6_STATEMENTS = (
     "CHECK (prompt_tokens IS NULL OR prompt_tokens >= 0)",
 )
 
+# task 6.4 / palaver/mcp/query_events.py: what an agent actually retrieved.
+#
+# A separate pair of tables rather than rows in `events`, for two reasons.
+# `events.session_id` is NOT NULL and references `sessions` — an MCP query
+# has no observed session behind it, so it cannot satisfy that column
+# without inventing one. And `events` is observation: things that happened
+# *inside* a watched session. A retrieval is something that happened to the
+# store from outside it. Merging them would make "what did this session do"
+# unanswerable without a kind filter that every future reader must remember.
+#
+# `result_count` is nullable, and null means "not counted" rather than
+# "returned nothing" — a read tool whose page key `query_events` does not
+# know about records the honest absence instead of a confident zero (INV-7).
+#
+# `query_event_memories.memory_id` does carry a foreign key even though
+# INV-4 means memories are never deleted, so there is nothing for it to
+# cascade from. It is here to catch the other direction: an id recorded that
+# names no memory at all. That is the failure this table would otherwise
+# hide, because a telemetry row nobody reads until months later is exactly
+# where a wrong id survives. The check costs one rowid lookup per row.
+_V7_STATEMENTS = (
+    """
+    CREATE TABLE query_events (
+        id INTEGER PRIMARY KEY,
+        tool TEXT NOT NULL,
+        scope_kind TEXT NOT NULL CHECK (scope_kind IN ('project', 'session')),
+        scope_value TEXT NOT NULL,
+        result_count INTEGER CHECK (result_count IS NULL OR result_count >= 0),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+    """,
+    """
+    CREATE TABLE query_event_memories (
+        query_event_id INTEGER NOT NULL REFERENCES query_events(id) ON DELETE CASCADE,
+        memory_id INTEGER NOT NULL REFERENCES memories(id),
+        PRIMARY KEY (query_event_id, memory_id)
+    ) WITHOUT ROWID
+    """,
+    # Indexed by memory rather than by event: the question this table exists
+    # to answer is "has anything ever actually retrieved this memory", which
+    # scans by `memory_id`. The event side already has the primary key.
+    "CREATE INDEX query_event_memories_by_memory ON query_event_memories(memory_id)",
+    "CREATE INDEX query_events_by_created_at ON query_events(created_at)",
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -463,6 +510,14 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
             "(task 3.2, palaver/extract/client.py)"
         ),
         statements=_V6_STATEMENTS,
+    ),
+    Migration(
+        version=7,
+        description=(
+            "query_events and query_event_memories: which memories an agent "
+            "actually retrieved (task 6.4, palaver/mcp/query_events.py)"
+        ),
+        statements=_V7_STATEMENTS,
     ),
 )
 

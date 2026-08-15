@@ -48,7 +48,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 | `palaver/ingest/adapters/` | One adapter per agent session store. |
 | `palaver/observer/` | Deterministic signals and status derivation. |
 | `palaver/memory/` | Append-only memory with provenance tiers. |
-| `palaver/mcp/` | The MCP read surface other agents query. |
+| `palaver/mcp/` | The MCP surface other agents query. Reads go through a `mode=ro` connection; the two writes it can make (a correction, a query event) are posted to the observer daemon rather than opened locally. |
 | `palaver/cli/` | `palaver status`, `inspect`, and friends. |
 | `tests/` | Test suite, including a sanitized transcript fixture corpus. |
 | `INVARIANTS.md` | The system contract. Read this before changing behavior. |

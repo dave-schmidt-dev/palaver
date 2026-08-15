@@ -28,6 +28,7 @@ from palaver.extract.client import (
     ModelTimeoutError,
 )
 from palaver.store.migrate import connect, migrate
+from palaver.store.schema import LATEST_VERSION
 
 # Self-contained (no external $ref, per the orchestrator's verified
 # constraint on the server's schema converter), reused across tests.
@@ -375,7 +376,11 @@ def test_migration_6_adds_columns_to_an_upgraded_store(tmp_path):
     assert reached_v5 == 5
 
     reached_latest = migrate(db_path)
-    assert reached_latest == 6
+    # `LATEST_VERSION`, not a literal: what this test is about is that the
+    # columns arrive by *upgrade* rather than by a rewritten migration 1, and
+    # a hardcoded number turns every later migration into a spurious failure
+    # here. The `>= 6` keeps the claim honest -- forward is still forward.
+    assert reached_latest == LATEST_VERSION >= 6
 
     conn = connect(db_path)
     try:

@@ -14,7 +14,10 @@ next task can change without noticing. Opening `mode=ro` makes the database
 itself refuse a write, so the read surface stays a read surface even if a
 future tool forgets. Task 6.3's `palaver_correct` writes through the
 daemon's single-writer socket rather than through this connection, which is
-exactly why this one can stay closed to writes.
+exactly why this one can stay closed to writes. Task 6.4's query events go
+the same way, and are the sharper case: recording a retrieval is a write
+this server performs *on its own behalf*, so it is the one that would most
+naturally have justified a second writable connection. It does not get one.
 
 A missing database is an error rather than an empty answer: `palaver status`
 with no store behind it should say so, not report that this machine has no
@@ -33,7 +36,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
 
 from palaver import __version__
-from palaver.mcp import tools_read, tools_write
+from palaver.mcp import query_events, tools_read, tools_write
 from palaver.observer.socket import daemon_running
 
 log = logging.getLogger(__name__)
@@ -129,9 +132,20 @@ def build_server(
                 # store this server points at, not of the question asked —
                 # so a tool added later cannot answer without saying how
                 # current its answer is.
-                return handler(conn, scope, cursor, freshness(conn, db_path))
+                result = handler(conn, scope, cursor, freshness(conn, db_path))
             finally:
                 conn.close()
+
+            # After the read connection is closed, and outside its `try`, on
+            # both counts deliberately. A recording that raised inside that
+            # block would surface as a failed *read*, and one that ran while
+            # the connection was open would hold a read-only handle open for
+            # the duration of a socket write it has no reason to wait on.
+            # Nothing here is checked: `record` returns whether the event
+            # landed, and a query event that did not land is a gap in
+            # Palaver's telemetry, not a fault in the answer above.
+            query_events.record(db_path, tool_name, result)
+            return result
 
         _call.__name__ = tool_name
         _call.__doc__ = handler.__doc__
