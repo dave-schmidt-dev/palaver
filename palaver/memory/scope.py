@@ -56,6 +56,7 @@ def read_memories(
     *,
     project: str | None = None,
     session: int | None = None,
+    after_id: int = 0,
 ) -> list[dict]:
     """Read memories in exactly one scope: an entire project, or one session.
 
@@ -70,6 +71,13 @@ def read_memories(
             `session_id` matches exactly this session — never a sibling
             session of the same project, and never a project-level memory
             with no session_id.
+        after_id: Return only rows with a greater `id`. This is the keyset
+            half of task 6.2's pagination: `palaver observe` writes to this
+            database while a reader pages through it, and under `OFFSET` an
+            insert between two pages shifts every later offset and a row is
+            skipped without trace. Resuming from the last id seen means a
+            concurrent insert lands after the reader rather than under it.
+            `id` is unique, so the ordering is total and needs no tiebreaker.
 
     Returns:
         Matching `memories` rows, oldest first (`ORDER BY id`), each as a
@@ -96,16 +104,16 @@ def read_memories(
         if project_row is None:
             raise LookupError(f"no project named {project!r}")
         cursor = conn.execute(
-            f"SELECT {columns} FROM memories WHERE project_id = ? ORDER BY id",
-            (project_row[0],),
+            f"SELECT {columns} FROM memories WHERE project_id = ? AND id > ? ORDER BY id",
+            (project_row[0], after_id),
         )
     else:
         session_row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session,)).fetchone()
         if session_row is None:
             raise LookupError(f"no session with id {session!r}")
         cursor = conn.execute(
-            f"SELECT {columns} FROM memories WHERE session_id = ? ORDER BY id",
-            (session,),
+            f"SELECT {columns} FROM memories WHERE session_id = ? AND id > ? ORDER BY id",
+            (session, after_id),
         )
 
     return [dict(zip(_MEMORY_COLUMNS, row, strict=True)) for row in cursor.fetchall()]

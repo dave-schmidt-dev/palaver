@@ -20,9 +20,11 @@ functions in-process would prove none of it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import errno
 import io
+import json
 import signal
 import sqlite3
 import subprocess
@@ -36,9 +38,10 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import palaver
 from palaver.cli import SUBCOMMANDS
 from palaver.cli import mcp as mcp_cli
+from palaver.mcp import pagination, tools_read
 from palaver.mcp import server as mcp_server
-from palaver.mcp import tools_read
 from palaver.memory.evidence import EvidenceAnchor
+from palaver.memory.scope import read_memories
 from palaver.memory.write import write_memory
 from palaver.store.migrate import connect, migrate
 
@@ -750,13 +753,29 @@ def test_a_port_already_in_use_is_refused_before_a_url_is_printed(tmp_path):
     held = mcp_cli.bind_listener(mcp_server.DEFAULT_HOST, mcp_cli._free_port())
     try:
         port = held.getsockname()[1]
-        out = io.StringIO()
-        status: list[str] = []
-        args = _selftest_args(selftest=False, db=db_path, port=port)
-        assert mcp_cli.run(args, out=out, on_status=status.append) == 1
-        assert "http://" not in out.getvalue()
-        assert "cannot bind" in out.getvalue()
-        assert "already serving it" in out.getvalue()
+        # A subprocess, not an in-process `run()`: if the guard ever stops
+        # working, `run()` does not return an error, it serves forever, and
+        # an in-process call would hang the suite rather than fail it.
+        # Measured — mutating the bind away cost a mutation battery its whole
+        # budget twice before this test was moved out of process.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SERVE_SUBPROCESS, str(db_path), str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError(
+                "the collision was never refused: the process is still serving a "
+                "port another socket holds"
+            ) from None
+        assert proc.returncode == 1, f"exited {proc.returncode}\n{stderr}"
+        assert "http://" not in stdout, stdout
+        assert "cannot bind" in stdout, stdout
+        assert "already serving it" in stdout, stdout
     finally:
         held.close()
 
@@ -927,3 +946,345 @@ def test_the_server_advertises_a_version_in_the_handshake(store):
     server = mcp_server.build_server(Path("unused.db"), connect=lambda _: _conn(store))
     assert server.version == palaver.__version__
     assert server.version
+
+
+# =============================================================================
+# Task 6.2: the bound is bytes on the wire, and the cut is keyset
+#
+# The plan built this task on `mcp`'s 4 MiB `max_request_body_size`. Measured
+# against a live client, that constant guards **incoming POST bodies** and
+# never sees a tool result. What truncates a recall is `httpx2`'s
+# `DEFAULT_MAX_EVENT_SIZE_BYTES` — 1 MiB, client-side, per SSE event — and
+# over it the caller gets `MCPError: SSE stream ended without a response`,
+# which names neither size nor remedy. Hence a bound asserted here, before
+# the response leaves the tool. `palaver/mcp/pagination.py` records the
+# measurements.
+# =============================================================================
+
+
+def _fill_memories(
+    db_path: Path, seeded: dict, count: int, size: int, *, session_index: int = 0
+) -> list[str]:
+    """Write `count` memories of roughly `size` bytes each, and return them.
+
+    The prose is generated, never copied: INV-9 treats a committed fixture
+    carrying real session text as an export that cannot be recalled, and a
+    multi-megabyte one would be the largest such export in the repo.
+
+    Numbering continues from what is already stored, so a caller that fills
+    in several rounds — as the exhaustion test does, writing between pages —
+    gets distinct statements instead of a second `memory 0`.
+    """
+    conn = connect(db_path)
+    chunk_id = conn.execute("SELECT id FROM transcript_chunks ORDER BY id LIMIT 1").fetchone()[0]
+    start = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    written = []
+    try:
+        for index in range(start, start + count):
+            # Quotes and backslashes are what escaping doubles, so prose
+            # without them would understate the wire size it produces.
+            statement = f'memory {index}: the caller said "keep it" \\ ' + "detail " * (
+                max(size // 7, 1)
+            )
+            write_memory(
+                conn,
+                project_id=seeded["project_id"],
+                session_id=seeded["session_ids"][session_index],
+                statement=statement,
+                origin="observer",
+                tier=4,
+                evidence=[
+                    EvidenceAnchor(start_offset=0, end_offset=8, transcript_chunk_id=chunk_id)
+                ],
+            )
+            written.append(statement)
+        conn.commit()
+    finally:
+        conn.close()
+    return written
+
+
+def test_recall_over_long_session_is_bounded(store):
+    """A recall whose full result is over 4 MiB still fits one response.
+
+    4 MiB is the figure the plan named. It is also comfortably over the
+    1 MiB the client actually enforces, so a fixture built to the planned
+    number exercises the real limit several times over.
+    """
+    db_path, seeded = store
+    _fill_memories(db_path, seeded, count=600, size=8000)
+
+    conn = _conn(db_path)
+    try:
+        unbounded = read_memories(conn, session=seeded["session_ids"][0])
+        full_bytes = pagination.wire_size({"scope": {}, "memories": unbounded})
+        assert full_bytes > 4 * 1024 * 1024, f"fixture is only {full_bytes} bytes"
+
+        page = tools_read.recall(conn, {"session": seeded["session_key"]})
+    finally:
+        conn.close()
+
+    assert pagination.wire_size(page) <= pagination.RESPONSE_BUDGET
+    assert pagination.wire_size(page) < pagination.MAX_SSE_EVENT_BYTES
+    assert page["next_cursor"] is not None, "a truncated page must say how to continue"
+    assert len(page["memories"]) < len(unbounded)
+
+
+def test_the_paginate_bound_is_measured_on_the_serialized_payload_not_the_row_count(store):
+    """Row count is not a proxy for bytes, and the code must not treat it as one.
+
+    Two scopes with the *same* number of memories, differing only in how
+    large each statement is, must produce different page sizes. If the cut
+    were an item count, both would return the same number of rows and this
+    would fail.
+    """
+    db_path, seeded = store
+    pages = {}
+    for label, size in (("small", 200), ("large", 20000)):
+        # Separate databases, not two rounds against one: appending the large
+        # memories after the small ones would leave page one entirely small
+        # either way, and the test would compare a store against itself.
+        other = db_path.parent / f"{label}.db"
+        other_seeded = _seed(other)
+        _fill_memories(other, other_seeded, count=400, size=size)
+        conn = _conn(other)
+        try:
+            pages[label] = tools_read.recall(conn, {"session": other_seeded["session_key"]})
+        finally:
+            conn.close()
+
+    assert len(pages["small"]["memories"]) > len(pages["large"]["memories"])
+    for page in pages.values():
+        assert pagination.wire_size(page) <= pagination.RESPONSE_BUDGET
+
+
+def test_paginate_wire_size_counts_the_second_escaping_a_row_count_cannot_see():
+    """The payload is escaped twice, and quotes are what makes that expensive.
+
+    The tool's dict becomes JSON, and that JSON is embedded as a *string* in
+    `content[0].text`, so one `"` costs four bytes on the wire. A budget
+    calibrated on plain prose would be well over on quote-heavy evidence.
+    """
+    plain = {"scope": {}, "memories": [{"statement": "x" * 4000}]}
+    quoted = {"scope": {}, "memories": [{"statement": '"' * 4000}]}
+    assert pagination.wire_size(quoted) > pagination.wire_size(plain) * 1.5
+
+
+def test_a_paginate_cursor_from_one_scope_is_refused_against_another(store):
+    """A cursor is bound to the question it answered.
+
+    Honoured across scopes it would return the wrong scope's rows in a
+    response that looks entirely normal — the one failure the scope rules in
+    `tools_read` exist to prevent, reintroduced through the back door.
+    """
+    db_path, seeded = store
+    _fill_memories(db_path, seeded, count=400, size=8000)
+
+    conn = _conn(db_path)
+    try:
+        session_page = tools_read.recall(conn, {"session": seeded["session_key"]})
+        assert session_page["next_cursor"] is not None
+
+        with pytest.raises(pagination.CursorError) as excinfo:
+            tools_read.recall(conn, {"project": "demo"}, session_page["next_cursor"])
+        assert "different scope" in str(excinfo.value)
+
+        # Positive control: the same cursor against its own scope works, so
+        # the refusal above is about the scope and not about the cursor
+        # being unusable in general.
+        again = tools_read.recall(
+            conn, {"session": seeded["session_key"]}, session_page["next_cursor"]
+        )
+        assert again["memories"], "the cursor must still work for its own scope"
+    finally:
+        conn.close()
+
+
+def test_a_garbled_paginate_cursor_is_refused_rather_than_silently_restarted(store):
+    """Ignoring a bad cursor restarts at page one without saying so.
+
+    The caller would re-read rows it already has, believing it advanced.
+    """
+    db_path, seeded = store
+    conn = _conn(db_path)
+    try:
+        for bad in ("not-a-cursor", "", "!!!!", base64.urlsafe_b64encode(b"{}").decode()):
+            with pytest.raises(pagination.CursorError):
+                tools_read.recall(conn, {"session": seeded["session_key"]}, bad)
+    finally:
+        conn.close()
+
+
+def test_paginating_to_exhaustion_returns_every_memory_exactly_once(store):
+    """The property that makes the cursor keyset rather than offset.
+
+    `palaver observe` writes to this database while an agent pages through
+    it. Under `LIMIT/OFFSET` an insert between two pages shifts every later
+    offset and a row is dropped with no trace — so a row is inserted between
+    every pair of pages here. A test that paged a quiescent store would pass
+    for an offset cursor too, and prove nothing about the one that matters.
+    """
+    db_path, seeded = store
+    _fill_memories(db_path, seeded, count=500, size=6000)
+
+    seen: list[str] = []
+    cursor = None
+    pages = 0
+    while True:
+        conn = _conn(db_path)
+        try:
+            page = tools_read.recall(conn, {"session": seeded["session_key"]}, cursor)
+        finally:
+            conn.close()
+        seen.extend(memory["statement"] for memory in page["memories"])
+        pages += 1
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        assert pages < 100, "paging is not converging"
+        _fill_memories(db_path, seeded, count=1, size=6000)  # observe, mid-read
+
+    assert pages > 1, "the fixture must be large enough to actually paginate"
+    conn = _conn(db_path)
+    try:
+        expected = [
+            row["statement"] for row in read_memories(conn, session=seeded["session_ids"][0])
+        ]
+    finally:
+        conn.close()
+    assert len(seen) == len(set(seen)), "a row came back twice"
+    assert seen == expected, "the pages did not reconstruct the store in order"
+
+
+def test_a_single_memory_over_the_budget_is_refused_rather_than_paged_forever(store):
+    """Paging cannot split a row, so an oversized one must raise.
+
+    Returning an empty page plus a cursor would loop a caller forever on a
+    row that can never be delivered.
+    """
+    db_path, seeded = store
+    # A session of its own, so the oversized memory is the *first* row of its
+    # scope. Behind a small row it would simply not fit on page one and be
+    # deferred forever instead — a different bug, and not this one.
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO sessions (project_id, source, external_id) VALUES (?, ?, ?)",
+            (seeded["project_id"], "claude-code", "session-oversized"),
+        )
+        conn.commit()
+        seeded = {
+            **seeded,
+            "session_ids": [
+                *seeded["session_ids"],
+                conn.execute(
+                    "SELECT id FROM sessions WHERE external_id = ?", ("session-oversized",)
+                ).fetchone()[0],
+            ],
+        }
+    finally:
+        conn.close()
+
+    _fill_memories(db_path, seeded, count=1, size=pagination.RESPONSE_BUDGET, session_index=1)
+    conn = _conn(db_path)
+    try:
+        with pytest.raises(pagination.RowTooLargeError) as excinfo:
+            tools_read.recall(conn, {"session": "demo/session-oversized"})
+        assert "shortened at the source" in str(excinfo.value)
+
+        # Positive control: the same scope with a normal-sized memory
+        # returns it, so the refusal above is about the size and not about
+        # this session being unreadable.
+        ok = tools_read.recall(conn, {"session": seeded["session_key"]})
+        assert ok["memories"]
+    finally:
+        conn.close()
+
+
+def test_palaver_sessions_paginates_without_ever_returning_a_rowid(store):
+    """The session list pages too, and still refuses to hand out a rowid.
+
+    `resolve_session_id` refuses a rowid as a session identifier so a caller
+    never holds one. Paginating by `sessions.id` puts that value back within
+    reach, so the emitted records are checked for it explicitly.
+    """
+    db_path, seeded = store
+    conn = connect(db_path)
+    try:
+        for index in range(300):
+            conn.execute(
+                "INSERT INTO sessions (project_id, source, external_id) VALUES (?, ?, ?)",
+                (seeded["project_id"], "claude-code", f"paginate-session-{index:04d}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = _conn(db_path)
+    try:
+        page = tools_read.sessions(conn, {"project": "demo"})
+    finally:
+        conn.close()
+
+    assert page["sessions"]
+    assert pagination.wire_size(page) <= pagination.RESPONSE_BUDGET
+    for record in page["sessions"]:
+        assert set(record) == {"session_key", "source", "started_at", "ended_at"}
+
+
+def test_a_paginated_recall_survives_the_real_transport_a_client_speaks(tmp_path):
+    """The check that would have caught this task's premise being wrong.
+
+    Everything above measures Palaver's own arithmetic. This drives a real
+    `streamable_http_client` against a real server over a loopback socket
+    and follows the cursors, because the limit being budgeted for is the
+    *client's*, and no in-process assertion can observe it.
+    """
+    db_path = tmp_path / "wire.db"
+    seeded = _seed(db_path)
+    _fill_memories(db_path, seeded, count=400, size=8000)
+    port = mcp_cli._free_port()
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SERVE_SUBPROCESS, str(db_path), str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        url = _endpoint_line(proc)
+        assert url.startswith("http://")
+        pages = asyncio.run(_with_timeout(_follow_cursors(url, seeded["session_key"]), 60.0))
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=30)
+    except BaseException:
+        proc.kill()
+        raise
+
+    statements = [memory["statement"] for page in pages for memory in page["memories"]]
+    assert len(pages) > 1, "the fixture must be large enough to actually paginate"
+    assert len(statements) == len(set(statements))
+    assert len(statements) == 401  # 400 written here, plus the one `_seed` writes
+
+
+async def _follow_cursors(url: str, session_key: str) -> list[dict]:
+    """Page a real client through to exhaustion, returning every page."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    pages: list[dict] = []
+    async with streamable_http_client(url) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            cursor = None
+            while True:
+                arguments: dict = {"scope": {"session": session_key}}
+                if cursor is not None:
+                    arguments["cursor"] = cursor
+                result = await session.call_tool("palaver_recall", arguments)
+                assert not result.is_error, result.content[0].text
+                page = json.loads(result.content[0].text)
+                pages.append(page)
+                cursor = page["next_cursor"]
+                if cursor is None or len(pages) > 100:
+                    return pages

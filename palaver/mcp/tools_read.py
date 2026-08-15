@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from palaver.mcp.pagination import decode_cursor, paginate
 from palaver.memory.scope import read_memories
 from palaver.memory.tiers import tier_name
 
@@ -167,42 +168,59 @@ def resolve_session_id(conn: sqlite3.Connection, session: str) -> int:
     return int(matches[0][0])
 
 
-def recall(conn: sqlite3.Connection, scope: Any) -> dict:
+def recall(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> dict:
     """Read the memories in one scope, each carrying its provenance tier.
 
     Args:
         conn: Open connection to a migrated database.
         scope: The caller's scope argument; see `parse_scope`.
+        cursor: The `next_cursor` from a previous call, to resume where that
+            page stopped. Omitted or `None` starts at the beginning. A cursor
+            issued for a different scope is refused rather than honoured —
+            see `pagination.decode_cursor`.
 
     Returns:
-        A dict with the resolved `scope` echoed back and a `memories` list.
-        Every record carries both the numeric `tier` and its `tier_name`,
-        so a caller weighing two statements against each other can see which
-        one outranks the other without knowing Palaver's tier table.
+        A dict with the resolved `scope` echoed back, a `memories` list, and
+        a `next_cursor`. Every record carries both the numeric `tier` and its
+        `tier_name`, so a caller weighing two statements against each other
+        can see which one outranks the other without knowing Palaver's tier
+        table.
+
+        `next_cursor` is `None` exactly when this page is the last one. A
+        caller loops until it is `None` rather than until a page comes back
+        short: a page that happens to fill the byte budget exactly can still
+        be the final one, and stopping on "not full" would drop the tail.
 
     Raises:
         ScopeError: The scope was absent, doubled, or malformed.
         SessionLookupError: A session scope resolved to no session, or to
             several.
         LookupError: A project scope named no project.
+        CursorError: The cursor is malformed, stale, or from another scope.
+        RowTooLargeError: One memory alone exceeds the response budget.
     """
     parsed = parse_scope(scope)
 
+    echo = (
+        {"project": parsed.project} if parsed.project is not None else {"session": parsed.session}
+    )
+    after_id = decode_cursor(cursor, echo) if cursor is not None else 0
+
     if parsed.project is not None:
-        rows = read_memories(conn, project=parsed.project)
-        echo = {"project": parsed.project}
+        rows = read_memories(conn, project=parsed.project, after_id=after_id)
     else:
-        session_id = resolve_session_id(conn, parsed.session)
-        rows = read_memories(conn, session=session_id)
-        echo = {"session": parsed.session}
+        rows = read_memories(
+            conn, session=resolve_session_id(conn, parsed.session), after_id=after_id
+        )
 
-    return {
-        "scope": echo,
-        "memories": [{**row, "tier_name": tier_name(row["tier"])} for row in rows],
-    }
+    return paginate(
+        [(int(row["id"]), {**row, "tier_name": tier_name(row["tier"])}) for row in rows],
+        scope=echo,
+        items_key="memories",
+    )
 
 
-def sessions(conn: sqlite3.Connection, scope: Any) -> dict:
+def sessions(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> dict:
     """List the sessions in one scope, so a caller can obtain a session key.
 
     This is the companion to `recall`'s session scope: a caller that holds
@@ -215,20 +233,36 @@ def sessions(conn: sqlite3.Connection, scope: Any) -> dict:
             scope lists every session of that project. A session scope
             returns the single session it resolves to, which is how a caller
             confirms an identifier means what they think before using it.
+        cursor: The `next_cursor` from a previous call, to resume where that
+            page stopped. Omitted or `None` starts at the beginning.
 
     Returns:
-        A dict with the resolved `scope` echoed back and a `sessions` list,
-        each carrying `session_key`, `source`, `started_at`, and `ended_at`.
+        A dict with the resolved `scope` echoed back, a `sessions` list —
+        each carrying `session_key`, `source`, `started_at`, and `ended_at`,
+        and never a rowid — and a `next_cursor` that is `None` exactly when
+        this page is the last one.
 
     Raises:
         ScopeError: The scope was absent, doubled, or malformed.
         SessionLookupError: A session scope resolved to no session, or to
             several.
         LookupError: A project scope named no project.
+        CursorError: The cursor is malformed, stale, or from another scope.
+        RowTooLargeError: One session record alone exceeds the budget.
     """
     parsed = parse_scope(scope)
 
-    columns = "p.name, s.external_id, s.source, s.started_at, s.ended_at"
+    echo = (
+        {"project": parsed.project} if parsed.project is not None else {"session": parsed.session}
+    )
+    after_id = decode_cursor(cursor, echo) if cursor is not None else 0
+
+    # `s.id` is selected to order and resume by, and is deliberately absent
+    # from every emitted record: `resolve_session_id` refuses a rowid as a
+    # session identifier so that a caller never holds one, and returning it
+    # in each row would hand back exactly the value that refusal exists to
+    # keep out of a caller's hands.
+    columns = "s.id, p.name, s.external_id, s.source, s.started_at, s.ended_at"
     if parsed.project is not None:
         project_row = conn.execute(
             "SELECT id FROM projects WHERE name = ?", (parsed.project,)
@@ -237,31 +271,33 @@ def sessions(conn: sqlite3.Connection, scope: Any) -> dict:
             raise LookupError(f"no project named {parsed.project!r}")
         rows = conn.execute(
             f"SELECT {columns} FROM sessions s JOIN projects p ON p.id = s.project_id "
-            "WHERE s.project_id = ? ORDER BY s.id",
-            (project_row[0],),
+            "WHERE s.project_id = ? AND s.id > ? ORDER BY s.id",
+            (project_row[0], after_id),
         ).fetchall()
-        echo = {"project": parsed.project}
     else:
         session_id = resolve_session_id(conn, parsed.session)
         rows = conn.execute(
             f"SELECT {columns} FROM sessions s JOIN projects p ON p.id = s.project_id "
-            "WHERE s.id = ?",
-            (session_id,),
+            "WHERE s.id = ? AND s.id > ?",
+            (session_id, after_id),
         ).fetchall()
-        echo = {"session": parsed.session}
 
-    return {
-        "scope": echo,
-        "sessions": [
-            {
-                "session_key": f"{name}/{external_id}",
-                "source": source,
-                "started_at": started_at,
-                "ended_at": ended_at,
-            }
-            for name, external_id, source, started_at, ended_at in rows
+    return paginate(
+        [
+            (
+                row_id,
+                {
+                    "session_key": f"{name}/{external_id}",
+                    "source": source,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                },
+            )
+            for row_id, name, external_id, source, started_at, ended_at in rows
         ],
-    }
+        scope=echo,
+        items_key="sessions",
+    )
 
 
 #: Every read tool, by the name it is exposed under. `server.build_server`

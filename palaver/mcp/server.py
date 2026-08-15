@@ -108,14 +108,18 @@ def build_server(
     # what two machines are running has nothing to compare.
     server = MCPServer(name=name, version=__version__, instructions=INSTRUCTIONS)
 
-    def _register(tool_name: str, handler: Callable[[sqlite3.Connection, Any], dict]) -> None:
+    def _register(tool_name: str, handler: Callable[..., dict]) -> None:
         # Bound in a closure per tool rather than in the loop body directly:
         # a late-binding `handler` would register every tool against the last
         # one in the mapping, and every tool would answer identically.
-        def _call(scope: dict[str, str]) -> dict[str, Any]:
+        #
+        # `cursor` defaults to None rather than being required, so the first
+        # call of a sequence looks exactly like an unpaginated one. `scope`
+        # has no default and never will — see `tools_read`.
+        def _call(scope: dict[str, str], cursor: str | None = None) -> dict[str, Any]:
             conn = connect(db_path)
             try:
-                return handler(conn, scope)
+                return handler(conn, scope, cursor)
             finally:
                 conn.close()
 

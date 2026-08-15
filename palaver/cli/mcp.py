@@ -284,10 +284,17 @@ class _StopRequest:
         self._server = None
 
     def attach(self, server) -> None:
-        """Bind the server, applying any request that already arrived."""
+        """Bind the server, so a later signal has somewhere to go.
+
+        Deliberately does *not* apply an already-recorded request: mutation
+        testing showed that branch survives every test, because
+        `_serve_forever` checks `requested` immediately afterwards and
+        returns without serving. Two mechanisms for one case means one of
+        them is never the reason the stop worked, so the redundant one is
+        gone rather than covered by a test that would only prove it is
+        redundant.
+        """
         self._server = server
-        if self.requested:
-            server.should_exit = True
 
     def record(self, signum: int, frame) -> None:
         """Signal handler: remember the request, and forward it if possible."""
