@@ -58,7 +58,7 @@ import os
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from palaver.observer.signals import Liveness, Tri
@@ -392,7 +392,14 @@ def session_candidates(
     Args:
         project_key: The encoded project directory name.
         sessions_root: The store root, e.g. `~/.claude/projects`.
-        now: Reference time the window is measured back from.
+        now: Reference time the window is measured back from. Compared
+            against store mtimes, which are absolute epoch seconds, so this
+            is converted with `.timestamp()` and follows its rule: an aware
+            datetime is exact, a naive one is read as *local* time. Passing a
+            naive UTC clock therefore shifts the cutoff by the UTC offset —
+            silently, since it still returns a plausible-looking list. The
+            rest of the tree (`collect_status`) is aware-UTC and callers
+            should stay that way; `join_pane`'s default does.
         activity_window: How recently a store must have been written.
 
     Returns:
@@ -494,7 +501,7 @@ def join_pane(
         return None
 
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
     candidates = session_candidates(project_key, root, now=now, activity_window=activity_window)
     return PaneJoin(
         pane_id=variables.pane_id,

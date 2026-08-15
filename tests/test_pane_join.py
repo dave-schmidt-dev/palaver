@@ -30,7 +30,8 @@ import itertools
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -119,14 +120,20 @@ def _variables(cwd, *, pane_id="pane-1", job_pid=JOB_PID, job_name="node", path=
     )
 
 
-def _join(cwd, sessions_root, *, table=None, cwd_reader=None, **kwargs):
-    """Call `join_pane` with the agent's cwd reported as `cwd` by default."""
+def _join(cwd, sessions_root, *, table=None, cwd_reader=None, now=NOW, **kwargs):
+    """Call `join_pane` with the agent's cwd reported as `cwd` by default.
+
+    `now` is an explicit parameter rather than part of `**kwargs` so a test
+    can pass `now=None` and reach `join_pane`'s own clock default. Folded into
+    `**kwargs` it would be forwarded to `_variables` instead and never get
+    near the code under test.
+    """
     return join_pane(
         _variables(cwd, **kwargs),
         table=_table() if table is None else table,
         cwd_reader=(lambda pid: cwd) if cwd_reader is None else cwd_reader,
         sessions_root=sessions_root,
-        now=NOW,
+        now=now,
     )
 
 
@@ -446,6 +453,63 @@ def test_a_session_older_than_the_activity_window_is_not_a_candidate(project):
     fresh = (NOW - timedelta(minutes=1)).timestamp()
     os.utime(stale, (fresh, fresh))
     assert session_candidates(project_key_for_cwd(cwd), sessions_root, now=NOW) == ("old-session",)
+
+
+def test_an_aware_clock_and_a_naive_local_one_pick_the_same_candidates(project):
+    """The window is compared against mtimes, which are absolute epoch seconds.
+
+    `datetime.timestamp()` reads an aware value exactly and a naive one as
+    *local* time, so the same wall-clock instant expressed both ways must land
+    on the same cutoff. It does today only because `NOW` is naive-local; the
+    rest of the tree (`collect_status`) is aware-UTC, and 5.3 wires a live app
+    to this. A caller switching to the aware clock the rest of the tree uses
+    must not silently shift the window by the UTC offset.
+    """
+    cwd, sessions_root = project
+    key = project_key_for_cwd(cwd)
+    store = sessions_root / key / "aware-session.jsonl"
+    store.write_text("", encoding="utf-8")
+    inside = (NOW - timedelta(minutes=1)).timestamp()
+    os.utime(store, (inside, inside))
+
+    naive_local = NOW
+    aware = datetime.fromtimestamp(NOW.timestamp(), tz=timezone.utc)
+    assert aware.tzinfo is not None and naive_local.tzinfo is None
+    assert aware.timestamp() == naive_local.timestamp()
+
+    assert session_candidates(key, sessions_root, now=aware) == ("aware-session",)
+    assert session_candidates(key, sessions_root, now=aware) == session_candidates(
+        key, sessions_root, now=naive_local
+    )
+
+    # Positive control: the agreement is not both clocks being uselessly
+    # permissive. Just outside the window, both must also agree on nothing.
+    outside = (NOW - timedelta(days=3)).timestamp()
+    os.utime(store, (outside, outside))
+    assert session_candidates(key, sessions_root, now=aware) == ()
+    assert session_candidates(key, sessions_root, now=naive_local) == ()
+
+
+def test_the_default_clock_is_an_absolute_instant_not_a_naive_utc_reading(project):
+    """`join_pane`'s `now` default has to agree with `st_mtime`'s epoch.
+
+    A default of `datetime.now(timezone.utc)` is correct and so is a naive
+    `datetime.now()`; a naive *UTC* clock is not, because `.timestamp()` would
+    then re-interpret it as local and move the cutoff by the UTC offset. West
+    of UTC that pushes the cutoff into the future and a store written this
+    second stops being a candidate, which is what this asserts against.
+    """
+    cwd, sessions_root = project
+    store = sessions_root / project_key_for_cwd(cwd) / "right-now.jsonl"
+    store.write_text("", encoding="utf-8")
+    just_now = time.time() - 1.0
+    os.utime(store, (just_now, just_now))
+
+    join = _join(cwd=cwd, sessions_root=sessions_root, now=None)
+
+    assert join is not None
+    assert join.session_candidates == ("right-now",)
+    assert join.session_key == "right-now"
 
 
 # --- the pieces --------------------------------------------------------------
