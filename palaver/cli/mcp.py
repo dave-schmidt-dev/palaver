@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import signal
 import socket
 import sqlite3
 import sys
@@ -58,10 +59,6 @@ SELFTEST_PROJECT = "palaver-selftest"
 SELFTEST_SESSION_ID = "0e5f1a1c-selftest-0000-000000000000"
 SELFTEST_STATEMENT = "The selftest seeded exactly one memory, at tier 3."
 SELFTEST_TIER = 3
-
-
-def _no_status(message: str) -> None:
-    """Swallow a progress message when the caller supplied no channel."""
 
 
 def seed_selftest_db(db_path: Path) -> str:
@@ -181,9 +178,158 @@ def _build_server(app, host: str, port: int):
     return uvicorn.Server(config)
 
 
-async def _serve_forever(app, host: str, port: int) -> None:
-    """Run the ASGI app under uvicorn until the process is interrupted."""
-    await _build_server(app, host, port).serve()
+async def _announce_when_started(server, announce: Callable[[], None]) -> None:
+    """Call `announce` once uvicorn is accepting requests.
+
+    The endpoint URL is stdout's result, so it should mean "this is
+    serving", not "this bound a port and intends to". The difference is not
+    cosmetic: a supervisor or a test that treats the URL as the ready
+    signal and acts on it immediately would otherwise race the startup it
+    was waiting for.
+    """
+    while not server.started:
+        await asyncio.sleep(0.01)
+    announce()
+
+
+async def _serve_forever(
+    app,
+    host: str,
+    port: int,
+    *,
+    sock: socket.socket | None = None,
+    stop: _StopRequest | None = None,
+    announce: Callable[[], None] | None = None,
+) -> None:
+    """Run the ASGI app under uvicorn until it is asked to stop.
+
+    Args:
+        app: The Starlette application.
+        host: Interface, used for logging when `sock` is supplied.
+        port: Port, likewise.
+        sock: An already-bound listening socket. When given, uvicorn serves
+            it instead of binding its own — see `bind_listener`.
+        stop: The record from `own_stop_signals`, handed the server so a
+            signal arriving before uvicorn installs its own handler still
+            stops it.
+        announce: Called once the server is actually accepting requests.
+    """
+    server = _build_server(app, host, port)
+    if stop is not None:
+        stop.attach(server)
+        if stop.requested:
+            # Signalled before there was anything to signal. Returning here
+            # rather than serving is the difference between a stop that is
+            # honoured and one that is dropped on the floor.
+            return
+    if announce is not None:
+        asyncio.get_running_loop().create_task(_announce_when_started(server, announce))
+    await server.serve(sockets=None if sock is None else [sock])
+
+
+def bind_listener(host: str, port: int) -> socket.socket:
+    """Take the listening socket before anything is announced.
+
+    `run()` writes the endpoint URL to stdout, which is its result contract,
+    and letting uvicorn bind means that write happens *before* the bind is
+    known to have succeeded. A second `palaver mcp` on the fixed default port
+    would then print a URL it does not serve and exit, which is exactly the
+    confidently-stale answer INV-7 exists to prevent — the reader has a URL
+    in hand and no reason to distrust it.
+
+    Binding here also closes the check-then-bind race a pre-flight probe
+    would leave open: the port is held from this call onward, not merely
+    observed to be free a moment ago.
+
+    `SO_REUSEADDR` is set so a restart is not blocked by the previous
+    process's sockets in `TIME_WAIT`. Measured on macOS 15: it does **not**
+    permit a second live listener — a real collision still raises
+    `EADDRINUSE` — so it buys the restart without weakening the check.
+
+    Args:
+        host: Interface to bind.
+        port: Port to bind.
+
+    Returns:
+        A bound, listening socket for uvicorn to serve.
+
+    Raises:
+        OSError: The address is in use or otherwise unbindable.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(socket.SOMAXCONN)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class _StopRequest:
+    """A stop signal that arrived before uvicorn was ready to receive it.
+
+    uvicorn installs its own signal handlers, but only once `serve()` is
+    running. Between `own_stop_signals()` and that moment there is a window
+    — short, but it covers the whole of ASGI startup — where a SIGINT or
+    SIGTERM would land on a handler that does nothing, and the server would
+    then run forever having been told twice to stop. This holds the request
+    across that window and applies it as soon as there is a server to apply
+    it to.
+    """
+
+    def __init__(self) -> None:
+        self.requested = False
+        self._server = None
+
+    def attach(self, server) -> None:
+        """Bind the server, applying any request that already arrived."""
+        self._server = server
+        if self.requested:
+            server.should_exit = True
+
+    def record(self, signum: int, frame) -> None:
+        """Signal handler: remember the request, and forward it if possible."""
+        self.requested = True
+        if self._server is not None:
+            self._server.should_exit = True
+
+
+def own_stop_signals() -> _StopRequest:
+    """Claim SIGINT and SIGTERM before `asyncio.run` can.
+
+    Ctrl-C is how a foreground server is stopped, so it is the normal exit
+    path, and it printed a 25-line `KeyboardInterrupt` traceback. The cause
+    is a three-way interaction worth writing down, because none of the three
+    parties is doing anything wrong:
+
+    1. `asyncio.run` installs its own SIGINT handler, but only if the current
+       handler is still `signal.default_int_handler`. That handler cancels
+       the main task and re-raises `KeyboardInterrupt`.
+    2. uvicorn's `serve()` then installs *its* handler, which sets
+       `should_exit` and shuts down gracefully.
+    3. `sse_starlette` — transitive through `mcp` — replaces
+       `uvicorn.Server.handle_exit` with one that chains to whatever handler
+       was installed when the app started. Under `asyncio.run` that chain
+       lands on asyncio's task-cancelling handler, so a single Ctrl-C both
+       shuts uvicorn down cleanly *and* cancels the task out from under it.
+
+    Installing a handler here defeats step 1's check, so asyncio installs
+    nothing and step 3 chains to this no-op instead. Measured: the graceful
+    shutdown still runs, and the process returns from `asyncio.run` normally
+    rather than through an exception. SIGTERM gets the same treatment,
+    because that is what launchd sends.
+
+    Returns:
+        The `_StopRequest` this installed, to be handed to `_serve_forever`
+        so a signal arriving before uvicorn takes the slot is not lost.
+    """
+    stop = _StopRequest()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, stop.record)
+    return stop
 
 
 async def _await_listening(host: str, port: int, *, attempts: int = 100) -> bool:
@@ -349,10 +495,32 @@ def run(
         out.write(f"palaver mcp: {exc}\n")
         return 1
 
+    try:
+        sock = bind_listener(args.host, args.port)
+    except OSError as exc:
+        out.write(
+            f"palaver mcp: cannot bind {args.host}:{args.port}: {exc.strerror or exc}. "
+            "Another Palaver MCP server is probably already serving it.\n"
+        )
+        return 1
+
     _, app = mcp_server.build_app(db_path, host=args.host)
     url = f"http://{args.host}:{args.port}{mcp_server.DEFAULT_PATH}"
     on_status(f"serving {db_path} at {url}")
-    out.write(f"{url}\n")
-    out.flush()
-    asyncio.run(_serve_forever(app, args.host, args.port))
+
+    def _announce() -> None:
+        # stdout is the result, and it goes out only once the server is
+        # accepting requests — a URL printed by a process that is not yet
+        # (or no longer) serving is worse than no URL at all.
+        out.write(f"{url}\n")
+        out.flush()
+
+    stop = own_stop_signals()
+    try:
+        asyncio.run(
+            _serve_forever(app, args.host, args.port, sock=sock, stop=stop, announce=_announce)
+        )
+    finally:
+        sock.close()
+    on_status("stopped")
     return 0

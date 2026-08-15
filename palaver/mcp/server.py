@@ -31,6 +31,7 @@ from typing import Any
 
 from mcp.server import MCPServer
 
+from palaver import __version__
 from palaver.mcp import tools_read
 
 log = logging.getLogger(__name__)
@@ -102,7 +103,10 @@ def build_server(
         and building it eagerly would tie server construction to a transport
         a caller might not want yet.
     """
-    server = MCPServer(name=name, instructions=INSTRUCTIONS)
+    # The version travels in the initialize handshake and is what a client
+    # reports back. Left unset it is the empty string, so a user comparing
+    # what two machines are running has nothing to compare.
+    server = MCPServer(name=name, version=__version__, instructions=INSTRUCTIONS)
 
     def _register(tool_name: str, handler: Callable[[sqlite3.Connection, Any], dict]) -> None:
         # Bound in a closure per tool rather than in the loop body directly:
