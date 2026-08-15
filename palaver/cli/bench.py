@@ -31,6 +31,7 @@ from typing import TextIO
 from palaver.bench import (
     DEFAULT_SESSIONS,
     DEFAULT_TICK_INTERVAL,
+    PROJECTION_HORIZONS_DAYS,
     BenchError,
     BenchReport,
     run_bench,
@@ -59,6 +60,43 @@ def _render_slot_files(report: BenchReport) -> list[str]:
         f"slot files: {usage.file_count} file(s), {_megabytes(usage.total_bytes)}",
         f"  {usage.path}",
     ]
+
+
+def _kibibytes(value: int) -> str:
+    return f"{value / 1024:.1f} KiB"
+
+
+def _render_growth(report: BenchReport) -> list[str]:
+    """Render the store's current size and its projected size (task 4.5).
+
+    The two horizon lines are always printed. When the store is too young to
+    project from, they carry the reason instead of a number — a fabricated
+    projection would be indistinguishable from a measured one in the output,
+    which is the failure mode the rest of this report is built to avoid.
+    """
+    lines = ["", f"store: {_megabytes(report.store_total_bytes)} on disk"]
+    for usage in report.tables:
+        pages = (
+            "pages unavailable (no dbstat in this SQLite build)"
+            if usage.page_bytes < 0
+            else f"{_kibibytes(usage.page_bytes)} of pages"
+        )
+        lines.append(
+            f"  {usage.table}: {usage.rows} row(s), "
+            f"{_kibibytes(usage.payload_bytes)} of text, {pages}"
+        )
+    projection = report.projection
+    if projection is None:
+        for days in PROJECTION_HORIZONS_DAYS:
+            lines.append(f"  {days}-day projection: unavailable — {report.projection_detail}")
+        return lines
+    lines.append(
+        f"  measured growth: {_kibibytes(int(projection.bytes_per_day))}/day "
+        f"over {projection.span_days:.0f} day(s), {projection.samples_used} sample(s)"
+    )
+    for days, projected in projection.horizons:
+        lines.append(f"  {days}-day projection: {_megabytes(projected)}")
+    return lines
 
 
 def _render_sessions(report: BenchReport) -> list[str]:
@@ -94,6 +132,7 @@ def render_report(report: BenchReport, *, host: str, port: int, detailed: bool) 
         f"peak RSS: {_megabytes(report.rss_after_bytes)} "
         f"(delta over the round {_megabytes(report.rss_delta_bytes)})",
         *_render_slot_files(report),
+        *_render_growth(report),
     ]
     if detailed:
         lines.extend(_render_sessions(report))
@@ -152,6 +191,15 @@ def add_arguments(parser) -> None:
         help="the server's --slot-save-path, which it will not report over HTTP",
     )
     parser.add_argument(
+        "--growth-db",
+        type=Path,
+        default=None,
+        help=(
+            "store to measure growth against (default: the benchmark store; "
+            "point this at a real store to project its disk usage)"
+        ),
+    )
+    parser.add_argument(
         "--db",
         type=Path,
         default=None,
@@ -196,6 +244,7 @@ def run(
             timeout=args.timeout,
             tick_interval=args.tick_interval,
             prompt_words=args.prompt_words,
+            growth_db_path=args.growth_db,
             slot_save_path=args.slot_save_path,
             on_status=on_status,
         )
