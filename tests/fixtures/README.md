@@ -115,7 +115,13 @@ time, so withholding it keeps the corroboration column reproducible.
 - **case:** WAITING_FOR_USER
 - **ground truth:** AWAITING_HUMAN
 - **derived today:** AWAITING_HUMAN
-- **phase 3 target:** WAITING_FOR_USER
+- **phase 3 target:** QUESTION
+- **phase 3 target corrected 2026-08-14:** was `WAITING_FOR_USER`. Task 3.6 surfaced that this row
+  disagreed with `tests/fixtures/eval/labels.json`, which marks the same fixture `expect_question: true`.
+  The fixture decides it: line 4, the last message-bearing record, is `should i also rename the helper?`
+  — a direct question to the user, not merely an ended turn with work outstanding. Task 3.6's ordered
+  refinement puts `QUESTION` ahead of `WAITING_FOR_USER`, so this row was the stale one. The file name
+  predates the three-way split and is left alone rather than churning a path two test modules reference.
 - **boundary basis:** assistant_final
 - **last message-bearing record:** line 4, an `assistant` record
 - **unresolved tool_use:** no — `tu-1` on line 2 is answered on line 3
