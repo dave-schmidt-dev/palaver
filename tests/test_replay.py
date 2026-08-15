@@ -7,6 +7,16 @@ replays dump identically" just as well as a real one, so each such test also
 asserts the first pass wrote something nonzero, or that the dump actually
 contains fixture-derived content.
 
+**Chunk content changed under task 3.3 and these assertions changed with
+it, not away from it.** `transcript_chunks.content` used to hold
+`json.dumps(record, sort_keys=True)`; it now holds that record's normalized
+rendering, because evidence anchors index this column by offset and the
+quote gate checks model-supplied quotes against those bytes (see
+`palaver/replay.py`'s module docstring). The byte-identical-dump property is
+unchanged and still asserted; what is new is that the dump assertions now
+also pin *which* bytes, so a silent regression to raw JSON — which the old
+assertions passed either way — fails here.
+
 `DEFAULT_DB_PATH` (a fixed path under the OS temp directory, `palaver/cli/replay.py`)
 is deliberately never used here: every test passes its own `tmp_path`-scoped
 `--db`/`db_path` so tests never share mutable state with each other, with a
@@ -20,6 +30,7 @@ not by a test that would otherwise accumulate state across CI runs.
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -27,6 +38,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from palaver.cli import replay as replay_cli
+from palaver.extract.normalize import normalize_path
 from palaver.memory.evidence import resolve_evidence
 from palaver.memory.tiers import TIER_OBSERVER_INFERENCE
 from palaver.observer.signals import Status
@@ -37,9 +49,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
 FIXTURE = FIXTURES_DIR / "waiting-for-user-reply.jsonl"
 BOOKKEEPING_FIXTURE = FIXTURES_DIR / "bookkeeping-only.jsonl"
+COMPACTION_FIXTURE = FIXTURES_DIR / "compaction-boundary.jsonl"
 
 #: Fixed reference time so nothing here depends on when the suite runs.
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+
+#: How a raw JSONL record's `"type": "user"` field looks inside a
+#: `dump_database` line: the payload is a JSON string *within* a JSON array,
+#: so its own quotes come back escaped. Used to tell a raw-JSON column from a
+#: normalized one.
+_ESCAPED_RAW_USER_RECORD = '\\"type\\": \\"user\\"'
 
 _TABLES = (
     "projects",
@@ -206,6 +225,17 @@ def test_replay_two_independent_runs_produce_identical_database_dumps(tmp_path):
     assert "waiting-for-user-reply" in dump_a  # the memory's statement, not just a count
     assert "<TIMESTAMP>" in dump_a  # normalization actually fired, not a no-op
 
+    # Which bytes, not just how many rows (task 3.3). Scoped to the
+    # transcript_chunks lines on purpose: `events` rows legitimately still
+    # carry the raw JSON record, so an unscoped "no raw JSON anywhere"
+    # assertion would fail for the wrong reason and hide this one.
+    chunk_lines = [line for line in dump_a.splitlines() if line.startswith("transcript_chunks: ")]
+    assert len(chunk_lines) == 4
+    assert any("HUMAN: " in line for line in chunk_lines)  # normalized, channel-tagged text
+    assert not any(_ESCAPED_RAW_USER_RECORD in line for line in chunk_lines)  # not raw JSON
+    event_lines = [line for line in dump_a.splitlines() if line.startswith("events: ")]
+    assert any(_ESCAPED_RAW_USER_RECORD in line for line in event_lines)  # raw record kept
+
 
 # --- INV-2: the fixture is opened read-only and never mutated ---------------
 
@@ -262,8 +292,272 @@ def test_replay_memory_is_tier_observer_inference_with_resolvable_evidence(tmp_p
             "SELECT content FROM transcript_chunks ORDER BY id ASC LIMIT 1"
         ).fetchone()
         assert resolved == first_chunk_content
+        # And what it resolves to is the normalizer's rendering of that
+        # record (task 3.3), not the raw JSON this column used to hold --
+        # the assertion above passes either way, so it cannot carry this.
+        assert resolved == "HUMAN: refactor the auth module\n"
     finally:
         conn.close()
+
+
+# --- task 3.3: chunk content is the normalizer's own output -----------------
+
+
+def _write_session(tmp_path, records) -> Path:
+    """Write `records` as a JSONL session store under `tmp_path` and return its path.
+
+    Invented content only (INV-9), and never under `tests/fixtures/` -- this
+    is a per-test file, not a committed fixture, so it needs no
+    `fixture-lint` classification and cannot accumulate across runs.
+    """
+    path = tmp_path / "synth-project" / "synth-session.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    return path
+
+
+def _append_records(path: Path, records) -> None:
+    """Append `records` to an existing synthetic session, as a live tail would."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(record) + "\n" for record in records))
+
+
+def _user_text_record(text: str) -> dict:
+    return {
+        "type": "user",
+        "sessionId": "synth",
+        "isMeta": False,
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def _thinking_only_record() -> dict:
+    """An `assistant` record that normalizes to nothing.
+
+    `thinking` blocks are the model's private reasoning and the normalizer
+    drops them, so this record is message-bearing (it produces a `message`
+    event and therefore a chunk) while rendering zero lines -- the exact
+    case the empty-chunk rule exists for.
+    """
+    return {
+        "type": "assistant",
+        "sessionId": "synth",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "unsurfaced reasoning"}],
+        },
+    }
+
+
+def _chunk_rows(conn) -> list[tuple[int, str]]:
+    return conn.execute("SELECT seq, content FROM transcript_chunks ORDER BY seq").fetchall()
+
+
+def test_chunk_contents_joined_in_seq_order_are_the_normalizer_output(tmp_path):
+    """Every chunk holds exactly the line(s) the normalizer emits for its record.
+
+    Byte-identity, not resemblance: joining the fixture's chunk contents in
+    `seq` order reproduces `normalize_path`'s full-transcript output for the
+    same fixture, character for character. Each chunk keeps its rendering's
+    trailing newline, which is what makes the join an exact concatenation
+    with no separator to get wrong and makes an empty chunk a true no-op.
+
+    Positive control: the joined text is non-empty, carries a channel tag,
+    and is not the raw JSON this column used to hold -- an all-empty
+    chunk table would otherwise satisfy "join equals output" whenever the
+    normalizer also returned nothing.
+    """
+    db_path = tmp_path / "replay.db"
+    replay(FIXTURE, db_path, now=NOW)
+
+    conn = connect(db_path)
+    try:
+        rows = _chunk_rows(conn)
+    finally:
+        conn.close()
+
+    joined = "".join(content for _, content in rows)
+    assert joined == normalize_path(FIXTURE)
+    assert joined != ""
+    assert joined.startswith("HUMAN: ")
+
+    # Stated against the behaviour this replaced, not against a string that
+    # happens to be absent: task 2.5 stored `json.dumps(record,
+    # sort_keys=True)` in this column, so rebuild that for the fixture's
+    # first record and assert the chunk is no longer it.
+    first_record = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+    assert rows[0][1] != json.dumps(first_record, sort_keys=True)
+
+
+def test_seq_stays_contiguous_when_a_record_normalizes_to_nothing(tmp_path):
+    """A record that renders no lines still gets its chunk, with empty content.
+
+    `seq` is what evidence anchors are read in order against, so dropping a
+    chunk would silently renumber every later record and repoint anchors
+    written before the drop. The empty chunk keeps the numbering honest and
+    costs nothing: an empty string concatenates as a no-op, so the join
+    property above still holds exactly.
+
+    Deliberately two passes, with the empty chunk left as the highest `seq`
+    at the end of the first. Within one pass `seq` is a local counter and
+    contiguity is trivial; the failure this guards against is `_next_seq`'s
+    `MAX(seq)` resuming from a row whose content is empty. One pass never
+    executes that path.
+    """
+    fixture = _write_session(
+        tmp_path,
+        [
+            _user_text_record("start the migration"),
+            _thinking_only_record(),
+        ],
+    )
+    db_path = tmp_path / "store" / "replay.db"
+
+    first = replay(fixture, db_path, now=NOW)
+    assert first.chunks_written == 2  # one per ingested record, not one per rendered record
+
+    _append_records(
+        fixture,
+        [
+            _user_text_record("and then stop"),
+            _thinking_only_record(),
+            _user_text_record("resume when ready"),
+        ],
+    )
+    second = replay(fixture, db_path, now=NOW)
+    assert second.chunks_written == 3  # only the appended records; the cursor held
+
+    conn = connect(db_path)
+    try:
+        rows = _chunk_rows(conn)
+    finally:
+        conn.close()
+
+    seqs = [seq for seq, _ in rows]
+    assert seqs == [1, 2, 3, 4, 5]  # contiguous across the pass boundary, no hole, no repeat
+    assert len(set(seqs)) == len(seqs)
+    assert rows[1][1] == "" and rows[3][1] == ""  # the records that normalized to nothing
+    assert rows[0][1] != "" and rows[2][1] != "" and rows[4][1] != ""  # their neighbours rendered
+    assert "".join(content for _, content in rows) == normalize_path(fixture)
+
+
+def test_memory_anchors_to_the_first_non_empty_chunk(tmp_path):
+    """When the earliest record renders nothing, the anchor skips to the first that does.
+
+    `memory_evidence`'s `CHECK (end_offset > start_offset)` admits no
+    zero-length span, and an empty chunk is not evidence of anything, so
+    anchoring the literal first chunk would make this fixture unreplayable.
+    The memory is still written -- the fallback is a different anchor, not a
+    dropped memory.
+    """
+    fixture = _write_session(
+        tmp_path, [_thinking_only_record(), _user_text_record("resume the rollout")]
+    )
+    db_path = tmp_path / "store" / "replay.db"
+
+    result = replay(fixture, db_path, now=NOW)
+    assert result.memories_written == 1
+
+    conn = connect(db_path)
+    try:
+        (chunk_id, seq, content) = conn.execute(
+            "SELECT id, seq, content FROM transcript_chunks ORDER BY seq LIMIT 1"
+        ).fetchone()
+        assert (seq, content) == (1, "")  # the empty chunk really is first
+
+        (evidence_id, anchored_chunk_id) = conn.execute(
+            "SELECT id, transcript_chunk_id FROM memory_evidence"
+        ).fetchone()
+        assert anchored_chunk_id != chunk_id
+        assert resolve_evidence(conn, evidence_id) == "HUMAN: resume the rollout\n"
+    finally:
+        conn.close()
+
+
+def test_a_session_that_normalizes_to_nothing_writes_no_memory(tmp_path):
+    """No non-empty chunk means no anchor, and therefore no memory (INV-6).
+
+    The paired positive control is `test_memory_anchors_to_the_first_non_empty_chunk`
+    above: the same fallback that skips an empty chunk writes a memory as
+    soon as one non-empty chunk exists, so this is not "the harness never
+    writes memories".
+    """
+    fixture = _write_session(tmp_path, [_thinking_only_record()])
+    db_path = tmp_path / "store" / "replay.db"
+
+    result = replay(fixture, db_path, now=NOW)
+
+    assert result.chunks_written == 1
+    assert result.memories_written == 0
+
+    conn = connect(db_path)
+    try:
+        assert _row_counts(conn)["memories"] == 0
+        assert _row_counts(conn)["transcript_chunks"] == 1
+    finally:
+        conn.close()
+
+
+def test_events_payload_still_holds_the_raw_record(tmp_path):
+    """Moving normalized text into `transcript_chunks` lost no data.
+
+    The raw JSONL record is the thing task 2.5 stored in both columns; after
+    task 3.3 it lives in `events.payload` alone, so this asserts it is still
+    there, still parses, and still carries fields the normalizer drops
+    (`sessionId`, `isMeta`) -- fields no chunk could reconstruct.
+    """
+    db_path = tmp_path / "replay.db"
+    replay(FIXTURE, db_path, now=NOW)
+
+    conn = connect(db_path)
+    try:
+        payloads = [
+            json.loads(row[0])
+            for row in conn.execute(
+                "SELECT payload FROM events WHERE kind = 'message' ORDER BY id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert len(payloads) == 4
+    assert payloads[0]["type"] == "user"
+    assert payloads[0]["message"]["content"][0]["text"] == "refactor the auth module"
+    assert "isMeta" in payloads[0]  # a field the normalized rendering does not preserve
+    assert all("sessionId" in payload for payload in payloads)
+
+
+def test_system_records_render_a_line_with_no_chunk_to_anchor_it(tmp_path):
+    """The known gap, pinned as a measurement rather than left implied.
+
+    A `system` record produces a `compaction`-kind event, not a `message`
+    event, so `replay()` writes no chunk for it -- but the normalizer *does*
+    render it as a `SYSTEM(kind):` line. For a session containing one, the
+    chunk join therefore equals the normalizer's output minus those lines,
+    and a model that quotes a compaction banner has no chunk to anchor
+    against. Task 3.3 does not close this; the assertion below states
+    exactly how wide the gap is so a later task closing it fails here
+    loudly rather than passing silently.
+    """
+    db_path = tmp_path / "replay.db"
+    result = replay(COMPACTION_FIXTURE, db_path, now=NOW)
+
+    conn = connect(db_path)
+    try:
+        rows = _chunk_rows(conn)
+    finally:
+        conn.close()
+
+    full = normalize_path(COMPACTION_FIXTURE)
+    system_lines = [line for line in full.splitlines() if line.startswith("SYSTEM(")]
+    assert len(system_lines) == 1  # the fixture really does contain one
+    without_system = "".join(
+        f"{line}\n" for line in full.splitlines() if not line.startswith("SYSTEM(")
+    )
+
+    assert result.chunks_written == 4
+    assert "".join(content for _, content in rows) == without_system
+    assert "".join(content for _, content in rows) != full
 
 
 # --- CLI: palaver replay -----------------------------------------------------

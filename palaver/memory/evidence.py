@@ -2,8 +2,18 @@
 
 This module carries task 2.2's half of one invariant (`INVARIANTS.md`):
 
-**INV-6 — every memory carries at least one evidence link to stored raw
-transcript.** Task 2.1 deliberately left this unenforced (see
+**INV-6 — every memory carries at least one evidence link to stored
+transcript.** Task 3.3 changed what "stored transcript" means for a chunk
+anchor, and this docstring is corrected to match rather than left to describe
+the old behaviour: `transcript_chunks.content` now holds the NORMALIZED
+semantic text, not the raw JSON record. The raw record is still stored, in
+`events.payload`, and an anchor may still name either. The reason for the
+change is that the extraction gate checks a model-produced quote against the
+span it cites, and the model reads normalized text — anchoring into raw JSON
+made that check silently dependent on JSON escaping, admitting plain quotes
+and rejecting any quote containing a newline, a quote character, or a
+backslash. Anchors therefore index exactly the bytes the model read.
+Task 2.1 deliberately left this unenforced (see
 `palaver/memory/write.py`'s module docstring) because the anchor shape it
 would have enforced against — a copied `quote` string on `memory_evidence`
 — was itself scheduled to be replaced here. That replacement is the core of

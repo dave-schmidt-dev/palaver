@@ -34,8 +34,9 @@ fresh every call and Phase 1 persists it nowhere — so this module does *not*
 write status to `memories`. What it writes instead, and only once per
 session ever (gated on this being the pass that first creates the
 `sessions` row, not on every pass that happens to see new records), is a
-durable ingest fact: that this session was first observed, anchored to its
-earliest transcript record. That statement makes no channel-attribution
+durable ingest fact: that this session was first observed, anchored to the
+earliest transcript record that renders any text (see the chunk note
+below). That statement makes no channel-attribution
 claim (it does not say who wrote the anchored record, or what it means) —
 INV-8 exists because `type: "user"` is not reliably "the human," and this
 module has no business asserting authorship a later phase's normalizer and
@@ -45,12 +46,62 @@ did*, not literally an observed tool/command result and never a tier-1 quote
 (minting tier-1 is task 3.3's quote-grounding gate, not this module's to
 claim).
 
-**Transcript content is stored raw, not flattened.** `transcript_chunks.content`
-and `events.payload` both hold `json.dumps(record, sort_keys=True)` — the
-entire decoded JSONL record, verbatim. Turning that into semantic,
-human-readable turn text is task 3.1's job (the normalizer), which the plan
-lists as *blocked by* this task; attempting that flattening here would
-duplicate work Phase 3 owns and risk drifting from it.
+**Transcript content is stored normalized; the raw record lives in
+`events.payload`.** This reverses task 2.5's original choice, deliberately
+and in one place (task 3.3's amendment, 2026-08-14). `transcript_chunks.content`
+holds `palaver.extract.normalize.normalize_records([record])` — exactly the
+line(s) the normalizer emits for that record in full-transcript output, with
+their trailing newline, so concatenating a session's chunks in `seq` order
+reproduces the normalizer's own output byte for byte. `events.payload` still
+holds `json.dumps(record, sort_keys=True)`, the entire decoded JSONL record
+verbatim, so nothing is lost by the change; the raw record simply stops
+being stored twice.
+
+The reason is the evidence anchor. `memory_evidence` indexes
+`transcript_chunks.content` by offset, and task 3.3's quote gate checks a
+model-supplied quote against those bytes — but the model reads *normalized*
+text. Against raw JSON, that check silently admits plain one-line quotes and
+rejects any quote containing a newline, a double quote, or a backslash,
+because `json.dumps` escapes all three: a pass rate that reads as a quality
+measurement while actually measuring quote punctuation. Anchors now index
+exactly the bytes the model read, `resolve_evidence` returns text a human
+can read instead of a JSON slice, and the FTS5 index over this column
+searches semantic text rather than JSON punctuation.
+
+**One chunk per ingested record, including records that normalize to
+nothing.** A record whose rendering is empty (an assistant turn carrying
+only a `thinking` block, say) stores the empty string rather than being
+dropped: `seq` is the ordering evidence anchors are read against, and a hole
+in the numbering would silently repoint every anchor after it. The one
+consequence is that this module's own memory anchors to the first
+*non-empty* chunk — `memory_evidence`'s `CHECK (end_offset > start_offset)`
+admits no zero-length span, and an empty chunk is not evidence of anything.
+
+Records that are not `user`/`assistant` still produce no chunk (the event
+loop below writes one only for `kind == "message"`), which is unchanged from
+task 2.5. The normalizer does render `system` records as `SYSTEM(kind):`
+lines, so for a session containing one, the chunk concatenation above
+reproduces the normalizer's output minus those lines —
+`tests/test_replay.py::test_system_records_render_a_line_with_no_chunk_to_anchor_it`
+pins that gap as a measured fact rather than leaving it implied.
+
+**Replay is incremental, not fresh-database-only, so a store can hold chunks
+written under both content rules.** `_get_or_create_session` and the cursor
+above exist precisely to resume an existing store, and this module only ever
+`INSERT`s a chunk — it never `UPDATE`s or `DELETE`s one, and nothing else in
+the package writes this column. A database first populated before the change
+above therefore keeps its raw-JSON rows verbatim and gains normalized rows
+alongside them. The FTS5 index does not go stale from this: `_fts_statements`
+indexes on the `AFTER INSERT` trigger, so each row was indexed from the bytes
+it actually holds, and an `integrity-check` on a deliberately mixed store
+passes (pinned by
+`tests/test_replay.py::test_fts_index_stays_consistent_when_a_store_mixes_content_rules`).
+Nothing in the package issues an FTS `rebuild`, and after this change nothing
+needs to. What a mixed store *does* carry is heterogeneous content: task
+3.3's gate would check a quote against raw JSON for the pre-change rows and
+so hit exactly the escaping failure described above. Rewriting those rows is
+a schema-migration decision, not this module's, and is deliberately not done
+here.
 
 **Determinism in the byte-identical-dump comparison.** `memories.created_at`
 and `memory_evidence.created_at` come from `write_memory` (task 2.1), whose
@@ -75,6 +126,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from palaver.extract.normalize import normalize_records
 from palaver.ingest.adapters.claude_code import ClaudeCodeAdapter
 from palaver.ingest.cursors import CursorStore
 from palaver.memory.evidence import EvidenceAnchor
@@ -203,8 +255,8 @@ def replay(
 
         events_written = 0
         chunks_written = 0
-        first_chunk_id: int | None = None
-        first_chunk_content: str | None = None
+        anchor_chunk_id: int | None = None
+        anchor_chunk_content: str | None = None
         seq = _next_seq(conn, session_id)
 
         for event in tail_result.events:
@@ -220,14 +272,25 @@ def replay(
                 message = record.get("message")
                 role = message.get("role") if isinstance(message, dict) else None
                 role = role or record.get("type") or "unknown"
+                # One `normalize_records` call per record, not a second
+                # rendering path of this module's own: for a single record it
+                # returns exactly that record's lines, each newline-terminated,
+                # so `"".join(chunk contents in seq order)` is the normalizer's
+                # full-transcript output for those records, byte for byte.
+                content = normalize_records([record])
                 chunk_cursor = conn.execute(
                     "INSERT INTO transcript_chunks(session_id, seq, role, content) "
                     "VALUES (?, ?, ?, ?)",
-                    (session_id, seq, role, payload_json),
+                    (session_id, seq, role, content),
                 )
-                if first_chunk_id is None:
-                    first_chunk_id = chunk_cursor.lastrowid
-                    first_chunk_content = payload_json
+                # First *non-empty* chunk, not first chunk: a record that
+                # normalizes to nothing still gets its row (seq stays
+                # contiguous) but is a zero-length span, which
+                # `memory_evidence`'s CHECK (end_offset > start_offset)
+                # rejects and which is no evidence of anything anyway.
+                if anchor_chunk_id is None and content:
+                    anchor_chunk_id = chunk_cursor.lastrowid
+                    anchor_chunk_content = content
                 chunks_written += 1
                 seq += 1
 
@@ -237,7 +300,7 @@ def replay(
         # once, and a live, growing session tailed incrementally must not
         # accrue a fresh "first observed" memory on every tick that happens
         # to bring in new records (see the module docstring).
-        if session_is_new and first_chunk_id is not None:
+        if session_is_new and anchor_chunk_id is not None:
             write_memory(
                 conn,
                 project_id=project_id,
@@ -250,9 +313,9 @@ def replay(
                 tier=TIER_OBSERVER_INFERENCE,
                 evidence=[
                     EvidenceAnchor(
-                        transcript_chunk_id=first_chunk_id,
+                        transcript_chunk_id=anchor_chunk_id,
                         start_offset=0,
-                        end_offset=len(first_chunk_content),
+                        end_offset=len(anchor_chunk_content),
                     )
                 ],
             )

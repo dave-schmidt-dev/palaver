@@ -65,11 +65,22 @@ rationale: Tiers, highest first: (1) explicit user instruction or correction, (2
   fields. The constraint therefore lives in a CHECK/trigger at the write boundary, where it holds
   regardless of which model wrote the row or how it was prompted.
 
-### INV-6 — Every durable memory carries at least one evidence link to stored raw transcript
+### INV-6 — Every durable memory carries at least one evidence link to stored transcript
 area: ["palaver/memory/**/*.py"]
 gate_test: tests/test_memory.py::test_memory_without_evidence_is_rejected
 threshold: 3
-rationale: "Raw transcript = evidence, structured memory = knowledge." A memory with no evidence link
+rationale: **Amended 2026-08-14 (task 3.3), and the word "raw" was dropped from this entry's title
+  deliberately.** Two artifacts are stored, and an anchor may name either: `events.payload` holds the
+  raw record byte-for-byte, and `transcript_chunks.content` holds the normalized semantic text. Until
+  task 3.3 both were raw. The change is not a weakening of the evidence requirement — nothing is
+  discarded — but it matters to what an anchor means, so it is written here rather than left implied.
+  A chunk anchor now indexes exactly the text the model read, which is what makes the quote-grounding
+  gate meaningful: checking a model's quote against raw JSON made the check depend on JSON escaping,
+  so it admitted plain one-line quotes and rejected any quote containing a newline, a double quote, or
+  a backslash — passing the trivial cases and failing the substantive ones, at a rate that would have
+  read as a quality measurement. An anchor into raw bytes is still available through `events.payload`
+  for anything needing the original record.
+  "Raw transcript = evidence, structured memory = knowledge." A memory with no evidence link
   is indistinguishable from a fabrication and cannot be audited, replayed, or refuted. Spike run 1
   proved the cheap enforcement mechanism: require a verbatim `quote` on every extracted memory and
   substring-check it against the source — 17/17 quotes verified, zero fabrications. A quote that does
