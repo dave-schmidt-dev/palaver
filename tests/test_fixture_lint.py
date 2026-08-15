@@ -947,9 +947,7 @@ def test_every_committed_label_row_is_accepted():
     correspondence fails here with the offending row named.
     """
     rows = [
-        json.loads(line)
-        for line in LABELS_PATH.read_text(encoding="utf-8").splitlines()
-        if line
+        json.loads(line) for line in LABELS_PATH.read_text(encoding="utf-8").splitlines() if line
     ]
     assert len(rows) == 19
     for index, row in enumerate(rows):
@@ -965,9 +963,7 @@ def test_annotation_text_is_exactly_the_committed_basis_vocabulary():
     visible in review.
     """
     rows = [
-        json.loads(line)
-        for line in LABELS_PATH.read_text(encoding="utf-8").splitlines()
-        if line
+        json.loads(line) for line in LABELS_PATH.read_text(encoding="utf-8").splitlines() if line
     ]
     assert {row["basis"] for row in rows} == set(ANNOTATION_TEXT)
 
