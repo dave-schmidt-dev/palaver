@@ -1,0 +1,4 @@
+{"type": "session_meta", "payload": {"id": "fixture-codex-finished", "session_id": "fixture-codex-finished", "cwd": "/tmp/fixture-codex-project"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "check the staging deploy status"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "the staging deploy is healthy"}]}}
+{"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "the fixture worker finished the requested change"}}

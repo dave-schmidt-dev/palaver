@@ -1,0 +1,4 @@
+{"type": "opencode_message", "id": "fixture-oc-compaction-msg-1", "session_id": "fixture-oc-compaction", "data": {"role": "user"}}
+{"type": "opencode_part", "id": "fixture-oc-compaction-part-1", "message_id": "fixture-oc-compaction-msg-1", "session_id": "fixture-oc-compaction", "data": {"type": "text", "text": "restart the worker queue"}}
+{"type": "opencode_part", "id": "fixture-oc-compaction-part-2", "message_id": "fixture-oc-compaction-msg-1", "session_id": "fixture-oc-compaction", "data": {"type": "compaction", "auto": true, "tail_start_id": "fixture-oc-compaction-msg-1"}}
+{"type": "opencode_part", "id": "fixture-oc-compaction-part-3", "message_id": "fixture-oc-compaction-msg-1", "session_id": "fixture-oc-compaction", "data": {"type": "text", "text": "session continuation: resuming after context compaction", "synthetic": true}}

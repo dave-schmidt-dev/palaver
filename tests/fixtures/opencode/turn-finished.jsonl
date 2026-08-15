@@ -1,0 +1,5 @@
+{"type": "opencode_message", "id": "fixture-oc-finished-msg-1", "session_id": "fixture-oc-finished", "data": {"role": "user"}}
+{"type": "opencode_part", "id": "fixture-oc-finished-part-1", "message_id": "fixture-oc-finished-msg-1", "session_id": "fixture-oc-finished", "data": {"type": "text", "text": "restart the worker queue"}}
+{"type": "opencode_message", "id": "fixture-oc-finished-msg-2", "session_id": "fixture-oc-finished", "data": {"role": "assistant", "finish": "stop"}}
+{"type": "opencode_part", "id": "fixture-oc-finished-part-2", "message_id": "fixture-oc-finished-msg-2", "session_id": "fixture-oc-finished", "data": {"type": "text", "text": "the worker queue is restarted"}}
+{"type": "opencode_part", "id": "fixture-oc-finished-part-3", "message_id": "fixture-oc-finished-msg-2", "session_id": "fixture-oc-finished", "data": {"type": "step-finish", "reason": "stop"}}

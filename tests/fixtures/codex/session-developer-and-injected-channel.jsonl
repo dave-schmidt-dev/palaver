@@ -1,0 +1,6 @@
+{"type": "session_meta", "payload": {"id": "fixture-codex-channel", "session_id": "fixture-codex-channel", "cwd": "/tmp/fixture-codex-project"}}
+{"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "you are operating inside a sandboxed fixture container with no network access"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>fixture sandbox: bash on linux</environment_context>"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "check the staging deploy status"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "the staging deploy is healthy"}]}}
+{"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": null}}

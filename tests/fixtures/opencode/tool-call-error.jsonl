@@ -1,0 +1,5 @@
+{"type": "opencode_message", "id": "fixture-oc-toolerr-msg-1", "session_id": "fixture-oc-toolerr", "data": {"role": "user"}}
+{"type": "opencode_part", "id": "fixture-oc-toolerr-part-1", "message_id": "fixture-oc-toolerr-msg-1", "session_id": "fixture-oc-toolerr", "data": {"type": "text", "text": "restart the worker queue"}}
+{"type": "opencode_message", "id": "fixture-oc-toolerr-msg-2", "session_id": "fixture-oc-toolerr", "data": {"role": "assistant", "finish": "tool-calls"}}
+{"type": "opencode_part", "id": "fixture-oc-toolerr-part-2", "message_id": "fixture-oc-toolerr-msg-2", "session_id": "fixture-oc-toolerr", "data": {"type": "tool", "tool": "bash", "callID": "tu-1", "state": {"status": "error", "error": "fixture tool exited with a non-zero status"}}}
+{"type": "opencode_part", "id": "fixture-oc-toolerr-part-3", "message_id": "fixture-oc-toolerr-msg-2", "session_id": "fixture-oc-toolerr", "data": {"type": "step-finish", "reason": "tool-calls"}}

@@ -40,6 +40,32 @@ restated, so the set of `system` subtypes the corpus may contain is exactly the
 set the adapter claims to understand. A subtype the adapter has never heard of
 is, by construction, one nobody has classified.
 
+**Three sources, one allowlist discipline.** `RECORD_SHAPES` (Claude Code),
+`CODEX_RECORD_SHAPES`, and `OPENCODE_RECORD_SHAPES` are three separate tables,
+one per source, because task 7.0 asked for per-source shape tables rather than
+one table folding all three vocabularies together — the point being that a
+reviewer can delete one source's table and watch only that source's corpus
+fail (`tests/test_fixture_lint.py`'s
+`test_codex_source_and_opencode_source_corpora_require_their_shape_tables`
+does exactly that). `classify_record` dispatches by trying each table in turn
+against the record's `type`; this is safe only because the three sources' top
+level `type` vocabularies are disjoint today
+(`test_source_shape_tables_are_pairwise_disjoint` pins that as an assertion,
+not an assumption). Neither Codex nor OpenCode has an adapter yet (tasks 7.1
+and 7.2), so unlike `SYSTEM_SUBTYPE_KINDS` there is nothing to import the
+allowlisted sub-values from; `CODEX_EVENT_TYPES` and `OPENCODE_PART_TYPES`
+below are authored from `docs/research.md` and are expected to become the
+values those adapters import back out of this module, mirroring the existing
+direction in reverse.
+
+OpenCode has no natural JSONL representation — its real store is SQLite rows
+in `message`/`part` with a JSON `data` column, not a line-delimited transcript
+file. `opencode_message` / `opencode_part` (the `type` values in
+`OPENCODE_RECORD_SHAPES`) are this module's own fixture-format invention: one
+JSON object per row, wrapping the columns a future adapter reads. A binary
+`.db` fixture would not be reviewable by a human before it reaches a public
+remote, which is the exact thing INV-9's git clause exists to make possible.
+
 Output follows the CLI's two-stream contract: the result (the report, with one
 line per rejection) goes to stdout, per-file progress goes to stderr (INV-1).
 """
@@ -67,6 +93,13 @@ RULE_UNDECODABLE = "undecodable-record"
 RULE_NOT_AN_OBJECT = "not-an-object"
 RULE_UNKNOWN_RECORD_TYPE = "unknown-record-type"
 RULE_UNKNOWN_SYSTEM_SUBTYPE = "unknown-system-subtype"
+#: The Codex/OpenCode analogue of `RULE_UNKNOWN_SYSTEM_SUBTYPE`: a nested
+#: discriminator (Codex's `event_msg.payload.type`, OpenCode's
+#: `part.data.type`) inside an otherwise-recognized record shape, whose value
+#: this corpus does not classify. One shared rule rather than one per source,
+#: because it is the same dimension — "which sub-shape applies" — recurring in
+#: a second and third source, not a new kind of failure.
+RULE_UNKNOWN_SUBTYPE = "unknown-subtype"
 RULE_MISSING_KEY = "missing-key"
 RULE_UNEXPECTED_KEY = "unexpected-key"
 RULE_UNKNOWN_CONTENT_BLOCK = "unknown-content-block"
@@ -83,6 +116,7 @@ RULE_NAMES: tuple[str, ...] = (
     RULE_NOT_AN_OBJECT,
     RULE_UNKNOWN_RECORD_TYPE,
     RULE_UNKNOWN_SYSTEM_SUBTYPE,
+    RULE_UNKNOWN_SUBTYPE,
     RULE_MISSING_KEY,
     RULE_UNEXPECTED_KEY,
     RULE_UNKNOWN_CONTENT_BLOCK,
@@ -130,6 +164,28 @@ SYNTHESIZED_TEXT = frozenset(
         "hook ran",
         "test suite run",
         "<command-name>/status</command-name>",
+        # Codex: human-channel turns and assistant replies.
+        "check the staging deploy status",
+        "the staging deploy is healthy",
+        # Codex: harness-written content on the one reliably-harness channel
+        # (`role: "developer"`, `docs/research.md` §2).
+        "you are operating inside a sandboxed fixture container with no network access",
+        # Codex: `role: "user"` wearing an injected prefix. Codex has no
+        # `isMeta` equivalent, so this is exactly the shape the prefix
+        # heuristic in a future adapter (task 7.1) has to see in the corpus.
+        "<environment_context>fixture sandbox: bash on linux</environment_context>",
+        # Codex: a turn's final assistant message, and an error message.
+        "the fixture worker finished the requested change",
+        "the fixture worker is retrying after a transient timeout",
+        # OpenCode: human-channel turns and assistant replies.
+        "restart the worker queue",
+        "the worker queue is restarted",
+        # OpenCode: a tool-part error message (`state.error`).
+        "fixture tool exited with a non-zero status",
+        # OpenCode: a synthetic (harness-injected) text part attached to a
+        # `role: "user"` message — the same channel-ambiguity lesson INV-8
+        # names for Claude Code, reproduced at the *part* level.
+        "session continuation: resuming after context compaction",
     }
 )
 
@@ -159,6 +215,87 @@ MODE_VALUES = frozenset({"default", "plan", "acceptEdits"})
 #: question → options → option → label), so this is that plus headroom, not an
 #: arbitrary number.
 MAX_INPUT_DEPTH = 8
+
+# --- Codex -------------------------------------------------------------------
+#
+# Shapes below are authored from `docs/research.md` §2 (4,884 real rollout
+# files, sampled), not from an adapter — task 7.1 (the Codex adapter) has not
+# landed yet. Every Codex fixture record carries exactly `{"type", "payload"}`
+# at the envelope level: no `timestamp` and no `ordinal`, even though every
+# real rollout record carries a `timestamp`. That omission is deliberate and
+# mirrors the Claude Code corpus's missing `uuid`/`cwd`/`version` keys — a
+# record pasted from `~/.codex/sessions/` is rejected on its key set before
+# its prose is ever read, and nothing this corpus's consumers read depends on
+# the timestamp value itself.
+#
+# `response_item.payload.type` values other than `"message"` (`function_call`,
+# `reasoning`, …) and the top-level `type` values `turn_context`, `world_state`,
+# and `inter_agent_communication_metadata` are not modelled at all — not an
+# oversight, a scope decision: task 7.1 names turn boundary, compaction,
+# errors, channel, and identity as the signals that matter, and none of them
+# reads those shapes. `payload.item.changes` (a `FileChange` map keyed by
+# absolute file path) is excluded for the same reason and one more: a map
+# keyed by real paths is exactly the kind of field a structural corpus must
+# not carry, since the keys themselves would be free text wearing a key's
+# clothing.
+
+#: Codex's `session_meta.payload.cwd`. A real session records the actual
+#: project working directory — an identifying path — so this requires a
+#: `/tmp/fixture-*` shape rather than accepting any string.
+CODEX_CWD = re.compile(r"^/tmp/fixture-[a-z0-9-]{1,40}$")
+
+#: `response_item.payload.role`, and each `compacted.payload.replacement_
+#: history[]` entry's role. `developer` is Codex's one reliably-harness
+#: channel (`docs/research.md` §2: 817/817 sampled were harness content).
+#: `user` and `assistant` carry the same ambiguity Claude Code's `isMeta` flag
+#: resolves and Codex has no equivalent for — prefix heuristic only — which is
+#: why the corpus needs a `role: "user"` record wearing an injected prefix.
+CODEX_ROLES = frozenset({"user", "assistant", "developer"})
+
+#: The one `response_item.payload.content[].type` variant this corpus models.
+CODEX_CONTENT_BLOCK_TYPES = frozenset({"input_text", "output_text"})
+
+#: `event_msg.payload.type` values this corpus classifies: the two
+#: turn-boundary terminals, the error shape, and the compaction pair's second
+#: half. Every other observed value (`task_started`, `user_message`,
+#: `token_count`, `agent_message`, `item_completed`, `sub_agent_activity`,
+#: `thread_settings_applied`, …) carries no signal task 7.1 names.
+CODEX_EVENT_TYPES = frozenset({"task_complete", "turn_aborted", "error", "context_compacted"})
+
+#: `event_msg.payload.reason` on a `turn_aborted` event. Observed value only.
+CODEX_TURN_ABORTED_REASONS = frozenset({"interrupted"})
+
+#: `event_msg.payload.codex_error_info` on an `error` event. Observed value
+#: only (`docs/research.md` §2).
+CODEX_ERROR_CODES = frozenset({"usage_limit_exceeded"})
+
+# --- OpenCode ------------------------------------------------------------
+#
+# OpenCode's real store is SQLite rows (`message`, `part`) with a JSON `data`
+# column — there is no adapter yet (task 7.2) and no natural JSONL shape to
+# borrow one from. `opencode_message` / `opencode_part` below are this
+# module's own fixture-format invention, documented at the top of this file:
+# one JSON object per row, carrying only the columns and `data` fields a
+# future adapter is expected to read, per `docs/research.md` §3.
+
+#: `part.data.type` values this corpus classifies: a plain text turn, a tool
+#: invocation, the terminal marker that doubly-confirms a turn boundary, and
+#: the (rare) compaction marker.
+OPENCODE_PART_TYPES = frozenset({"text", "tool", "step-finish", "compaction"})
+
+#: `message.data.finish` and `part.data.reason` (on a `step-finish` part)
+#: share one vocabulary — `docs/research.md` §3 documents them as the same
+#: semantic space, confirmed paired on a finished turn (`finish="stop"` with a
+#: terminal `step-finish` part `reason="stop"`).
+OPENCODE_FINISH_VALUES = frozenset({"stop", "tool-calls", "unknown"})
+
+#: `part.data.tool` on a `type: "tool"` part. Invented, structurally plausible
+#: identifiers — sampling redacted string values, so this is *not* claimed to
+#: be OpenCode's exact tool-name vocabulary; task 7.2 measures and owns that.
+OPENCODE_TOOL_NAMES = frozenset({"bash", "read", "edit"})
+
+#: `part.data.state.status` on a `type: "tool"` part (`docs/research.md` §3).
+OPENCODE_TOOL_STATUSES = frozenset({"completed", "error"})
 
 
 @dataclass(frozen=True)
@@ -447,6 +584,326 @@ RECORD_SHAPES: dict[str, Callable[[dict], Verdict]] = {
 }
 
 
+# --- Codex classifiers ---------------------------------------------------
+
+
+def _check_codex_content_block(block: object, where: str) -> Verdict | None:
+    """Allowlist one content block of a Codex `message` payload."""
+    if not isinstance(block, dict):
+        return _reject(RULE_NOT_AN_OBJECT, f"{where} is not an object")
+    block_type = block.get("type")
+    if block_type not in CODEX_CONTENT_BLOCK_TYPES:
+        return _reject(
+            RULE_UNKNOWN_CONTENT_BLOCK,
+            f"{where} has block type {block_type!r}, which no Codex content shape declares",
+        )
+    verdict = _check_keys(block, frozenset({"type", "text"}), frozenset(), where)
+    return verdict if verdict is not None else _check_text(block["text"], f"{where}.text")
+
+
+def _check_codex_message(payload: dict, where: str) -> Verdict | None:
+    """Allowlist a Codex `response_item` payload of type `"message"`.
+
+    Mirrors `_check_message` for Claude Code: role literal, then each content
+    block. Codex's other `response_item.payload.type` values (`function_call`,
+    `reasoning`, …) are not modelled — see the module-level Codex note.
+    """
+    verdict = _check_keys(payload, frozenset({"type", "role", "content"}), frozenset(), where)
+    if verdict is not None:
+        return verdict
+    verdict = _check_literal(payload["type"], frozenset({"message"}), f"{where}.type")
+    if verdict is not None:
+        return verdict
+    verdict = _check_literal(payload["role"], CODEX_ROLES, f"{where}.role")
+    if verdict is not None:
+        return verdict
+    content = payload["content"]
+    if not isinstance(content, list) or not content:
+        return _reject(RULE_BAD_VALUE, f"{where}.content must be a non-empty list of blocks")
+    for index, block in enumerate(content):
+        verdict = _check_codex_content_block(block, f"{where}.content[{index}]")
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _classify_codex_session_meta(record: dict) -> Verdict:
+    verdict = _check_keys(record, frozenset({"type", "payload"}), frozenset(), "record")
+    if verdict is not None:
+        return verdict
+    payload = record["payload"]
+    if not isinstance(payload, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.payload is not an object")
+    verdict = _check_keys(
+        payload,
+        frozenset({"id", "session_id", "cwd"}),
+        frozenset({"parent_thread_id"}),
+        "record.payload",
+    )
+    if verdict is not None:
+        return verdict
+    for key in ("id", "session_id", "parent_thread_id"):
+        if key not in payload:
+            continue
+        verdict = _check_pattern(payload[key], SESSION_ID, f"record.payload.{key}")
+        if verdict is not None:
+            return verdict
+    verdict = _check_pattern(payload["cwd"], CODEX_CWD, "record.payload.cwd")
+    return verdict if verdict is not None else ACCEPTED
+
+
+def _classify_codex_response_item(record: dict) -> Verdict:
+    verdict = _check_keys(record, frozenset({"type", "payload"}), frozenset(), "record")
+    if verdict is not None:
+        return verdict
+    payload = record["payload"]
+    if not isinstance(payload, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.payload is not an object")
+    verdict = _check_codex_message(payload, "record.payload")
+    return verdict if verdict is not None else ACCEPTED
+
+
+def _classify_codex_event_msg(record: dict) -> Verdict:
+    verdict = _check_keys(record, frozenset({"type", "payload"}), frozenset(), "record")
+    if verdict is not None:
+        return verdict
+    payload = record["payload"]
+    if not isinstance(payload, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.payload is not an object")
+    event_type = payload.get("type")
+    if event_type not in CODEX_EVENT_TYPES:
+        return _reject(
+            RULE_UNKNOWN_SUBTYPE,
+            f"record.payload.type {str(event_type)[:40]!r} is not an event type this corpus "
+            f"classifies ({sorted(CODEX_EVENT_TYPES)})",
+        )
+    if event_type == "task_complete":
+        verdict = _check_keys(
+            payload, frozenset({"type", "last_agent_message"}), frozenset(), "record.payload"
+        )
+        if verdict is not None:
+            return verdict
+        if payload["last_agent_message"] is not None:
+            verdict = _check_text(
+                payload["last_agent_message"], "record.payload.last_agent_message"
+            )
+            if verdict is not None:
+                return verdict
+        return ACCEPTED
+    if event_type == "turn_aborted":
+        verdict = _check_keys(payload, frozenset({"type", "reason"}), frozenset(), "record.payload")
+        if verdict is not None:
+            return verdict
+        verdict = _check_literal(
+            payload["reason"], CODEX_TURN_ABORTED_REASONS, "record.payload.reason"
+        )
+        return verdict if verdict is not None else ACCEPTED
+    if event_type == "error":
+        verdict = _check_keys(
+            payload,
+            frozenset({"type", "message", "codex_error_info"}),
+            frozenset(),
+            "record.payload",
+        )
+        if verdict is not None:
+            return verdict
+        verdict = _check_text(payload["message"], "record.payload.message")
+        if verdict is not None:
+            return verdict
+        verdict = _check_literal(
+            payload["codex_error_info"], CODEX_ERROR_CODES, "record.payload.codex_error_info"
+        )
+        return verdict if verdict is not None else ACCEPTED
+    # context_compacted: the second half of the compaction pair, no extra keys.
+    verdict = _check_keys(payload, frozenset({"type"}), frozenset(), "record.payload")
+    return verdict if verdict is not None else ACCEPTED
+
+
+def _classify_codex_compacted(record: dict) -> Verdict:
+    verdict = _check_keys(record, frozenset({"type", "payload"}), frozenset(), "record")
+    if verdict is not None:
+        return verdict
+    payload = record["payload"]
+    if not isinstance(payload, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.payload is not an object")
+    verdict = _check_keys(
+        payload, frozenset({"replacement_history"}), frozenset(), "record.payload"
+    )
+    if verdict is not None:
+        return verdict
+    history = payload["replacement_history"]
+    if not isinstance(history, list) or not history:
+        return _reject(
+            RULE_BAD_VALUE, "record.payload.replacement_history must be a non-empty list"
+        )
+    for index, item in enumerate(history):
+        where = f"record.payload.replacement_history[{index}]"
+        if not isinstance(item, dict):
+            return _reject(RULE_NOT_AN_OBJECT, f"{where} is not an object")
+        verdict = _check_keys(item, frozenset({"role", "content"}), frozenset(), where)
+        if verdict is not None:
+            return verdict
+        verdict = _check_literal(item["role"], CODEX_ROLES, f"{where}.role")
+        if verdict is not None:
+            return verdict
+        content = item["content"]
+        if not isinstance(content, list) or not content:
+            return _reject(RULE_BAD_VALUE, f"{where}.content must be a non-empty list")
+        for block_index, block in enumerate(content):
+            verdict = _check_codex_content_block(block, f"{where}.content[{block_index}]")
+            if verdict is not None:
+                return verdict
+    return ACCEPTED
+
+
+#: Codex's shape allowlist. `turn_context`, `world_state`, and
+#: `inter_agent_communication_metadata` are absent deliberately — see the
+#: module-level Codex note.
+CODEX_RECORD_SHAPES: dict[str, Callable[[dict], Verdict]] = {
+    "session_meta": _classify_codex_session_meta,
+    "response_item": _classify_codex_response_item,
+    "event_msg": _classify_codex_event_msg,
+    "compacted": _classify_codex_compacted,
+}
+
+
+# --- OpenCode classifiers -------------------------------------------------
+
+
+def _check_opencode_tool_state(state: object, where: str) -> Verdict | None:
+    """Allowlist a `type: "tool"` part's `state` object."""
+    if not isinstance(state, dict):
+        return _reject(RULE_NOT_AN_OBJECT, f"{where} is not an object")
+    verdict = _check_keys(state, frozenset({"status"}), frozenset({"error"}), where)
+    if verdict is not None:
+        return verdict
+    verdict = _check_literal(state["status"], OPENCODE_TOOL_STATUSES, f"{where}.status")
+    if verdict is not None:
+        return verdict
+    if state["status"] == "error":
+        if "error" not in state:
+            return _reject(RULE_MISSING_KEY, f"{where} has status 'error' but no error message")
+        return _check_text(state["error"], f"{where}.error")
+    if "error" in state:
+        return _reject(RULE_UNEXPECTED_KEY, f"{where} carries 'error' without status 'error'")
+    return None
+
+
+def _classify_opencode_message(record: dict) -> Verdict:
+    verdict = _check_keys(
+        record, frozenset({"type", "id", "session_id", "data"}), frozenset(), "record"
+    )
+    if verdict is not None:
+        return verdict
+    verdict = _check_pattern(record["id"], SESSION_ID, "record.id")
+    if verdict is not None:
+        return verdict
+    verdict = _check_pattern(record["session_id"], SESSION_ID, "record.session_id")
+    if verdict is not None:
+        return verdict
+    data = record["data"]
+    if not isinstance(data, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.data is not an object")
+    verdict = _check_keys(data, frozenset({"role"}), frozenset({"finish", "error"}), "record.data")
+    if verdict is not None:
+        return verdict
+    verdict = _check_literal(data["role"], frozenset({"user", "assistant"}), "record.data.role")
+    if verdict is not None:
+        return verdict
+    if "finish" in data:
+        verdict = _check_literal(data["finish"], OPENCODE_FINISH_VALUES, "record.data.finish")
+        if verdict is not None:
+            return verdict
+    if "error" in data:
+        verdict = _check_text(data["error"], "record.data.error")
+        if verdict is not None:
+            return verdict
+    return ACCEPTED
+
+
+def _classify_opencode_part(record: dict) -> Verdict:
+    verdict = _check_keys(
+        record,
+        frozenset({"type", "id", "message_id", "session_id", "data"}),
+        frozenset(),
+        "record",
+    )
+    if verdict is not None:
+        return verdict
+    for key in ("id", "message_id", "session_id"):
+        verdict = _check_pattern(record[key], SESSION_ID, f"record.{key}")
+        if verdict is not None:
+            return verdict
+    data = record["data"]
+    if not isinstance(data, dict):
+        return _reject(RULE_NOT_AN_OBJECT, "record.data is not an object")
+    part_type = data.get("type")
+    if part_type not in OPENCODE_PART_TYPES:
+        return _reject(
+            RULE_UNKNOWN_SUBTYPE,
+            f"record.data.type {str(part_type)[:40]!r} is not a part type this corpus "
+            f"classifies ({sorted(OPENCODE_PART_TYPES)})",
+        )
+    if part_type == "text":
+        verdict = _check_keys(
+            data, frozenset({"type", "text"}), frozenset({"synthetic"}), "record.data"
+        )
+        if verdict is not None:
+            return verdict
+        verdict = _check_text(data["text"], "record.data.text")
+        if verdict is not None:
+            return verdict
+        if "synthetic" in data and data["synthetic"] is not True:
+            return _reject(
+                RULE_BAD_VALUE,
+                f"record.data.synthetic must be true when present, got {data['synthetic']!r}",
+            )
+        return ACCEPTED
+    if part_type == "tool":
+        verdict = _check_keys(
+            data, frozenset({"type", "tool", "callID", "state"}), frozenset(), "record.data"
+        )
+        if verdict is not None:
+            return verdict
+        if not isinstance(data["tool"], str) or data["tool"] not in OPENCODE_TOOL_NAMES:
+            return _reject(
+                RULE_UNKNOWN_TOOL,
+                f"record.data.tool must be one of {sorted(OPENCODE_TOOL_NAMES)}, "
+                f"got {data['tool']!r}",
+            )
+        verdict = _check_pattern(data["callID"], TOOL_USE_ID, "record.data.callID")
+        if verdict is not None:
+            return verdict
+        verdict = _check_opencode_tool_state(data["state"], "record.data.state")
+        return verdict if verdict is not None else ACCEPTED
+    if part_type == "step-finish":
+        verdict = _check_keys(data, frozenset({"type", "reason"}), frozenset(), "record.data")
+        if verdict is not None:
+            return verdict
+        verdict = _check_literal(data["reason"], OPENCODE_FINISH_VALUES, "record.data.reason")
+        return verdict if verdict is not None else ACCEPTED
+    # compaction
+    verdict = _check_keys(
+        data, frozenset({"type", "auto", "tail_start_id"}), frozenset(), "record.data"
+    )
+    if verdict is not None:
+        return verdict
+    verdict = _check_bool(data["auto"], "record.data.auto")
+    if verdict is not None:
+        return verdict
+    verdict = _check_pattern(data["tail_start_id"], SESSION_ID, "record.data.tail_start_id")
+    return verdict if verdict is not None else ACCEPTED
+
+
+#: OpenCode's shape allowlist, keyed by this module's own fixture-format
+#: discriminator (see the module-level OpenCode note) rather than a real
+#: column name.
+OPENCODE_RECORD_SHAPES: dict[str, Callable[[dict], Verdict]] = {
+    "opencode_message": _classify_opencode_message,
+    "opencode_part": _classify_opencode_part,
+}
+
+
 def classify_record(record: object) -> Verdict:
     """Classify one decoded fixture record against both allowlist layers.
 
@@ -464,12 +921,19 @@ def classify_record(record: object) -> Verdict:
     if not isinstance(record, dict):
         return _reject(RULE_NOT_AN_OBJECT, f"record is a {type(record).__name__}, not an object")
     record_type = record.get("type")
-    shape = RECORD_SHAPES.get(record_type) if isinstance(record_type, str) else None
+    shape = None
+    if isinstance(record_type, str):
+        for shapes in (RECORD_SHAPES, CODEX_RECORD_SHAPES, OPENCODE_RECORD_SHAPES):
+            shape = shapes.get(record_type)
+            if shape is not None:
+                break
     if shape is None:
+        allowed = sorted(
+            set(RECORD_SHAPES) | set(CODEX_RECORD_SHAPES) | set(OPENCODE_RECORD_SHAPES)
+        )
         return _reject(
             RULE_UNKNOWN_RECORD_TYPE,
-            f"record type {str(record_type)[:40]!r} is not in the shape allowlist "
-            f"({sorted(RECORD_SHAPES)})",
+            f"record type {str(record_type)[:40]!r} is not in the shape allowlist ({allowed})",
         )
     return shape(record)
 
