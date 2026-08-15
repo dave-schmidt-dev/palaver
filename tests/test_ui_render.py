@@ -33,7 +33,7 @@ import pytest
 
 from palaver.cli import ui
 from palaver.observer.signals import Status
-from palaver.ui import component
+from palaver.ui import component, publisher
 from palaver.ui.component import (
     LADYBUG,
     PUSHED_AT_KEY,
@@ -606,9 +606,17 @@ def _fake_iterm2(monkeypatch, session, *, dropped=False, drop_tick=False, stall_
             return
         session.store[name] = value
 
+    async def read_variables(_pane_id):
+        # Task 5.6's publish check runs over the same fake connection. A pane
+        # iTerm2 will not describe is the ordinary case for a stub, and the
+        # publisher answers it `UNKNOWN` -- which is what this check is about
+        # anyway: that something wrote, not what it decided.
+        return None
+
     monkeypatch.setattr(ui, "import_iterm2", lambda: module)
     monkeypatch.setattr(component, "import_iterm2", lambda: module)
     monkeypatch.setattr(component, "make_variable_writer", lambda connection: writer)
+    monkeypatch.setattr(publisher, "make_variables_reader", lambda connection: read_variables)
     return module
 
 
@@ -645,7 +653,7 @@ def test_the_ui_subcommand_is_registered():
 
 
 def test_ui_with_no_flags_does_nothing_and_says_so(capsys):
-    args = argparse.Namespace(selftest=False, enable_status_bar=False)
+    args = argparse.Namespace(selftest=False, enable_status_bar=False, disable_status_bar=False)
     assert ui.run(args, on_status=lambda _m: None) == 2
     assert "nothing to do" in capsys.readouterr().out
 
@@ -777,6 +785,93 @@ def test_the_selftest_never_switches_the_status_bar_on(monkeypatch):
     assert "Status bar enabled" in _named(checks, "layout").detail
 
 
+def test_the_selftest_proves_something_writes_to_the_pane(monkeypatch):
+    """Task 5.6's check, and the one whose absence let the gap ship.
+
+    Every other check here proves a pane *can* be written to. This one runs
+    the production publisher over the same connection, which is the only
+    check that fails if nothing writes.
+    """
+    checks, _ = _checks(monkeypatch)
+    publish = _named(checks, "publish")
+    assert publish.passed is True
+    assert publish.mark == "ok"
+
+
+def test_a_publisher_that_writes_nothing_fails_the_selftest(monkeypatch):
+    """The negative control for the check above.
+
+    A `PanePush` with no payload is exactly what a refused write produces,
+    and it is indistinguishable from a successful one by status alone.
+    """
+
+    async def wrote_nothing(pane_ids, **kwargs):
+        return tuple(
+            publisher.PanePush(pane_id=pane_id, status=Status.WORKING, task=None, payload=None)
+            for pane_id in pane_ids
+        )
+
+    monkeypatch.setattr(publisher, "publish_once", wrote_nothing)
+    checks, _ = _checks(monkeypatch)
+    assert _named(checks, "publish").passed is False
+    assert ui.exit_code(checks) == 1
+
+
+def test_the_status_bar_can_be_switched_back_off(monkeypatch):
+    """The reversal for `--enable-status-bar`.
+
+    A change that only Palaver can make and only iTerm2's preferences can
+    undo is a change a user cannot try, so both directions go through one
+    function and this asserts the flag reaches it.
+    """
+    asked = []
+
+    async def record(profile, *, shown):
+        asked.append(shown)
+
+    class _Profile:
+        guid = "profile-1"
+
+        async def async_get_full_profile(self):
+            return self
+
+    module = types.SimpleNamespace(
+        PartialProfile=types.SimpleNamespace(async_query=lambda connection: _resolved([_Profile()]))
+    )
+    monkeypatch.setattr(ui, "import_iterm2", lambda: module)
+    monkeypatch.setattr(component, "show_status_bar", record)
+
+    off = asyncio.run(ui.set_status_bar(object(), shown=False, on_status=lambda _m: None))
+    on = asyncio.run(ui.set_status_bar(object(), shown=True, on_status=lambda _m: None))
+
+    assert asked == [False, True]
+    assert "switched off" in off[0].detail
+    assert "switched on" in on[0].detail
+
+
+def _resolved(value):
+    """Wrap a value in an awaitable, for a stub whose real form is async."""
+
+    async def wait():
+        return value
+
+    return wait()
+
+
+def test_the_two_status_bar_flags_cannot_be_given_together(capsys):
+    """Opposite instructions in one invocation are refused, not silently ordered."""
+    args = argparse.Namespace(
+        selftest=False,
+        enable_status_bar=True,
+        disable_status_bar=True,
+        session=None,
+        width=40,
+        no_ask_cookie=True,
+    )
+    assert ui.run(args) == 2
+    assert "contradict" in capsys.readouterr().out
+
+
 def test_a_skipped_check_is_never_counted_as_a_pass():
     """Asserted twice: in the summary, and on the line a human reads first.
 
@@ -809,7 +904,12 @@ def test_a_machine_with_no_socket_reports_the_reason_and_exits_zero(monkeypatch,
     monkeypatch.setattr(ui, "preflight", _no_socket)
     monkeypatch.setattr(ui, "ensure_cookie", lambda **kwargs: ui.Check("cookie", True, "set"))
     args = argparse.Namespace(
-        selftest=True, enable_status_bar=False, session=None, width=40, no_ask_cookie=True
+        selftest=True,
+        enable_status_bar=False,
+        disable_status_bar=False,
+        session=None,
+        width=40,
+        no_ask_cookie=True,
     )
     assert ui.run(args, on_status=lambda _m: None) == 0
     out = capsys.readouterr().out
@@ -820,7 +920,12 @@ def test_without_a_cookie_nothing_live_is_tried(monkeypatch, capsys):
     monkeypatch.delenv("ITERM2_COOKIE", raising=False)
     monkeypatch.setattr(ui, "preflight", lambda *a, **k: pytest.fail("must not attach"))
     args = argparse.Namespace(
-        selftest=True, enable_status_bar=False, session=None, width=40, no_ask_cookie=True
+        selftest=True,
+        enable_status_bar=False,
+        disable_status_bar=False,
+        session=None,
+        width=40,
+        no_ask_cookie=True,
     )
     assert ui.run(args, on_status=lambda _m: None) == 0
     assert "no cookie" in capsys.readouterr().out

@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from typing import Any, TextIO
 
 from palaver.observer.signals import Status
-from palaver.ui import component
+from palaver.ui import component, publisher
 from palaver.ui.connection import (
     COOKIE_ENV,
     KEY_ENV,
@@ -305,6 +305,30 @@ async def run_checks(
             checks.append(Check("render", False, f"the render returned {component.LADYBUG}"))
         else:
             checks.append(Check("render", True, f"the pane renders as {lines[-1]!r}"))
+
+        # The production path, over the same connection: everything above
+        # this line proves a pane can be written to, and none of it proves
+        # anything writes to one. Reads this machine's real pane variables,
+        # process table, and session stores, so a status here is derived the
+        # way the AutoLaunch process derives it rather than from a probe.
+        on_status(f"publishing one tick to {pane} the way the daemon would")
+        pushes = await publisher.publish_once(
+            [pane],
+            read_variables=publisher.make_variables_reader(connection),
+            set_variable=writer,
+            on_status=on_status,
+        )
+        if pushes and pushes[0].published:
+            checks.append(
+                Check(
+                    "publish",
+                    True,
+                    f"the publisher derived {pushes[0].status.name.lower()} for this pane "
+                    f"and iTerm2 accepted it",
+                )
+            )
+        else:
+            checks.append(Check("publish", False, f"the publisher wrote nothing to {pane}"))
     finally:
         # Whatever the daemon had put there is the truth about this pane; the
         # probe value is not, and leaving it would be this command creating
@@ -333,23 +357,40 @@ async def run_checks(
     return checks
 
 
-async def enable_status_bar(connection: Any, *, on_status: Callable[[str], None]) -> list[Check]:
-    """Turn the status bar on for every shared profile, by explicit request.
+async def set_status_bar(
+    connection: Any, *, shown: bool, on_status: Callable[[str], None]
+) -> list[Check]:
+    """Turn the status bar on or off for every shared profile, by explicit request.
 
     Every shared profile rather than the current pane's, because a session's
     profile is divorced -- writing there would change one pane until it
     closed, which looks like it worked and then silently is not there
     tomorrow. The shared profile is the durable one, and a write to it was
     measured to reach already-divorced sessions.
+
+    The off direction exists because this is the one thing `palaver ui` does
+    that changes what every pane on the machine looks like, and a change that
+    can only be made from Palaver and only undone from iTerm2's preferences
+    is not a change a user can try.
+
+    Args:
+        connection: A live `iterm2.Connection`.
+        shown: Whether the bar should be shown.
+        on_status: Progress channel (INV-1).
+
+    Returns:
+        One check naming how many profiles were written.
     """
     iterm2 = import_iterm2()
     profiles = await iterm2.PartialProfile.async_query(connection)
     changed = []
     for profile in profiles:
         full = await profile.async_get_full_profile()
-        await component.show_status_bar(full, shown=True)
+        await component.show_status_bar(full, shown=shown)
         changed.append(profile.guid)
-        on_status(f"status bar on for profile {profile.guid}")
+        on_status(f"status bar {'on' if shown else 'off'} for profile {profile.guid}")
+    if not shown:
+        return [Check("status bar", True, f"switched off for {len(changed)} shared profile(s)")]
     return [
         Check(
             "status bar",
@@ -371,6 +412,11 @@ def add_arguments(parser) -> None:
         "--enable-status-bar",
         action="store_true",
         help="turn the status bar on in every shared profile; changes how every pane looks",
+    )
+    parser.add_argument(
+        "--disable-status-bar",
+        action="store_true",
+        help="turn the status bar back off in every shared profile",
     )
     parser.add_argument(
         "--session",
@@ -414,7 +460,14 @@ def run(
     out = sys.stdout if out is None else out
     on_status = _stderr_status if on_status is None else on_status
 
-    if not (args.selftest or args.enable_status_bar):
+    if args.enable_status_bar and args.disable_status_bar:
+        print(
+            "palaver ui: --enable-status-bar and --disable-status-bar contradict each other",
+            file=out,
+        )
+        return 2
+
+    if not (args.selftest or args.enable_status_bar or args.disable_status_bar):
         print(
             "palaver ui: nothing to do; pass --selftest to check the pane surface "
             "or --enable-status-bar to turn it on",
@@ -442,8 +495,10 @@ def run(
     collected: list[Check] = []
 
     async def main(connection):
-        if args.enable_status_bar:
-            collected.extend(await enable_status_bar(connection, on_status=on_status))
+        if args.enable_status_bar or args.disable_status_bar:
+            collected.extend(
+                await set_status_bar(connection, shown=args.enable_status_bar, on_status=on_status)
+            )
         if args.selftest:
             collected.extend(
                 await run_checks(

@@ -123,8 +123,9 @@ credential and is passed only through the environment, never on a command line.
 To check whether the pane surface actually works on this machine:
 
 ```sh
-uv run palaver ui --selftest            # registers, round-trips a variable, renders
-uv run palaver ui --enable-status-bar   # turns the bar on; changes how every pane looks
+uv run palaver ui --selftest             # registers, round-trips a variable, renders, publishes
+uv run palaver ui --enable-status-bar    # turns the bar on; changes how every pane looks
+uv run palaver ui --disable-status-bar   # and turns it back off
 ```
 
 The selftest reports rather than judges. A profile with the component not yet
@@ -134,6 +135,13 @@ refused, a variable that will not round-trip, a render tick that does not
 advance. Adding the component to the layout is a one-time manual step in
 iTerm2 > Settings > Profiles > Session > Configure Status Bar, and turning the
 bar on is a separate flag because it changes what every pane looks like.
+
+What actually writes each pane's status is the AutoLaunch process, not the
+observer daemon: it holds the iTerm2 connection, joins each pane to a session
+on disk, and pushes on a heartbeat. The heartbeat is the point rather than an
+implementation detail — a status carries the time it was pushed, and one that
+stops being refreshed stops being shown, so a publisher that skipped an
+unchanged status would blank the pane of an agent working steadily.
 
 Supervising the observer daemon is separate and needs no iTerm2:
 

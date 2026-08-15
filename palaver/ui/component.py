@@ -110,12 +110,39 @@ STATUS_REFERENCE = f"{STATUS_VARIABLE}?"
 #: tick" is a claim about something rather than vacuously true.
 UPDATE_CADENCE = 30.0
 
-#: How long a pushed status stays believable without being refreshed. Three
-#: cadence ticks: one missed render is a busy machine, three in a row is
-#: nobody home. Derived from `UPDATE_CADENCE` rather than chosen separately,
-#: so raising the cadence cannot silently make the horizon too tight to ever
-#: be met.
-STALE_AFTER = 3.0 * UPDATE_CADENCE
+#: Seconds between heartbeats from `palaver.ui.publisher`. This is the clock
+#: the horizon below is measured against -- the one that *writes* the stamp,
+#: not the one that reads it, and not the observer daemon's tick, which
+#: governs how fresh the content is rather than how fresh the stamp is. It
+#: equals `UPDATE_CADENCE` because there is no reason for the component's own
+#: backstop and the publisher's heartbeat to differ, but they are separate
+#: constants because they answer to different processes.
+PUSH_CADENCE = UPDATE_CADENCE
+
+#: How many heartbeats a status survives without one. One missed push is a
+#: busy machine; three in a row is nobody home.
+HORIZON_HEARTBEATS = 3.0
+
+
+def stale_horizon(cadence: float = PUSH_CADENCE) -> float:
+    """How long a status pushed at `cadence` stays believable without a refresh.
+
+    A function rather than only a constant because the rule is the point:
+    the horizon has to move when the heartbeat does, and a horizon written as
+    a literal is indistinguishable from this one until the day someone
+    changes the cadence and every pane quietly starts reading `unknown`.
+
+    Args:
+        cadence: Seconds between pushes.
+
+    Returns:
+        The horizon in seconds.
+    """
+    return HORIZON_HEARTBEATS * cadence
+
+
+#: How long a pushed status stays believable without being refreshed.
+STALE_AFTER = stale_horizon()
 
 #: What the bar shows when Palaver itself is broken, matching the glyph
 #: iTerm2 shows for a component it cannot reach. Never a `Status` label: it
@@ -285,6 +312,14 @@ async def push_status(
     dispatches in response to this one. Writing both here would report a
     render that had not happened.
 
+    **Call this every heartbeat, including when nothing changed.** The stamp
+    is what keeps the pane believable: `decode_status` expires a payload
+    older than `STALE_AFTER`, so suppressing a redundant push would take an
+    agent that has been working steadily for ten minutes -- which changes
+    nothing, and is the most common thing a pane is doing -- and degrade it
+    to `unknown` ninety seconds in. `palaver.ui.publisher` is the caller that
+    honours this.
+
     Args:
         set_variable: The variable writer.
         session_id: The pane to write to.
@@ -293,11 +328,9 @@ async def push_status(
         now: Epoch seconds to stamp the payload with.
 
     Returns:
-        The encoded payload, so a caller can suppress an unchanged push
-        without re-deriving it. Note that two pushes of the same state are
-        **not** byte-equal, because the stamp moves: comparing payloads to
-        suppress a redundant write would suppress nothing. Compare the
-        `(status, task)` pair.
+        The encoded payload, for a caller that wants to assert on what was
+        written. Not a deduplication key: two pushes of the same state are
+        **not** byte-equal, because the stamp moves.
     """
     payload = encode_status(status, task, now=now)
     await set_variable(session_id, STATUS_VARIABLE, payload)
