@@ -1508,15 +1508,21 @@ def test_the_read_only_connection_really_refuses_a_write(store):
 
 
 @pytest.mark.parametrize("tool", ["palaver_recall", "palaver_sessions"])
-def test_every_read_tool_reports_when_the_store_was_last_written_and_who_is_watching(store, tool):
+def test_every_read_tool_reports_when_the_store_was_last_written_and_who_is_watching(
+    short_store, tool
+):
     """A crashed daemon and a quiet one are otherwise identical from here.
 
     Same memories, same timestamps, same shape. A reader who cannot tell
     them apart will read a two-day-old store as current, which is INV-7's
     failure -- and the likelier reading, since a store that answers at all
     looks healthy.
+
+    `short_store`, not `store`: on a path too deep for a socket the honest
+    answer is `None`, and a test that accepted either would not be checking
+    that a *probeable* absent daemon reads as absent.
     """
-    db_path, _ = store
+    db_path, _ = short_store
     server = mcp_server.build_server(db_path)
     result = _call(server, tool, {"scope": {"project": "demo"}})
     payload = json.loads(result.content[0].text)
@@ -1524,6 +1530,29 @@ def test_every_read_tool_reports_when_the_store_was_last_written_and_who_is_watc
     assert "observed_at" in payload, "no freshness stamp, so a stale answer looks current"
     assert "daemon_running" in payload
     assert payload["daemon_running"] is False, "nothing is serving this test store"
+
+
+@pytest.mark.parametrize("tool", ["palaver_recall", "palaver_sessions"])
+def test_a_store_with_no_probeable_socket_reports_unknown_rather_than_stopped(store, tool):
+    """The distinction `False` cannot carry.
+
+    A store too deep for `sun_path` still gets a daemon -- it holds the lock
+    and ticks, it just serves no socket (task 6.3's degraded mode). Probing
+    it answers nothing, and answering `False` would report a *running*
+    daemon as stopped: a confident wrong value, which is the one thing INV-7
+    forbids. `null` says "cannot tell", which is true.
+
+    `store` is on pytest's `tmp_path`, which is over the limit -- the same
+    property that made this fixture wrong for the test above makes it right
+    here.
+    """
+    db_path, _ = store
+    payload = json.loads(
+        _call(mcp_server.build_server(db_path), tool, {"scope": {"project": "demo"}})
+        .content[0]
+        .text
+    )
+    assert payload["daemon_running"] is None, "an unprobeable store reported a definite answer"
 
 
 def test_the_freshness_stamp_is_the_newest_memory_not_the_time_of_the_call(store):

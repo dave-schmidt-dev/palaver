@@ -35,6 +35,7 @@ from palaver.ingest.adapters.claude_code import ClaudeCodeAdapter
 from palaver.ingest.cursors import CursorStore
 from palaver.observer.daemon import DEFAULT_INTERVAL, ObserverDaemon, TickResult
 from palaver.observer.scheduler import TickPlan, plan_tick
+from palaver.observer.socket import SingleWriterError, serve_until, single_writer
 
 NAME = "observe"
 
@@ -194,23 +195,48 @@ def run(
         out.write(render_tick(result))
         out.flush()
 
-    with ObserverDaemon(
-        db_path=db_path,
-        adapters=adapters,
-        cursors=cursors,
-        on_status=on_status,
-        all=args.all,
-    ) as daemon:
-        try:
-            daemon.run(
-                interval=args.interval,
-                max_ticks=max_ticks,
-                on_tick=emit,
-                now=now,
-            )
-        except KeyboardInterrupt:
-            # The unbounded mode's normal ending. Exiting 0 here — after the
-            # context manager closes the writer — is what makes a launchd
-            # stop (task 5.0) a clean shutdown rather than a crash report.
-            on_status("interrupted; closing the writer")
+    # `single_writer` wraps the daemon rather than the other way round: it
+    # is what establishes the right to write at all, so nothing that writes
+    # may be constructed before it is held. A daemon opened first would have
+    # migrated the store and taken a connection before discovering another
+    # daemon owns it (task 6.3).
+    try:
+        with single_writer(db_path, on_status=on_status) as request_socket:
+            with ObserverDaemon(
+                db_path=db_path,
+                adapters=adapters,
+                cursors=cursors,
+                on_status=on_status,
+                all=args.all,
+            ) as daemon:
+                # Requests are served *in place of* the sleep between ticks,
+                # on this same thread. A second thread accepting them would
+                # put two threads on one SQLite connection — the two-writer
+                # problem moved inside the process, where the lock cannot
+                # see it. See `serve_until`.
+                def idle(seconds: float) -> None:
+                    served = serve_until(request_socket, daemon.conn, seconds)
+                    if served:
+                        on_status(f"served {served} write request(s) while idle")
+
+                try:
+                    daemon.run(
+                        interval=args.interval,
+                        max_ticks=max_ticks,
+                        on_tick=emit,
+                        sleep=idle,
+                        now=now,
+                    )
+                except KeyboardInterrupt:
+                    # The unbounded mode's normal ending. Exiting 0 here —
+                    # after the context manager closes the writer — is what
+                    # makes a launchd stop (task 5.0) a clean shutdown
+                    # rather than a crash report.
+                    on_status("interrupted; closing the writer")
+    except SingleWriterError as exc:
+        # Not a traceback: a second daemon on one machine is an ordinary
+        # thing to attempt (launchd retry, a stale terminal), and the person
+        # who did it needs the sentence, not the stack.
+        out.write(f"palaver observe: {exc}\n")
+        return 2
     return 0

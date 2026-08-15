@@ -58,8 +58,10 @@ import json
 import logging
 import os
 import platform
+import select
 import socket as socket_module
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -298,7 +300,7 @@ def single_writer(
     on_status: StatusFn | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     backlog: int = 16,
-) -> Iterator[socket_module.socket]:
+) -> Iterator[socket_module.socket | None]:
     """Claim the writer role, yielding the socket to accept requests on.
 
     The lock is taken first and released last. Everything that could race —
@@ -316,7 +318,10 @@ def single_writer(
         backlog: `listen()` backlog.
 
     Yields:
-        A bound, listening `AF_UNIX` socket.
+        A bound, listening `AF_UNIX` socket — or `None` when the store sits
+        too deep for `sun_path` to hold a socket beside it. The writer role
+        is held either way; only the request channel is missing. Callers
+        pass the value straight to `serve_until`, which handles both.
 
     Raises:
         NonLocalFilesystemError: The data directory is somewhere `flock`
@@ -334,7 +339,20 @@ def single_writer(
     say(f"data directory {directory} is {fstype}; flock is trustworthy here")
 
     lock_path = lock_path_for(db_path)
-    socket_path = socket_path_for(db_path)
+
+    # Degrade here, do not refuse. The lock is what makes this the only
+    # writer, and a lock path has no length limit; the socket only adds
+    # corrections and a second liveness signal on top of it. Refusing to
+    # observe at all because corrections cannot be accepted would trade a
+    # missing feature for a total outage — the wrong direction for a process
+    # whose entire job is to keep watching. The lock below still refuses a
+    # second daemon, so nothing about single-writer safety rests on this.
+    socket_path: Path | None
+    try:
+        socket_path = socket_path_for(db_path)
+    except SocketPathTooLongError as exc:
+        socket_path = None
+        disabled = str(exc)
 
     # Opened, never truncated: the file is a lock token, and its content is
     # nobody's business. `O_CREAT` without `O_TRUNC` so a concurrent holder's
@@ -350,6 +368,16 @@ def single_writer(
                 "writer. Stop the running daemon first, or point --db elsewhere."
             ) from exc
         say(f"took the exclusive writer lock on {lock_path}")
+
+        if socket_path is None:
+            # Said at WARNING volume, not debug: the daemon runs, extracts,
+            # and looks entirely healthy, while `palaver_correct` fails for
+            # a reason nothing downstream can see. The one place that reason
+            # is visible is here, at startup, where it can be acted on.
+            say(f"write requests are disabled — {disabled}")
+            log.warning("write requests are disabled: %s", disabled)
+            yield None
+            return
 
         # Under the lock from here to the bind. A daemon that released now
         # and re-acquired later would reopen the very race the lock closes.
@@ -384,38 +412,47 @@ def single_writer(
         os.close(lock_fd)
 
 
-def daemon_alive(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool:
-    """Is a writer daemon serving this store right now?
+def daemon_running(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool | None:
+    """Is a writer daemon serving this store right now, and can we tell?
 
     Read tools report this alongside their results. A crashed daemon and an
     idle one produce identical output otherwise — the same memories, the
     same timestamps — and a reader with no way to tell the difference will
     take a stale answer for a current one, which is INV-7's failure exactly.
 
+    Three answers, not two, because a daemon at a path too deep for
+    `sun_path` runs perfectly well while serving no socket to probe. Under
+    the older design that combination could not exist — such a daemon
+    refused to start — so `False` was the whole truth. Now it is reachable,
+    and answering `False` there would report a *running* daemon as stopped:
+    a confident wrong answer, which is the one thing INV-7 forbids. "I
+    cannot tell" is not a confident wrong answer.
+
+    A *read* must never fail because of this probe, so nothing here raises;
+    the conditions that would are the daemon's to report at startup, where
+    they can be acted on, not a recall's to raise on a write path the caller
+    never asked to use.
+
     Args:
         db_path: The database whose daemon to check.
         timeout: Seconds to allow the connect.
 
-    A *read* must never fail because of this probe. A socket path too long
-    to bind is a real misconfiguration, but it is one the daemon reports
-    loudly at startup, where it can be acted on; raising it again on every
-    recall would turn a working read into an error about a write path the
-    caller never asked to use. So it is logged and answered as "no daemon",
-    which is exactly what it means for the reader.
-
     Returns:
-        True if a listener answered. False if the socket is absent, refuses,
-        or errors — from a reader's side, every one of those means "no
-        daemon is maintaining this store", and reporting the distinction
-        would imply a confidence this check does not have.
+        True if a listener answered, False if the socket is absent or
+        refuses, and None if this store has no probeable socket at all.
     """
     try:
-        return _probe(socket_path_for(db_path), timeout)
+        socket_path = socket_path_for(db_path)
     except SocketPathTooLongError as exc:
         log.warning("cannot probe for a daemon: %s", exc)
-        return False
+        return None
+    try:
+        return _probe(socket_path, timeout)
     except OSError:
-        return False
+        # `_probe` already narrowed "absent" and "refused" to False, so
+        # anything still raising is an unexpected condition rather than
+        # evidence of absence. Unknown, not dead.
+        return None
 
 
 def request(db_path: Path, payload: Mapping[str, Any], *, timeout: float = DEFAULT_TIMEOUT) -> dict:
@@ -636,3 +673,62 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
         return False
     finally:
         client.close()
+
+
+def serve_until(
+    server: socket_module.socket | None,
+    conn: sqlite3.Connection,
+    seconds: float,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Answer write requests for `seconds`, then return.
+
+    This is what the daemon does *instead of* sleeping between ticks. The
+    alternative — a thread accepting requests alongside the tick loop —
+    would put two threads on one SQLite connection, which is the same
+    two-writer problem this module exists to prevent, moved inside the
+    process where no lock would catch it. Serving in the idle window keeps
+    every write on the tick loop's own thread by construction.
+
+    The cost is that a request arriving mid-tick waits for the tick to
+    finish. Ticks are seconds and corrections are a human typing, so that is
+    the right trade; a correction that waits is fine, a correction racing an
+    extraction on one connection is not.
+
+    Args:
+        server: The listening socket from `single_writer`.
+        conn: The daemon's writable connection.
+        seconds: How long to keep serving. The remaining time is recomputed
+            after every request, so a busy window still ends on schedule
+            rather than extending by one timeout per request.
+        monotonic: Injected for tests. Monotonic rather than wall clock: a
+            clock adjustment must not strand the daemon in an idle window
+            for hours, or skip the window entirely.
+
+    Returns:
+        How many requests were served. Zero without a socket, which is not
+        a failure — the daemon still ticks, it just has nothing to answer.
+    """
+    if server is None:
+        # No request channel (see `single_writer`). Spend the window the way
+        # a daemon with no socket at all would: asleep. Doing anything else
+        # here would make the degraded configuration tick at a different
+        # rate from the normal one, for no reason a reader could see.
+        sleep(seconds)
+        return 0
+
+    deadline = monotonic() + seconds
+    served = 0
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return served
+        # `select` rather than a socket timeout, so the wait ends the moment
+        # a request arrives instead of on the next timeout boundary.
+        ready, _, _ = select.select([server], [], [], remaining)
+        if not ready:
+            return served
+        if serve_request(server, conn):
+            served += 1

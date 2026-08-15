@@ -624,8 +624,6 @@ def short_tmp():
 
 
 #: Holds the writer role and reports what happened, so a parent can assert on
-
-#: Holds the writer role and reports what happened, so a parent can assert on
 #: a *second* process's outcome rather than on a same-process call that shares
 #: this one's file descriptors. `flock` is per-open-file-description: two
 #: `single_writer` calls inside one interpreter would each get their own
@@ -867,6 +865,96 @@ def test_a_path_at_the_limit_binds_and_one_byte_over_does_not(short_tmp):
         writer_socket.socket_path_for(at_limit / "yy" / "palaver.db")
 
 
+def test_a_store_too_deep_for_a_socket_still_gets_a_writer(tmp_path):
+    """Degrade the request channel; never degrade the observing.
+
+    `palaver observe` exists to keep watching. A path too deep for
+    `sun_path` costs it corrections and a liveness probe -- it must not cost
+    it the daemon. Refusing to start here would convert a missing feature
+    into a total outage, and it would do so on exactly the machines whose
+    projects are nested deepest.
+
+    `tmp_path`, deliberately: pytest's own scratch path is already over the
+    limit, so this is the real configuration rather than a contrived one.
+    """
+    said: list[str] = []
+    with pytest.raises(writer_socket.SocketPathTooLongError):
+        writer_socket.socket_path_for(tmp_path / "palaver.db")  # the premise
+
+    with single_writer(tmp_path / "palaver.db", on_status=said.append) as server:
+        assert server is None, "a socket was bound at a path the kernel cannot hold"
+        # The role is still held, which is the whole point -- proven from a
+        # second process, since `flock` is per-open-file-description and a
+        # same-process retry would conflict for the wrong reason.
+        refused = subprocess.run(
+            [sys.executable, "-c", _HOLDER, str(tmp_path / "palaver.db"), "1"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert refused.returncode != 0, "the writer role was not held"
+        assert "DaemonAlreadyRunningError" in refused.stdout
+
+    assert any("write requests are disabled" in line for line in said), (
+        f"the daemon went quiet about its missing request channel: {said}"
+    )
+    assert any(str(writer_socket.MAX_SOCKET_PATH_BYTES) in line for line in said), (
+        "the warning named no limit, so nobody reading it knows what to fix"
+    )
+
+
+def test_serving_without_a_socket_sleeps_the_window_out_and_serves_nothing(tmp_path):
+    """The idle window has to behave the same either way.
+
+    A degraded daemon that returned from its idle window immediately would
+    spin the tick loop at whatever rate the CPU allows -- observation would
+    survive, but the machine would not.
+    """
+    slept: list[float] = []
+    served = writer_socket.serve_until(None, None, 7.5, sleep=slept.append)
+    assert served == 0
+    assert slept == [7.5], "the idle window was not spent asleep"
+
+
+def test_serving_with_a_socket_still_answers_a_request(short_tmp):
+    """The positive control for the two tests above.
+
+    Without it, `serve_until` could return 0 unconditionally and both
+    degradation tests would still pass -- while no correction ever landed.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    conn = connect(db_path)
+    try:
+        with single_writer(db_path) as server:
+            assert server is not None
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                pending = pool.submit(
+                    writer_socket.request,
+                    db_path,
+                    {"op": "correct", "memory_id": memory_id, "statement": "served while idle"},
+                )
+                # Scripted clock: `serve_until` serves for the *whole*
+                # window, so a real 30-second one would cost 30 seconds
+                # after the request it is meant to prove. Third reading is
+                # past the deadline, which also exercises the recomputation.
+                ticks = iter([0.0, 0.0, 100.0])
+                served = writer_socket.serve_until(
+                    server, conn, 30.0, monotonic=lambda: next(ticks)
+                )
+                assert served == 1
+                reply = pending.result(timeout=10)
+                assert reply["ok"], reply
+            finally:
+                pool.shutdown(wait=False)
+    finally:
+        conn.close()
+    assert _raw_row(db_path, reply["memory_id"])["statement"] == "served while idle"
+
+
 # ---------------------------------------------------------------------------
 # The write path: what it will do, what it refuses, and what it never touches.
 # ---------------------------------------------------------------------------
@@ -1102,7 +1190,7 @@ def test_a_correction_travels_over_the_real_socket_to_a_real_daemon(short_tmp):
     )
     try:
         assert _line_within(proc, 30.0) == "HELD"
-        assert writer_socket.daemon_alive(db_path) is True
+        assert writer_socket.daemon_running(db_path) is True
 
         reply = writer_socket.request(
             db_path, {"op": "correct", "memory_id": memory_id, "statement": "over the wire"}
@@ -1127,7 +1215,7 @@ def test_a_write_with_no_daemon_fails_loudly_rather_than_opening_a_second_writer
     """
     db_path = short_tmp / "palaver.db"
     memory_id = _seed_memory(db_path)
-    assert writer_socket.daemon_alive(db_path) is False
+    assert writer_socket.daemon_running(db_path) is False
 
     with pytest.raises(writer_socket.DaemonUnavailableError, match="second"):
         writer_socket.request(

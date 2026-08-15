@@ -34,7 +34,7 @@ from mcp.server.mcpserver.context import Context
 
 from palaver import __version__
 from palaver.mcp import tools_read, tools_write
-from palaver.observer.socket import daemon_alive
+from palaver.observer.socket import daemon_running
 
 log = logging.getLogger(__name__)
 
@@ -179,10 +179,13 @@ def freshness(conn: sqlite3.Connection, db_path: Path) -> dict:
         bound on what this store has seen, and `None` for a store with no
         memories yet — and `daemon_running`, a live connect probe rather
         than a cached flag, because a flag written at startup says only that
-        the daemon once existed.
+        the daemon once existed. `daemon_running` is `null`, not `false`,
+        when the store has no probeable socket: a daemon can run without one
+        (see `palaver.observer.socket.daemon_running`), and reporting it as
+        stopped would be the confident wrong answer INV-7 is about.
     """
     row = conn.execute("SELECT max(created_at) FROM memories").fetchone()
-    return {"observed_at": row[0] if row else None, "daemon_running": daemon_alive(db_path)}
+    return {"observed_at": row[0] if row else None, "daemon_running": daemon_running(db_path)}
 
 
 def build_app(
