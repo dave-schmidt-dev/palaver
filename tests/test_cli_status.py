@@ -119,7 +119,7 @@ def _bookkeeping() -> dict:
     return {"type": "mode", "sessionId": "session-1", "mode": "default"}
 
 
-def _frozen_sample(tmp_path: Path) -> Path:
+def _frozen_sample(tmp_path: Path, *, now: datetime = NOW) -> Path:
     """Copy the committed `tests/fixtures/` corpus into an adapter-shaped sample root.
 
     `ClaudeCodeAdapter.list_store_paths()` requires exactly one project
@@ -130,15 +130,25 @@ def _frozen_sample(tmp_path: Path) -> Path:
     repository's frozen corpus, writing only under `tmp_path` — so the
     byte-identical-output test below runs against a fixed, committed sample
     and never against the real `~/.claude/` store. Every copy's mtime is
-    pinned a few minutes behind `NOW`, so discovery does not depend on when
+    pinned a few minutes behind `now`, so discovery does not depend on when
     the suite actually runs.
+
+    Args:
+        tmp_path: Where the shaped copy is written.
+        now: The clock the mtimes are pinned behind. Defaults to `NOW` for
+            callers that also pass `NOW` into the code under test. A caller
+            that cannot — the console-script tests run a *subprocess*, which
+            reads the real clock and has no way to be handed a frozen one —
+            must pass the real time instead. Defaulting there silently aged
+            the corpus past the discovery window one day after `NOW`, so
+            those tests passed on 2026-08-14 and failed every day after.
     """
     project_dir = tmp_path / "projects" / "fixture-corpus"
     project_dir.mkdir(parents=True)
     for fixture in sorted(FIXTURES_DIR.glob("*.jsonl")):
         copy = project_dir / fixture.name
         copy.write_bytes(fixture.read_bytes())
-        _set_mtime(copy, timedelta(minutes=5))
+        _set_mtime(copy, timedelta(minutes=5), now=now)
     return tmp_path / "projects"
 
 
@@ -337,8 +347,14 @@ def test_inspect_ambiguous_bare_id_requires_the_qualified_session_key(tmp_path):
 def test_console_script_runs_status_with_progress_on_stderr(tmp_path):
     """End to end through the installed `palaver` console script: exits 0,
     one status line per session on stdout, per-session progress on stderr
-    (INV-1) — a scan is never a silent wait, and stdout stays pipeable."""
-    sample = _frozen_sample(tmp_path)
+    (INV-1) — a scan is never a silent wait, and stdout stays pipeable.
+
+    The subprocess reads the real clock, so the corpus is stamped against the
+    real clock too. Stamping it behind the frozen `NOW` instead made this
+    test pass on one calendar day and fail on every day after it, reporting
+    2 of 11 sessions.
+    """
+    sample = _frozen_sample(tmp_path, now=datetime.now(timezone.utc))
     script = Path(sys.executable).parent / "palaver"
     assert script.exists(), f"console script not installed at {script}"
 

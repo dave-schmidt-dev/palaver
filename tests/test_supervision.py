@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -182,10 +183,55 @@ def _await_unloaded(label: str, *, window: float = STARTUP_WINDOW_SECONDS) -> bo
     return False
 
 
-def _bootout_and_settle(label: str) -> None:
-    """Unload a label and do not return until launchd has finished with it."""
+def _contains_assertion(exc: BaseException) -> bool:
+    """Whether `exc` is, or groups, an `AssertionError`.
+
+    anyio's task groups re-raise failures wrapped in a `BaseExceptionGroup`,
+    so an `isinstance` check alone would miss a test's own failed assertion
+    once it has crossed an `async with` boundary.
+    """
+    if isinstance(exc, AssertionError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_assertion(inner) for inner in exc.exceptions)
+    return False
+
+
+def _bootout_and_settle(label: str, *, strict: bool = True) -> None:
+    """Unload a label and do not return until launchd has finished with it.
+
+    The docstring above is a promise this function cannot always keep, so the
+    failure to keep it is reported rather than discarded. An earlier version
+    called `_await_unloaded` and dropped its return value, which meant a
+    teardown that timed out looked identical to one that succeeded — and the
+    symptom surfaced as `Bootstrap failed: 5` in an unrelated test, which is
+    precisely the confusion `_await_unloaded` was added to end.
+
+    Args:
+        label: launchd label to unload.
+        strict: Raise on timeout rather than warn. True at setup, where a
+            label that is still going away invalidates the test about to run.
+            False at teardown, where raising would replace the test's own
+            result — a passing test would be reported as an error, and a
+            failing one would lose its actual assertion message.
+
+    Raises:
+        AssertionError: `strict` and the label outlived the window.
+    """
     bootout(label)
-    _await_unloaded(label)
+    if _await_unloaded(label):
+        return
+    message = (
+        f"{label}: still known to launchd {STARTUP_WINDOW_SECONDS:.0f}s after bootout. "
+        f"The next bootstrap of this label will probably fail with "
+        f"'Bootstrap failed: 5: Input/output error'."
+    )
+    if strict:
+        raise AssertionError(message)
+    # `warnings.warn`, not `print`: pytest captures and discards stdout from a
+    # passing test, so a printed warning here would be invisible in exactly
+    # the case it needs to be seen — a green run that left a job behind.
+    warnings.warn(message, stacklevel=2)
 
 
 @pytest.fixture
@@ -195,12 +241,12 @@ def loaded_selftest_agent(tmp_path):
     _bootout_and_settle(SELFTEST_LABEL)
     result = bootstrap(plist)
     if result.returncode != 0:
-        _bootout_and_settle(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL, strict=False)
         pytest.fail(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
     try:
         yield plist
     finally:
-        _bootout_and_settle(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL, strict=False)
 
 
 # --- rendering -------------------------------------------------------------
@@ -457,6 +503,89 @@ def test_the_restart_window_is_wider_than_two_throttle_intervals():
     assert RESTART_WINDOW_SECONDS > 2 * THROTTLE_INTERVAL_SECONDS
 
 
+def test_waiting_for_an_unload_returns_once_launchctl_stops_knowing_the_label(monkeypatch):
+    """The second call is what the caller is waiting for, not the first."""
+    calls = []
+
+    def fake_print(label, uid=None):
+        calls.append(label)
+        return subprocess.CompletedProcess([], 0 if len(calls) < 2 else 1, "", "")
+
+    monkeypatch.setattr(install_agent, "print_service", fake_print)
+    monkeypatch.setattr(install_agent.time, "sleep", lambda _seconds: None)
+    assert install_agent.wait_for_unloaded("whatever", window=5.0, poll_interval=0.01) is True
+
+
+def test_waiting_for_an_unload_reports_the_timeout_rather_than_claiming_success(monkeypatch):
+    """A label that never goes away must return False.
+
+    Returning True on timeout would put the bootstrap right back into the
+    race the wait exists to close, while making the code read as if it had
+    been closed.
+    """
+    monkeypatch.setattr(
+        install_agent,
+        "print_service",
+        lambda label, uid=None: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(install_agent.time, "sleep", lambda _seconds: None)
+    assert install_agent.wait_for_unloaded("whatever", window=0.2, poll_interval=0.01) is False
+
+
+def test_waiting_for_an_unload_reports_progress(monkeypatch):
+    """INV-1: this blocks for seconds, and a silent block reads as a hang."""
+    monkeypatch.setattr(
+        install_agent,
+        "print_service",
+        lambda label, uid=None: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(install_agent.time, "sleep", lambda _seconds: None)
+    messages = []
+    install_agent.wait_for_unloaded(
+        "whatever", window=0.2, poll_interval=0.01, on_status=messages.append
+    )
+    assert messages, "the wait emitted nothing on the status channel"
+    assert all("whatever" in message for message in messages)
+
+
+def test_reloading_waits_for_the_unload_before_bootstrapping(tmp_path, monkeypatch):
+    """The race the tests fixed for themselves was still open in the command.
+
+    `bootout` returns on acceptance, not completion, so `--reload` could
+    unload a job and then have its own bootstrap refused with `Bootstrap
+    failed: 5`. For the observer that leaves the machine with no database
+    writer at all — the unload half succeeds and the load half does not.
+
+    Ordering is what this asserts, because both calls happen either way and a
+    version that waited *after* bootstrapping would look identical in every
+    other respect.
+    """
+    import io
+
+    order = []
+    monkeypatch.setattr(install_agent, "bootout", lambda label, uid=None: order.append("bootout"))
+    monkeypatch.setattr(
+        install_agent,
+        "wait_for_unloaded",
+        lambda label, **kwargs: (order.append("wait"), True)[1],
+    )
+
+    def fake_bootstrap(plist_path, uid=None):
+        order.append("bootstrap")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(install_agent, "bootstrap", fake_bootstrap)
+    monkeypatch.setattr(install_agent, "service_pid", lambda label, uid=None: 4242)
+
+    args = _install_args(
+        reload=True, plist_path=tmp_path / "reload.plist", log_dir=tmp_path / "logs"
+    )
+    status = install_agent.run(args, out=io.StringIO(), on_status=lambda _message: None)
+
+    assert status == 0
+    assert order == ["bootout", "wait", "bootstrap"]
+
+
 # --- the command -----------------------------------------------------------
 
 
@@ -673,6 +802,15 @@ def test_the_two_mcp_agent_templates_agree_on_everything_but_scheduling(tmp_path
     assert set(observe) & scheduling == scheduling
     assert set(mcp) & scheduling == {"ProcessType"}
 
+    # And the exemption cannot be widened to cover a drift. Every key named in
+    # `scheduling` has to be a real point of divergence, so adding a newly
+    # drifted key to the set in the same commit as the drift does not buy a
+    # green run — which is the one way the check above could be defeated by
+    # editing only this file.
+    for key in sorted(scheduling):
+        diverges = key not in observe or key not in mcp or observe[key] != mcp[key]
+        assert diverges, f"{key} is exempted from the drift check but does not actually differ"
+
 
 def test_unset_mcp_agent_options_are_omitted_rather_than_duplicated():
     """The server owns its own defaults; the plist must not restate them."""
@@ -738,6 +876,68 @@ def test_an_mcp_agent_option_meant_for_the_other_service_is_refused(
     assert not target.exists(), "a refused invocation still wrote a plist"
 
 
+def test_no_option_is_claimed_by_more_than_one_mcp_agent_service():
+    """The cross-service refusal assumes the option sets are disjoint.
+
+    It refuses any option declared by a service other than the selected one,
+    without first checking whether the selected service declares it too. That
+    is correct only while no two services share an option name; the moment
+    one does, the shared flag would be refused for both services and neither
+    could use it. Pinning the assumption here is cheaper than the defensive
+    exclusion, and it fails at the commit that breaks it rather than at the
+    invocation.
+    """
+    seen: dict[str, str] = {}
+    for service in install_agent.SERVICES.values():
+        for option in service.options:
+            assert option not in seen, (
+                f"--{option} is declared by both {seen[option]} and {service.name}; "
+                f"the refusal loop in `run` would now reject it for both"
+            )
+            seen[option] = service.name
+
+
+@pytest.mark.inv9
+@pytest.mark.parametrize("host", ["0.0.0.0", "", "192.168.1.10", "::1", "localhost"])
+def test_an_mcp_agent_asked_to_bind_off_loopback_is_refused(tmp_path, capsys, host):
+    """INV-9, at the layer that makes the mistake durable.
+
+    `palaver mcp` refuses the address at startup, so the server never serves
+    it either way. What this stops is the plist: without the check the
+    command writes a `RunAtLoad`+`KeepAlive` job on disk asking for a bind
+    that INV-9 forbids, and launchd then retries it every ten seconds
+    forever. The file is the artifact that outlives the typo, so the refusal
+    has to happen before the file exists — which is what the last assertion
+    pins.
+    """
+    import io
+
+    target = tmp_path / "never-written.plist"
+    args = _install_args(service="mcp", host=host, plist_path=target)
+    status = install_agent.run(args, out=io.StringIO(), on_status=lambda _message: None)
+
+    assert status == 2
+    assert "127.0.0.1" in capsys.readouterr().err
+    assert not target.exists(), "a plist asking for a forbidden bind was written to disk"
+
+
+@pytest.mark.inv9
+def test_an_mcp_agent_on_loopback_is_still_installable(tmp_path):
+    """Positive control. A refusal that rejected every `--host` would satisfy
+    the test above while making `--service mcp` unusable."""
+    target = tmp_path / "loopback.plist"
+    rendered = _run_capture(
+        _install_args(
+            service="mcp",
+            host="127.0.0.2",
+            print_only=True,
+            plist_path=target,
+            log_dir=tmp_path / "logs",
+        )
+    )
+    assert "127.0.0.2" in rendered
+
+
 def test_the_mcp_agent_service_is_reachable_from_the_real_parser(tmp_path):
     """The wiring check, and the reason it goes through `run` and not `render_plist`.
 
@@ -760,6 +960,11 @@ def test_the_mcp_agent_service_is_reachable_from_the_real_parser(tmp_path):
             "9999",
             "--plist-path",
             str(target),
+            # Without this, `run()` mkdirs `.logs/` inside the real
+            # repository. The plist only needs the paths to render; it is
+            # never loaded here, so nothing has to write to them.
+            "--log-dir",
+            str(tmp_path / "logs"),
         ]
     )
     assert parsed.service == "mcp"
@@ -786,7 +991,11 @@ def test_the_default_mcp_agent_service_is_still_the_observer(tmp_path):
     from palaver.cli import build_parser
 
     target = tmp_path / "default.plist"
-    parsed = build_parser().parse_args(["install-agent", "--plist-path", str(target)])
+    parsed = build_parser().parse_args(
+        # `--log-dir` for the same reason as the test above: keep `run()`'s
+        # mkdir inside tmp_path rather than in the checkout.
+        ["install-agent", "--plist-path", str(target), "--log-dir", str(tmp_path / "logs")]
+    )
     assert parsed.service == "observe"
 
     status = install_agent.run(parsed, out=io.StringIO(), on_status=lambda _message: None)
@@ -865,7 +1074,7 @@ def test_an_agent_without_keepalive_stays_dead_when_killed(tmp_path):
         )
         assert revived is None, f"a job with no KeepAlive came back as pid {revived}"
     finally:
-        _bootout_and_settle(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL, strict=False)
 
 
 @live
@@ -941,7 +1150,7 @@ def loaded_mcp_agent(tmp_path):
     _bootout_and_settle(MCP_SELFTEST_LABEL)
     result = bootstrap(plist)
     if result.returncode != 0:
-        _bootout_and_settle(MCP_SELFTEST_LABEL)
+        _bootout_and_settle(MCP_SELFTEST_LABEL, strict=False)
         pytest.fail(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
     try:
         yield {"port": port, "url": f"http://127.0.0.1:{port}/mcp", "logs": logs}
@@ -949,7 +1158,7 @@ def loaded_mcp_agent(tmp_path):
         # Settling at teardown rather than only at the next setup: teardown is
         # where the job actually is, and leaving it half-removed makes the
         # *following* test fail for a reason that has nothing to do with it.
-        _bootout_and_settle(MCP_SELFTEST_LABEL)
+        _bootout_and_settle(MCP_SELFTEST_LABEL, strict=False)
 
 
 @live
@@ -1040,31 +1249,61 @@ def test_a_held_session_does_not_survive_the_mcp_agent_restart(loaded_mcp_agent)
     port = loaded_mcp_agent["port"]
     assert _accepting(port, window=STARTUP_WINDOW_SECONDS)
 
-    async def hold_across_restart() -> str:
-        async with streamable_http_client(loaded_mcp_agent["url"]) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                first = await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
-                assert not first.is_error
+    async def hold_across_restart() -> tuple[str, str]:
+        """Return which boundary surfaced the failure, and what it said.
 
-                original = _await_pid(MCP_SELFTEST_LABEL)
-                assert original is not None
-                os.kill(original, signal.SIGKILL)
-                assert (
-                    wait_for_new_pid(MCP_SELFTEST_LABEL, original, on_status=lambda _message: None)
-                    is not None
-                )
-                assert _accepting(port, window=RESTART_WINDOW_SECONDS)
+        Both boundaries are caught, not just the call. Tearing down a session
+        whose server is gone can raise on `__aexit__` instead of on the call,
+        and with only the call guarded that escape becomes a pytest *error*
+        with an unwind traceback — the same finding, reported as a broken
+        test. Which boundary it came from is returned rather than flattened,
+        because the message assertion below is only meaningful for one of
+        them.
+        """
+        source, message = "", ""
+        try:
+            async with streamable_http_client(loaded_mcp_agent["url"]) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    first = await session.call_tool(
+                        "palaver_recall", {"scope": {"project": "demo"}}
+                    )
+                    assert not first.is_error
 
-                try:
-                    await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
-                except Exception as exc:  # noqa: BLE001 - the escape is the finding
-                    return f"{type(exc).__name__}: {exc}"
-                return ""
+                    original = _await_pid(MCP_SELFTEST_LABEL)
+                    assert original is not None
+                    os.kill(original, signal.SIGKILL)
+                    assert (
+                        wait_for_new_pid(
+                            MCP_SELFTEST_LABEL, original, on_status=lambda _message: None
+                        )
+                        is not None
+                    )
+                    assert _accepting(port, window=RESTART_WINDOW_SECONDS)
 
-    outcome = asyncio.run(hold_across_restart())
-    assert outcome, "the held session survived the restart; the README claim may now be true"
-    assert "session" in outcome.lower(), outcome
+                    try:
+                        await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
+                    except Exception as exc:  # noqa: BLE001 - the escape is the finding
+                        source, message = "call", f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - so is an escape from the unwind
+            # An assertion above is a real failure, not the finding. Without
+            # this the guard would swallow "the first call errored" and report
+            # it as "the session did not survive", passing for the wrong
+            # reason. anyio wraps failures in groups, so the check recurses.
+            if _contains_assertion(exc):
+                raise
+            if not source:
+                source, message = "unwind", f"{type(exc).__name__}: {exc}"
+        return source, message
+
+    source, message = asyncio.run(hold_across_restart())
+    assert source, "the held session survived the restart; the README claim may now be true"
+    # Pinned only on the call path, where the SDK's own wording ("Session
+    # terminated", from its 404 handler) is what proves the session — rather
+    # than the socket — is what died. An unwind failure is the same finding
+    # arriving by a different route and carries no such guaranteed wording.
+    if source == "call":
+        assert "session" in message.lower(), message
 
 
 # ---------------------------------------------------------------------------

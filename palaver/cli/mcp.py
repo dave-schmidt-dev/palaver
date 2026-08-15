@@ -246,16 +246,24 @@ def bind_listener(host: str, port: int) -> socket.socket:
     permit a second live listener — a real collision still raises
     `EADDRINUSE` — so it buys the restart without weakening the check.
 
+    The INV-9 loopback check is repeated here rather than left to `run()`.
+    `run()` refuses first so the CLI answers with an exit code instead of a
+    traceback, but this is the single place a listening socket is created,
+    and a caller reaching it directly must not be able to open the store to
+    the network by skipping the front door.
+
     Args:
-        host: Interface to bind.
+        host: Interface to bind. IPv4 loopback only — see `ensure_loopback`.
         port: Port to bind.
 
     Returns:
         A bound, listening socket for uvicorn to serve.
 
     Raises:
+        NonLoopbackHost: `host` is not an IPv4 loopback literal.
         OSError: The address is in use or otherwise unbindable.
     """
+    mcp_server.ensure_loopback(host)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -481,6 +489,15 @@ def run(
 
     if args.clients < 1:
         out.write("palaver mcp: --clients must be at least 1\n")
+        return 2
+
+    # Ahead of the selftest branch on purpose. The selftest reaches uvicorn
+    # through `_build_server` rather than `bind_listener`, so a check placed
+    # only in the binder would leave `--selftest --host 0.0.0.0` open.
+    try:
+        mcp_server.ensure_loopback(args.host)
+    except mcp_server.NonLoopbackHost as exc:
+        out.write(f"palaver mcp: {exc}\n")
         return 2
 
     if args.selftest:

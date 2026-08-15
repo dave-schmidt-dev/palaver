@@ -26,6 +26,7 @@ memories.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -48,6 +49,63 @@ SERVER_NAME = "palaver"
 #: listener; a server reachable off-machine would make the aggregated store
 #: of every observed session remotely queryable.
 DEFAULT_HOST = "127.0.0.1"
+
+
+class NonLoopbackHost(ValueError):
+    """A requested bind address is not IPv4 loopback, so INV-9 refuses it."""
+
+
+def ensure_loopback(host: str) -> str:
+    """Refuse any bind address that would expose the store off-machine.
+
+    The comment on `DEFAULT_HOST` has always said "loopback and nowhere
+    else", and until this function existed nothing checked it. `--host`
+    reached `socket.bind` unvalidated, so `--host 0.0.0.0` served the
+    aggregated content of every observed session on the machine to the whole
+    network, and `install-agent --service mcp --host 0.0.0.0 --load` made
+    that mistake survive reboots under `KeepAlive`.
+
+    Only IPv4 loopback literals are accepted, and both halves of that are
+    deliberate:
+
+    *Only IPv4*, because `bind_listener` creates an `AF_INET` socket. `::1`
+    would pass an is-loopback test and then fail at `bind()` with an
+    `OSError` that `palaver mcp` reports as "another Palaver MCP server is
+    probably already serving it" — a confidently wrong answer (INV-7) on the
+    exact path this check exists to harden.
+
+    *Only literals*, so no hostname, `localhost` included. What a name binds
+    to is resolver and proxy state rather than a property of the argument,
+    which is the same hazard `palaver.extract.client` documents for outbound
+    requests; a check on a name cannot be made to hold. The message names
+    `127.0.0.1` so the fix is one substitution away.
+
+    Args:
+        host: The requested bind address.
+
+    Returns:
+        `host` unchanged, so a caller can wrap an argument in place.
+
+    Raises:
+        NonLoopbackHost: `host` is empty, is not an IPv4 literal, or is
+            outside 127.0.0.0/8. The empty string is refused rather than
+            ignored: `--host ""` binds `INADDR_ANY`, which is the worst
+            case and not a no-op.
+    """
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        reason = "is not an IPv4 address literal"
+    else:
+        if address.is_loopback:
+            return host
+        reason = "is not a loopback address"
+    raise NonLoopbackHost(
+        f"{host!r} {reason}. Palaver's MCP listener binds 127.0.0.0/8 and "
+        f"nothing else (default {DEFAULT_HOST}), because INV-9 keeps "
+        "observed-session content on this machine."
+    )
+
 
 #: The default port. Fixed rather than ephemeral because clients register a
 #: URL once in `~/.claude.json` or `~/.codex/config.toml` and a port that

@@ -49,16 +49,21 @@ calls `open(`/`os.open` directly — every read must go through
 from __future__ import annotations
 
 import ast
+import io
 import re
+import socket
 import sqlite3
 import tomllib
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 import palaver
+from palaver.cli import mcp as mcp_cli
 from palaver.ingest.adapters import opencode_guard
 from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN, CHANNEL_INJECTED, classify_channel
+from palaver.mcp import server as mcp_server
 
 PALAVER_ROOT = Path(palaver.__file__).resolve().parent
 ADAPTERS_DIR = PALAVER_ROOT / "ingest" / "adapters"
@@ -536,3 +541,90 @@ def test_adapters_route_every_read_through_the_chokepoint(tmp_path):
         "import os\n\ndef read_it(path):\n    return os.open(path, os.O_RDONLY)\n"
     )
     assert _direct_open_call_lines(poisoned_os_open) == [4]
+
+
+# INV-9 — the MCP listener cannot be opened anywhere but loopback
+#
+# The charter names three source-scanning gate tests for INV-9, and they all
+# answer the *outbound* half of it: no Palaver module constructs an HTTP
+# client. Task 6.1 opened an inbound socket, and `--host` reached
+# `socket.bind` with nothing between them, so the store could be served to
+# the network by a flag rather than by a code change no scan would see. The
+# checks below go after the bind itself and after the two commands that can
+# reach it, because a wrong value here is not a crash — it is a listener
+# quietly answering the LAN.
+
+#: Addresses that must be refused, each for a different reason. `0.0.0.0` and
+#: the empty string are `INADDR_ANY` under two spellings; a LAN literal is
+#: the plausible-looking mistake; `::1` *is* loopback but not in the family
+#: `bind_listener` creates, and accepting it would surface as a misleading
+#: "already in use" error; `localhost` resolves through state the check
+#: cannot see.
+NON_LOOPBACK_HOSTS = ("0.0.0.0", "", "192.168.1.10", "10.0.0.5", "::1", "localhost", "127.1")
+
+
+@pytest.mark.inv9
+@pytest.mark.parametrize("host", NON_LOOPBACK_HOSTS)
+def test_a_non_loopback_bind_address_is_refused(host):
+    """INV-9 gate: the validator refuses every address that is not IPv4 loopback."""
+    with pytest.raises(mcp_server.NonLoopbackHost) as excinfo:
+        mcp_server.ensure_loopback(host)
+    # The message has to be actionable, not merely present: whoever typed the
+    # flag needs to be told what to type instead.
+    assert mcp_server.DEFAULT_HOST in str(excinfo.value)
+
+
+@pytest.mark.inv9
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "127.1.2.3"])
+def test_the_loopback_check_is_not_a_blanket_refusal(host):
+    """Positive control. A validator that refused everything would pass the
+    test above while making the server unrunnable, so the accepted set is
+    asserted too — and it is the whole of 127.0.0.0/8, not just the default."""
+    assert mcp_server.ensure_loopback(host) == host
+
+
+@pytest.mark.inv9
+@pytest.mark.parametrize("host", ["0.0.0.0", "", "192.168.1.10"])
+def test_the_listener_itself_cannot_be_opened_off_loopback(host):
+    """After the bind, not merely after the CLI.
+
+    `run()` refusing first is what produces a clean exit code, but it is the
+    friendly wrapper. This attacks the one function in the codebase that
+    creates a listening socket, so a future caller reaching it directly
+    cannot open the store to the network by skipping the front door.
+    """
+    with pytest.raises(mcp_server.NonLoopbackHost):
+        mcp_cli.bind_listener(host, 0)
+
+
+@pytest.mark.inv9
+def test_the_listener_still_binds_on_loopback():
+    """Positive control for the test above: the refusal did not break binding."""
+    sock = mcp_cli.bind_listener(mcp_server.DEFAULT_HOST, 0)
+    try:
+        assert sock.getsockname()[0] == mcp_server.DEFAULT_HOST
+        assert sock.family == socket.AF_INET
+    finally:
+        sock.close()
+
+
+@pytest.mark.inv9
+@pytest.mark.parametrize("selftest", [False, True])
+def test_both_mcp_command_paths_refuse_a_non_loopback_host(tmp_path, selftest):
+    """`--selftest` reaches uvicorn through `_build_server`, not `bind_listener`.
+
+    Parametrized over both paths because the check's placement is the whole
+    point: it sits ahead of the selftest branch, and moving it below would
+    leave `--selftest --host 0.0.0.0` binding `INADDR_ANY` with every other
+    test in this file still green.
+    """
+    out = io.StringIO()
+    args = Namespace(
+        selftest=selftest,
+        clients=1,
+        db=tmp_path / "absent.db",
+        host="0.0.0.0",
+        port=0,
+    )
+    assert mcp_cli.run(args, out=out, on_status=lambda _: None) == 2
+    assert "127.0.0.1" in out.getvalue()

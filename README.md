@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** built and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, the Codex/OpenCode adapters, and the MCP surface — reads, pagination, the single-writer socket, `palaver_correct`, and query events — are all in place, each supervised by its own launchd user agent.
+**Status:** built and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, the Codex/OpenCode adapters, and the MCP surface — reads, pagination, the single-writer socket, `palaver_correct`, and query events — are all in place. Two of those components run as long-lived processes, and each has its own launchd user agent: the observer daemon and the MCP server.
 
 ## Problem
 
@@ -199,6 +199,13 @@ is `Standard` with neither, because every cycle it spends is inside an
 agent's blocking tool call. `Adaptive` is not an option for it: launchd
 promotes an Adaptive job out of Background on *XPC* activity, and this one
 speaks HTTP, so it would stay throttled forever.
+
+`--host` accepts `127.0.0.0/8` and nothing else — not `0.0.0.0`, not a LAN
+address, not `localhost`, and not `::1`. Both `palaver mcp` and
+`install-agent --service mcp` refuse anything else rather than binding it,
+because INV-9 keeps the aggregated store of every observed session on this
+machine. The refusal happens before the plist is written, so a typo cannot
+leave a `KeepAlive` job on disk retrying a forbidden bind every ten seconds.
 
 ## Conventions
 

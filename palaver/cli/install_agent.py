@@ -49,10 +49,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
-from typing import TextIO
+from typing import Any, TextIO
 from xml.sax.saxutils import escape
 
 from palaver.logging_setup import PROJECT_ROOT
+from palaver.mcp import server as mcp_server
 
 NAME = "install-agent"
 HELP = "render and optionally load a launchd user agent for `palaver observe` or `palaver mcp`"
@@ -96,6 +97,14 @@ THROTTLE_INTERVAL_SECONDS = 10
 #: throttle intervals plus slack: one interval can already be partly elapsed
 #: when the process dies, and the machine may be busy.
 RESTART_WINDOW_SECONDS = 2.0 * THROTTLE_INTERVAL_SECONDS + 5.0
+
+#: How long to wait for launchd to finish tearing a label down. `bootout`
+#: returns once the request is accepted, not once it is complete, and
+#: bootstrapping a label that is still going away fails with `Bootstrap
+#: failed: 5: Input/output error`. Teardown is far quicker than a throttled
+#: restart, so this is short — long enough to cover a busy machine, short
+#: enough that `--reload` does not appear to hang.
+UNLOAD_WINDOW_SECONDS = 10.0
 
 #: Where launchd's captured stdout and stderr land. `.logs/` is the repo's
 #: gitignored log directory, which is what the daemon's own file handler
@@ -219,11 +228,16 @@ class Service:
     name: str
     label: str
     template_path: Path
-    build_argv: Callable[[Path, object], list[str]]
+    #: `(executable, parsed_args) -> argv`. The second parameter is `Any`
+    #: rather than `argparse.Namespace` because the tests pass a
+    #: structural stand-in, and because `object` — its previous
+    #: annotation — describes something no implementation could use.
+    build_argv: Callable[[Path, Any], list[str]]
     options: tuple[str, ...]
 
 
 def _observe_argv(executable: Path, args) -> list[str]:
+    """Build `palaver observe`'s argv from the parsed flags. See `Service`."""
     return observe_program_arguments(
         executable=executable,
         db_path=args.db,
@@ -233,6 +247,7 @@ def _observe_argv(executable: Path, args) -> list[str]:
 
 
 def _mcp_argv(executable: Path, args) -> list[str]:
+    """Build `palaver mcp`'s argv from the parsed flags. See `Service`."""
     return mcp_program_arguments(
         executable=executable,
         db_path=args.db,
@@ -480,6 +495,47 @@ def wait_for_new_pid(
     return None
 
 
+def wait_for_unloaded(
+    label: str,
+    *,
+    window: float = UNLOAD_WINDOW_SECONDS,
+    poll_interval: float = 0.2,
+    uid: int | None = None,
+    on_status: Callable[[str], None] | None = None,
+) -> bool:
+    """Wait until launchd no longer knows the label.
+
+    `launchctl bootout` returns when the request is *accepted*, not when the
+    teardown is *finished*. Bootstrapping in that gap fails with `Bootstrap
+    failed: 5: Input/output error`, so `--reload` without this wait can
+    unload a job and then decline to load it again — and for the observe
+    service, which is the database's single writer, losing that race leaves
+    the machine with no writer at all.
+
+    Args:
+        label: launchd label being torn down.
+        window: Seconds to wait before giving up.
+        poll_interval: Seconds between `launchctl print` calls.
+        uid: User id, defaulting to the current one.
+        on_status: Progress channel (INV-1) — this blocks for as long as
+            launchd takes, and a silent multi-second wait reads as a hang.
+
+    Returns:
+        True once the label is gone; False if it was still present when the
+        window expired. A False is not fatal on its own — the bootstrap that
+        follows is the real test — so callers report it rather than raise.
+    """
+    deadline = time.monotonic() + window
+    while time.monotonic() < deadline:
+        if print_service(label, uid=uid).returncode != 0:
+            return True
+        if on_status is not None:
+            remaining = deadline - time.monotonic()
+            on_status(f"{label}: awaiting teardown, {remaining:.0f}s of the window left")
+        time.sleep(poll_interval)
+    return print_service(label, uid=uid).returncode != 0
+
+
 def add_arguments(parser) -> None:
     """Register `install-agent`'s flags on its subparser."""
     parser.add_argument(
@@ -633,6 +689,18 @@ def run(
                 )
                 return 2
 
+    # Checked here, not only in `palaver mcp`. A plist is durable: the server
+    # itself would refuse the address at startup, but only after this command
+    # had already written a `RunAtLoad`+`KeepAlive` job asking for it, leaving
+    # a file on disk that describes an INV-9 breach and a service that crash
+    # loops every ten seconds trying to perform it.
+    if args.host is not None:
+        try:
+            mcp_server.ensure_loopback(args.host)
+        except mcp_server.NonLoopbackHost as exc:
+            print(f"palaver install-agent: {exc}", file=sys.stderr)
+            return 2
+
     label = service.label if args.label is None else args.label
     executable = _default_executable() if args.executable is None else args.executable
     log_dir = DEFAULT_LOG_DIR if args.log_dir is None else args.log_dir
@@ -674,6 +742,8 @@ def run(
     if args.reload:
         on_status(f"{label}: unloading any previously loaded job")
         bootout(label)
+        if not wait_for_unloaded(label, on_status=on_status):
+            on_status(f"{label}: still loaded after teardown window; bootstrapping anyway")
 
     on_status(f"{label}: bootstrapping into {domain_target()}")
     result = bootstrap(plist_path)
