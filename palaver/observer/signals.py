@@ -107,6 +107,26 @@ from enum import Enum
 
 from palaver.extract.persist import Extraction
 
+#: The share of a source's sampled sessions a signal must be determinable
+#: for before a status derived from that signal may be asserted for that
+#: source (task 7.3). Below it, `derive_status()` returns `UNKNOWN`.
+#:
+#: 50% is a policy constant, not a measurement, and it is deliberately
+#: coarse. The claim it encodes is structural rather than statistical: a
+#: derivation that cannot read a signal for most of a source's sessions has
+#: not been shown to fit that source's format at all, and the minority it
+#: does answer for are as likely to be shape coincidences — a record that
+#: happens to look Claude-Code-like — as observations. Coverage is not
+#: accuracy (see `palaver.cli.diagnose`), so this threshold cannot say a
+#: source's answers are *right*; it can only refuse to pass on answers from
+#: a derivation that demonstrably does not generalize. Every caller may pass
+#: its own value.
+DEFAULT_COVERAGE_THRESHOLD = 50.0
+
+#: Per-signal coverage for one source, as percentages keyed by the names in
+#: `SIGNAL_NAMES`. `palaver.cli.diagnose.CoverageReport` produces these.
+SourceCoverage = Mapping[str, float]
+
 
 class Tri(Enum):
     """A three-valued signal: true, false, or not determinable.
@@ -454,6 +474,56 @@ def _is_affirmatively_empty(value: str | None) -> bool:
     return value is not None and not value.strip()
 
 
+@dataclass(frozen=True)
+class StatusDerivation:
+    """One status, plus every signal the rule list read to reach it.
+
+    `consulted` exists so the per-source coverage gate (task 7.3) can be
+    computed rather than tabulated. A hand-written status-to-signals table
+    would be a second copy of the rule order, maintained by hand, and wrong
+    the first time a rule moved; this records what the interpreter actually
+    read, in the order it read it.
+
+    It is *every* signal examined up to and including the deciding one, not
+    only the deciding one. A `WORKING` result consulted `unresolved_tool_error`
+    and found it not `TRUE` — so if that signal is unreadable for most of a
+    source's sessions, `WORKING` is exactly as suspect as `ERROR` would have
+    been: the rule list may have skipped rule 3 for want of evidence rather
+    than for want of an error.
+
+    Attributes:
+        status: What `derive_status()` returns, ungated.
+        consulted: Names from `SIGNAL_NAMES`, in rule-evaluation order.
+    """
+
+    status: Status
+    consulted: tuple[str, ...]
+
+
+def under_covered(
+    consulted: Sequence[str],
+    coverage: SourceCoverage,
+    *,
+    threshold: float = DEFAULT_COVERAGE_THRESHOLD,
+) -> tuple[str, ...]:
+    """Name the consulted signals this source does not cover well enough.
+
+    Args:
+        consulted: Signal names to check, e.g. a `StatusDerivation.consulted`.
+        coverage: Per-signal coverage percentages for one source. A signal
+            absent from the mapping counts as 0% — unmeasured is not
+            presumed adequate, for the same reason
+            `CoverageReport.percentage` returns 0.0 over an empty sample
+            rather than 100% by vacuity.
+        threshold: Minimum percentage a signal must reach.
+
+    Returns:
+        The under-covered names, in `consulted` order. Empty when every
+        consulted signal clears the threshold.
+    """
+    return tuple(name for name in consulted if coverage.get(name, 0.0) < threshold)
+
+
 def derive_status(signals: Signals, *, extraction: Extraction | None = None) -> Status:
     """Compute a session's status from deterministic signals only.
 
@@ -529,6 +599,13 @@ def derive_status(signals: Signals, *, extraction: Extraction | None = None) -> 
     5f. **Otherwise → `AWAITING_HUMAN`.** An extraction that said nothing
         about remaining work refines nothing, so the coarse answer stands.
 
+    Task 7.3's per-source coverage gate is **not** a parameter here, and
+    that is deliberate rather than incidental: this function's contract is
+    that it takes no mapping of any kind, which is checked by INV-7's gate
+    test and is what makes "no status can reach it under any key" a property
+    a reader can confirm from the signature alone. The gate lives in
+    `derive_status_for_source`, which wraps this one.
+
     A note on what is deliberately *not* built here: an unresolved
     `AskUserQuestion` gives `turn_boundary` the basis
     `BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE`, which would corroborate
@@ -555,6 +632,85 @@ def derive_status(signals: Signals, *, extraction: Extraction | None = None) -> 
     Raises:
         TypeError: `extraction` is neither `None` nor an `Extraction`.
     """
+    return derive_status_with_provenance(signals, extraction=extraction).status
+
+
+def derive_status_for_source(
+    signals: Signals,
+    coverage: SourceCoverage,
+    *,
+    threshold: float = DEFAULT_COVERAGE_THRESHOLD,
+    extraction: Extraction | None = None,
+) -> Status:
+    """Compute a status, then withdraw it if its source cannot support it.
+
+    `derive_status()` answers "what does this session's signal set say".
+    This answers the narrower question a report has to answer: "what may
+    this *source* be allowed to say". A source whose coverage for a
+    consulted signal falls below `threshold` yields `UNKNOWN`, whatever the
+    rules concluded.
+
+    The gate runs last and can only ever weaken the answer — never turn one
+    status into a different confident one. That ordering is the point: a
+    coverage number is a property of a whole sample, not of the session in
+    hand, so it may withdraw a status but must never manufacture one.
+
+    Per-session, an undeterminable signal already yields `UNKNOWN` through
+    rules 1, 2 and 6. The gate catches what those rules cannot see: the
+    signal *was* determinable for this session, but the derivation behind it
+    plainly does not fit the source the session came from, so the sessions it
+    does answer for are as likely to be shape coincidences as observations.
+    That is the plan's adapter-interface rollback point — a source that
+    generalizes badly degrades honestly instead of degrading silently.
+
+    Args:
+        signals: The deterministic signal set. Takes no model output.
+        coverage: Per-signal coverage percentages for the source this
+            session came from, e.g.
+            `palaver.cli.diagnose.CoverageReport.as_coverage()`. Positional,
+            and with no default, because a caller reaching for the gated
+            entry point without a measurement has nothing to gate with and
+            should be calling `derive_status()` instead.
+        threshold: Minimum coverage percentage a consulted signal must
+            reach. A parameter rather than a module constant read directly,
+            so a test can drive the gate from both sides without
+            monkeypatching.
+        extraction: Optional refinement content; see `derive_status()`.
+
+    Returns:
+        The status `derive_status()` would return, or `Status.UNKNOWN` when
+        a consulted signal falls below `threshold` for this source.
+
+    Raises:
+        TypeError: `extraction` is neither `None` nor an `Extraction`.
+    """
+    derivation = derive_status_with_provenance(signals, extraction=extraction)
+    if under_covered(derivation.consulted, coverage, threshold=threshold):
+        return Status.UNKNOWN
+    return derivation.status
+
+
+def derive_status_with_provenance(
+    signals: Signals, *, extraction: Extraction | None = None
+) -> StatusDerivation:
+    """Run `derive_status()`'s rule list, reporting which signals it read.
+
+    The rule list itself, and the only copy of it. `derive_status()` is a
+    thin wrapper that applies the coverage gate to this result; see its
+    docstring for every rule, in order, with the reason it sits where it
+    does.
+
+    Args:
+        signals: The deterministic signal set. Takes no model output.
+        extraction: Optional refinement content; see `derive_status()`.
+
+    Returns:
+        The status and the signal names consulted to reach it, in
+        rule-evaluation order.
+
+    Raises:
+        TypeError: `extraction` is neither `None` nor an `Extraction`.
+    """
     if extraction is not None and not isinstance(extraction, Extraction):
         raise TypeError(
             f"derive_status() takes an Extraction or None, got "
@@ -562,22 +718,26 @@ def derive_status(signals: Signals, *, extraction: Extraction | None = None) -> 
             f"extraction_from_model_payload() first (INV-7)."
         )
 
+    consulted: list[str] = ["source_readable"]
     if signals.source_readable is not Tri.TRUE:
-        return Status.UNKNOWN
+        return StatusDerivation(status=Status.UNKNOWN, consulted=tuple(consulted))
 
+    consulted.append("signal_records_parsed")
     if signals.signal_records_parsed is not Tri.TRUE:
-        return Status.UNKNOWN
+        return StatusDerivation(status=Status.UNKNOWN, consulted=tuple(consulted))
 
+    consulted.append("unresolved_tool_error")
     if signals.unresolved_tool_error is Tri.TRUE:
-        return Status.ERROR
+        return StatusDerivation(status=Status.ERROR, consulted=tuple(consulted))
 
+    consulted.append("agent_turn_ended")
     if signals.agent_turn_ended is Tri.FALSE:
-        return Status.WORKING
+        return StatusDerivation(status=Status.WORKING, consulted=tuple(consulted))
 
     if signals.agent_turn_ended is Tri.TRUE:
-        return _refine_ended_turn(extraction)
+        return StatusDerivation(status=_refine_ended_turn(extraction), consulted=tuple(consulted))
 
-    return Status.UNKNOWN
+    return StatusDerivation(status=Status.UNKNOWN, consulted=tuple(consulted))
 
 
 def _refine_ended_turn(extraction: Extraction | None) -> Status:

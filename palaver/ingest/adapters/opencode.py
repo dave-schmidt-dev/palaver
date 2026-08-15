@@ -154,6 +154,37 @@ def open_store_readonly(path: str) -> sqlite3.Connection:
     return open_guarded_readonly(path)
 
 
+def fetch_sessions(conn: sqlite3.Connection, *, limit: int | None = None) -> list[str]:
+    """Enumerate session ids in the store, newest first (task 7.3).
+
+    OpenCode has no `discover_sessions` — this module deliberately does not
+    subclass `Adapter` (see the module docstring), and one SQLite database
+    holding every session has no per-session path to enumerate. A caller
+    that wants to sweep the store needs the id list, and this is where the
+    `SELECT` for it lives: the same rule as `fetch_messages` and
+    `fetch_parts`, so every SQL literal against the store stays in one
+    module and the INV-3 allowlist has one place to be dropped from rather
+    than several.
+
+    Descending, unlike the other two fetches. `session.id` is KSUID-shaped
+    and monotonic with creation order, so newest-first is what makes
+    `limit` a recency window rather than an arbitrary slice — sweeping the
+    oldest 20 sessions of a store with thousands measures how the adapter
+    handled a format that has since moved on.
+
+    Args:
+        conn: A connection from `open_store_readonly` (or any connection
+            carrying the same INV-3 guard).
+        limit: Return at most this many ids, or `None` for all of them.
+
+    Returns:
+        Session ids, newest first.
+    """
+    rows = conn.execute("SELECT id FROM session ORDER BY id DESC").fetchall()
+    ids = [row[0] for row in rows]
+    return ids if limit is None else ids[:limit]
+
+
 def fetch_messages(conn: sqlite3.Connection, session_id: str) -> list[dict]:
     """Read every `message` row for one session, oldest id first.
 

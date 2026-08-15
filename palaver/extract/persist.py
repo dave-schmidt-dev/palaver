@@ -80,7 +80,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from palaver.extract.quote_gate import admit_decision
+from palaver.extract.quote_gate import DEFAULT_SOURCE, admit_decision
 
 #: The session's current task, in the model's own words. Ephemeral: a new
 #: value overwrites the old one in place.
@@ -240,6 +240,7 @@ def _admit_claim(
     session_id: int | None,
     claim: GroundedClaim,
     origin: str,
+    source: str,
 ) -> int:
     """Ground and write one durable claim, returning its new `memories.id`."""
     admitted = admit_decision(
@@ -251,6 +252,7 @@ def _admit_claim(
         transcript_chunk_id=claim.transcript_chunk_id,
         origin=origin,
         cited_span=claim.cited_span,
+        source=source,
     )
     return admitted.memory_id
 
@@ -262,6 +264,7 @@ def persist_extraction(
     session_id: int | None,
     extraction: Extraction,
     origin: str = "observer-extraction",
+    source: str = DEFAULT_SOURCE,
 ) -> PersistResult:
     """Route one extraction pass's fields to `current_state` or `memories`.
 
@@ -284,6 +287,13 @@ def persist_extraction(
             writes, suffixed with `:decision` or `:resolved_question` so
             the two kinds of durable claim stay distinguishable in
             `memories.origin`.
+        source: The adapter source this extraction was read through, passed
+            to `admit_decision` so the source's tier cap (task 7.3) applies
+            to every durable claim written here. Defaults to Claude Code,
+            which is what a caller that names no source is reading. A
+            Codex-sourced pass must say so: the cap is fail-closed only for
+            callers that identify themselves, and the default cannot be
+            "capped" without demoting every Claude Code claim ever written.
 
     Returns:
         A `PersistResult` naming exactly what was written where.
@@ -317,6 +327,7 @@ def persist_extraction(
             session_id=session_id,
             claim=claim,
             origin=f"{origin}:decision",
+            source=source,
         )
         for claim in extraction.decisions
     )
@@ -327,6 +338,7 @@ def persist_extraction(
             session_id=session_id,
             claim=claim,
             origin=f"{origin}:resolved_question",
+            source=source,
         )
         for claim in extraction.resolved_questions
     )

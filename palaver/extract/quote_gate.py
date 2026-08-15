@@ -72,15 +72,35 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from palaver.extract.normalize import AGENT_TAG, CHANNEL_TAG
-from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN
+from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN, ClaudeCodeAdapter
+from palaver.ingest.adapters.codex import CodexAdapter, cap_codex_tier
 from palaver.memory.evidence import EvidenceAnchor
 from palaver.memory.tiers import TIER_OBSERVER_INFERENCE, TIER_USER_INSTRUCTION
 from palaver.memory.write import write_memory
 
 logger = logging.getLogger(__name__)
+
+#: The source `admit_decision` assumes when a caller names none. Claude Code
+#: is the source every caller written before task 7.3 was reading, and the
+#: one whose channel classification `ground_quote`'s tiering was measured
+#: against, so it is the only honest default.
+DEFAULT_SOURCE = ClaudeCodeAdapter.source
+
+#: Per-source demotions applied to an earned tier before it is written.
+#:
+#: An explicit table, not a registry an adapter opts into at import time: a
+#: source missing from a registry would be written *uncapped*, and whether
+#: it registered would depend on whether anything happened to import that
+#: adapter first. Here a source absent from this table is capped by nothing
+#: because nobody claimed it needs a cap, which is a decision visible in one
+#: place and reviewable in a diff.
+SOURCE_TIER_CAPS: dict[str, Callable[[int], int]] = {
+    CodexAdapter.source: cap_codex_tier,
+}
 
 #: Channel of a chunk whose first line is an `AGENT:` turn.
 CHANNEL_AGENT = "agent"
@@ -365,6 +385,23 @@ def _statement_is_the_span(statement: str, span_text: str) -> bool:
     return normalized_statement == normalize_for_comparison(span_text)
 
 
+def cap_tier_for_source(tier: int, *, source: str = DEFAULT_SOURCE) -> int:
+    """Demote an earned tier to whatever cap its source carries (task 7.3).
+
+    Args:
+        tier: The tier `ground_quote` earned from the quote's channel.
+        source: The adapter source name the quote was read through, e.g.
+            `"codex"`. A source with no entry in `SOURCE_TIER_CAPS` is
+            returned unchanged.
+
+    Returns:
+        The tier to write. Never better (numerically lower) than `tier` —
+        every cap in the table demotes or does nothing.
+    """
+    cap = SOURCE_TIER_CAPS.get(source)
+    return tier if cap is None else cap(tier)
+
+
 def admit_decision(
     conn: sqlite3.Connection,
     *,
@@ -376,6 +413,7 @@ def admit_decision(
     session_id: int | None = None,
     cited_span: tuple[int, int] | None = None,
     supersedes: int | None = None,
+    source: str = DEFAULT_SOURCE,
 ) -> AdmittedDecision:
     """Ground one extracted decision and write it, at the tier it earned.
 
@@ -398,10 +436,22 @@ def admit_decision(
         supersedes: `memories.id` this decision reclassifies, if any. Passed
             through to `write_memory` unchanged — INV-5's tier-ordering rule
             on that link is enforced by the database trigger, not here.
+        source: The adapter source this decision was read through. Applies
+            that source's tier cap (task 7.3) to the tier the quote earned,
+            *after* grounding and before the write, so a capped source still
+            has to ground its quote and simply cannot claim a strong tier
+            for it. This is where Codex's tier-4 cap binds: the cap function
+            lives in `palaver.ingest.adapters.codex`, but a function nothing
+            calls caps nothing, and this is the one place a tier reaches
+            `write_memory` from an extraction.
 
     Returns:
         The `AdmittedDecision`: the new `memories.id` and the
-        `GroundedQuote` whose anchor was written with it.
+        `GroundedQuote` whose anchor was written with it. When the source's
+        cap demoted the tier, the returned `GroundedQuote` carries the
+        *written* tier and a reason naming the demotion — the return value
+        describes the row, not the tier the quote would have earned from an
+        uncapped source.
 
     Raises:
         QuoteNotGroundedError: The quote is not grounded in its cited span;
@@ -414,6 +464,19 @@ def admit_decision(
         statement=statement,
         cited_span=cited_span,
     )
+    capped = cap_tier_for_source(grounded.tier, source=source)
+    if capped != grounded.tier:
+        logger.info(
+            "%s source cap demoted a grounded quote from tier %s to tier %s",
+            source,
+            grounded.tier,
+            capped,
+        )
+        grounded = replace(
+            grounded,
+            tier=capped,
+            reason=f"{grounded.reason}; demoted to tier {capped} by the {source} source cap",
+        )
     memory_id = write_memory(
         conn,
         project_id=project_id,

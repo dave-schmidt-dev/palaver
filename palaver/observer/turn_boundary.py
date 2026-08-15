@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from palaver.ingest.adapters.base import read_complete_records
+from palaver.ingest.adapters.base import Event, read_complete_records
 from palaver.ingest.adapters.claude_code import (
     CHANNEL_INJECTED,
     MESSAGE_RECORD_TYPES,
@@ -110,8 +110,15 @@ BASIS_NO_CONVERSATIONAL_RECORD = "no_conversational_record"
 BASIS_UNDECODABLE_RECORD = "undecodable_record"
 BASIS_SOURCE_UNREADABLE = "source_unreadable"
 
-#: Every basis `derive_turn_boundary` can report. The coverage command reports
-#: the distribution over this tuple.
+# The two bases only `derive_signals_from_events` can report (task 7.3).
+# Named apart from the record-derived bases above rather than folded into
+# them, because they are a weaker reading: an adapter told us a turn closed,
+# where the bases above say which record structure proved it.
+BASIS_EVENT_TURN_BOUNDARY = "event_turn_boundary"
+BASIS_EVENT_MESSAGE_PENDING = "event_message_pending"
+
+#: Every basis `derive_turn_boundary` or `derive_signals_from_events` can
+#: report. The coverage command reports the distribution over this tuple.
 BASIS_NAMES: tuple[str, ...] = (
     BASIS_ASSISTANT_FINAL,
     BASIS_UNRESOLVED_TOOL_USE,
@@ -121,7 +128,19 @@ BASIS_NAMES: tuple[str, ...] = (
     BASIS_NO_CONVERSATIONAL_RECORD,
     BASIS_UNDECODABLE_RECORD,
     BASIS_SOURCE_UNREADABLE,
+    BASIS_EVENT_TURN_BOUNDARY,
+    BASIS_EVENT_MESSAGE_PENDING,
 )
+
+# The shared event-kind vocabulary the non-Claude-Code adapters emit, and the
+# only thing `derive_signals_from_events` knows about a source. Declared here
+# rather than imported from either adapter so this module does not depend on
+# `palaver.ingest.adapters.codex` or `.opencode`; `tests/test_turn_boundary.py`
+# asserts all three spellings agree, so a rename in one adapter is a test
+# failure rather than a silently unreachable branch.
+KIND_MESSAGE = "message"
+KIND_TURN_BOUNDARY = "turn_boundary"
+KIND_ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -433,6 +452,90 @@ def derive_signals(
         agent_turn_ended=boundary.ended,
     )
     return SessionObservation(signals=signals, boundary=boundary)
+
+
+def derive_signals_from_events(
+    events: Sequence[Event],
+    *,
+    parsed: Tri = Tri.UNKNOWN,
+) -> SessionObservation:
+    """Compute the signal set from a canonical `Event` stream (task 7.3).
+
+    The derivation for every source that is not Claude Code. Claude Code
+    keeps `derive_signals`, which reads record structure directly and is the
+    measured path this project's coverage numbers were established against;
+    this one reads only `Event.kind`, from the vocabulary Codex and OpenCode
+    both emit. Two derivations rather than one is the deliberate answer to a
+    real asymmetry: those adapters resolve the turn boundary themselves and
+    publish it as a `turn_boundary` event, while Claude Code has no such
+    record and its boundary must be derived from message structure. A single
+    derivation over kinds would score Claude Code at 0% boundary coverage and
+    gate its statuses to `UNKNOWN` — the best-covered source silenced by a
+    uniformity that buys nothing.
+
+    What the kinds support, and nothing beyond it:
+
+    * **`agent_turn_ended`** is `TRUE` when the last message-bearing event is
+      a `turn_boundary`, `FALSE` when it is a `message`, `UNKNOWN` when the
+      stream holds neither. `FALSE` covers both "the human spoke last" and
+      "the agent is mid-turn": neither adapter's boundary event has fired, so
+      control has not been handed back, and this module does not read either
+      source's role field to say which of the two it is.
+    * **`unresolved_tool_error`** is `TRUE` when an `error` event follows the
+      last `turn_boundary`, and `FALSE` when a boundary came after every
+      error — a closed turn resolves the errors inside it, the same reading
+      `CodexAdapter.has_unresolved_trailing_tool_use` applies to pending
+      calls. An error-free stream is `FALSE` (observed absence, matching
+      `_unresolved_tool_error`); an empty one is `UNKNOWN`.
+
+    Args:
+        events: One session's canonical events, in source order.
+        parsed: What the caller knows about decode completeness, since an
+            `Event` stream cannot carry that itself — both adapters drop an
+            undecodable record rather than marking it, so a hole is invisible
+            downstream. The default is `Tri.UNKNOWN` ("nobody checked"),
+            which is the fail-closed value: `derive_status()`'s rule 2 turns
+            it into `UNKNOWN` rather than into a status derived from a view
+            that may be missing its decisive record. A caller that decoded
+            the source itself and counted the holes passes `TRUE`/`FALSE`.
+
+    Returns:
+        A `SessionObservation` whose `signals.source_readable` is `TRUE` —
+        events were obtained, so the source was read. Corroboration is always
+        `UNKNOWN`: the shared vocabulary carries no second, independent
+        signal to weigh a boundary against, and inventing agreement out of
+        the same event that produced the boundary would be corroboration in
+        name only.
+    """
+    kinds = [event.kind for event in events]
+
+    ended, basis = Tri.UNKNOWN, BASIS_NO_CONVERSATIONAL_RECORD
+    for kind in reversed(kinds):
+        if kind == KIND_TURN_BOUNDARY:
+            ended, basis = Tri.TRUE, BASIS_EVENT_TURN_BOUNDARY
+            break
+        if kind == KIND_MESSAGE:
+            ended, basis = Tri.FALSE, BASIS_EVENT_MESSAGE_PENDING
+            break
+
+    error = Tri.UNKNOWN if not kinds else Tri.FALSE
+    for kind in reversed(kinds):
+        if kind == KIND_TURN_BOUNDARY:
+            error = Tri.FALSE
+            break
+        if kind == KIND_ERROR:
+            error = Tri.TRUE
+            break
+
+    return SessionObservation(
+        signals=Signals(
+            source_readable=Tri.TRUE,
+            signal_records_parsed=parsed,
+            unresolved_tool_error=error,
+            agent_turn_ended=ended,
+        ),
+        boundary=TurnBoundary(ended=ended, basis=basis, corroboration=Tri.UNKNOWN),
+    )
 
 
 def _decode(raw: bytes, path: Path) -> dict | None:
