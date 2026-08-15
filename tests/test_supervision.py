@@ -37,6 +37,7 @@ import concurrent.futures
 import ctypes
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -45,19 +46,26 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
 from palaver.cli import install_agent
+from palaver.cli import mcp as mcp_cli
 from palaver.cli.install_agent import (
     DEFAULT_LABEL,
+    MCP_LABEL,
+    MCP_TEMPLATE_PATH,
+    OBSERVE_LABEL,
+    OBSERVE_TEMPLATE_PATH,
     RESTART_WINDOW_SECONDS,
     THROTTLE_INTERVAL_SECONDS,
     InstallAgentError,
     bootout,
     bootstrap,
     domain_target,
+    mcp_program_arguments,
     observe_program_arguments,
     pid_is_ours,
     print_service,
@@ -76,6 +84,12 @@ from palaver.observer.socket import (
 
 #: Never `DEFAULT_LABEL`. See the module docstring.
 SELFTEST_LABEL = "com.zerodelta.palaver.observe.selftest"
+
+#: The same isolation rule for task 6.5's MCP agent: never `MCP_LABEL`, so a
+#: live test cannot bootout the server an agent is currently registered
+#: against. Its port is allocated per run rather than fixed, because unlike
+#: the observer this job binds one — and 8787 is the port real clients hold.
+MCP_SELFTEST_LABEL = "com.zerodelta.palaver.mcp.selftest"
 
 #: Tick fast enough that a restarted job has visibly done something, slow
 #: enough that a two-second test window does not accumulate ticks.
@@ -420,10 +434,17 @@ def test_the_restart_window_is_wider_than_two_throttle_intervals():
 class _Args:
     def __init__(self, **fields):
         defaults = {
-            "label": DEFAULT_LABEL,
+            # None, not DEFAULT_LABEL: `run` resolves an unset label to the
+            # selected service's own, and hardcoding the observer's here would
+            # mean the mcp cases silently installed under the observer's label
+            # while appearing to test the default path.
+            "service": "observe",
+            "label": None,
             "db": None,
             "cursors": None,
             "interval": None,
+            "host": None,
+            "port": None,
             "executable": None,
             "log_dir": None,
             "plist_path": None,
@@ -520,6 +541,233 @@ def test_the_subcommand_is_registered_on_the_root_parser():
     assert parsed.print_only is True
 
 
+# --- the mcp agent (task 6.5) ----------------------------------------------
+#
+# Every name here carries `mcp_agent`, which is the selection the plan's quick
+# check runs: `pytest -q tests/test_supervision.py -k mcp_agent`. A test whose
+# name misses that substring is a test the gate does not run.
+
+
+def _render_keys(template_path: Path, tmp_path: Path) -> dict:
+    """Render a template with throwaway values and parse what launchd would see.
+
+    The templates cannot be parsed directly — they are `string.Template`
+    sources, and the unsubstituted placeholders are not valid inside the
+    elements they sit in. Rendering first is the only way to compare them as
+    plists rather than as text.
+    """
+    rendered = render_plist(
+        label="com.zerodelta.palaver.render-probe",
+        program_arguments=["/usr/bin/true"],
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+        working_directory=tmp_path,
+        template_path=template_path,
+    )
+    return plistlib.loads(rendered.encode("utf-8"))
+
+
+def test_the_rendered_mcp_agent_plist_is_something_launchd_can_parse(tmp_path):
+    plist = tmp_path / "mcp-agent.plist"
+    plist.write_text(
+        render_plist(
+            label=MCP_SELFTEST_LABEL,
+            program_arguments=mcp_program_arguments(
+                executable=Path("/bin/palaver"), db_path=tmp_path / "m.db", port=9999
+            ),
+            stdout_path=tmp_path / "out.log",
+            stderr_path=tmp_path / "err.log",
+            template_path=MCP_TEMPLATE_PATH,
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["plutil", "-lint", str(plist)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # `plutil` alone is not enough, and this is not a hypothetical. The first
+    # draft of this template wrote a command-line flag inside an XML comment.
+    # A double hyphen is illegal there, `plutil -lint` accepted the file
+    # regardless, and plistlib refused it. Parsing with a second, stricter
+    # implementation is what turned that into a failure instead of a latent
+    # portability bug in a file only launchd normally reads.
+    parsed = plistlib.loads(plist.read_bytes())
+    assert parsed["Label"] == MCP_SELFTEST_LABEL
+
+
+def test_the_mcp_agent_is_not_throttled_the_way_a_background_job_is(tmp_path):
+    """The finding that made task 6.5 more than a copy of task 5.0.
+
+    `man launchd.plist` describes Background's resource limits as existing
+    "to prevent them from disrupting the user experience". This server is
+    *inside* the user experience: every cycle it spends is an agent's blocking
+    tool call. So it is Standard, and it omits LowPriorityIO and Nice rather
+    than setting them low.
+
+    The observer assertions are the positive control. Without them, this test
+    would pass just as happily against a template that had lost its scheduling
+    keys entirely, which is a different bug wearing the same result.
+    """
+    mcp = _render_keys(MCP_TEMPLATE_PATH, tmp_path)
+    assert mcp["ProcessType"] == "Standard"
+    assert "LowPriorityIO" not in mcp
+    assert "Nice" not in mcp
+
+    observe = _render_keys(OBSERVE_TEMPLATE_PATH, tmp_path)
+    assert observe["ProcessType"] == "Background"
+    assert observe["LowPriorityIO"] is True
+    assert observe["Nice"] == 5
+
+
+def test_the_two_mcp_agent_templates_agree_on_everything_but_scheduling(tmp_path):
+    """The guard that lets these be two files instead of one.
+
+    Two static templates were chosen over one parameterized template because
+    the MCP job *omits* keys the observer sets, and a placeholder can supply a
+    value but cannot remove an element. The cost of that choice is ~60 lines
+    of duplicated XML that could drift. This is what makes drift fail loudly:
+    every key outside the scheduling set must be present in both and identical
+    in both.
+    """
+    scheduling = {"ProcessType", "LowPriorityIO", "Nice"}
+    observe = _render_keys(OBSERVE_TEMPLATE_PATH, tmp_path)
+    mcp = _render_keys(MCP_TEMPLATE_PATH, tmp_path)
+
+    assert set(observe) - scheduling == set(mcp) - scheduling
+    for key in sorted(set(observe) - scheduling):
+        assert observe[key] == mcp[key], f"{key} drifted between the two templates"
+
+    # And the divergence is exactly the one that was intended, not merely
+    # non-empty: naming both sides keeps this from passing if the MCP job
+    # quietly grew a Nice key back.
+    assert set(observe) & scheduling == scheduling
+    assert set(mcp) & scheduling == {"ProcessType"}
+
+
+def test_unset_mcp_agent_options_are_omitted_rather_than_duplicated():
+    """The server owns its own defaults; the plist must not restate them."""
+    bare = mcp_program_arguments(executable=Path("/bin/palaver"))
+    assert bare == ["/bin/palaver", "mcp"]
+
+    full = mcp_program_arguments(
+        executable=Path("/bin/palaver"),
+        db_path=Path("/tmp/m.db"),
+        host="127.0.0.1",
+        port=8787,
+    )
+    assert full == [
+        "/bin/palaver",
+        "mcp",
+        "--db",
+        "/tmp/m.db",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8787",
+    ]
+
+
+def test_the_mcp_agent_and_the_observer_never_share_a_label():
+    """Two jobs under one label is one job; launchd keys everything on it."""
+    assert MCP_LABEL != OBSERVE_LABEL
+    assert MCP_SELFTEST_LABEL not in {MCP_LABEL, OBSERVE_LABEL, SELFTEST_LABEL}
+    assert install_agent.SERVICES["mcp"].label == MCP_LABEL
+    assert install_agent.SERVICES["observe"].label == OBSERVE_LABEL
+    assert install_agent.SERVICES["mcp"].template_path != (
+        install_agent.SERVICES["observe"].template_path
+    )
+
+
+@pytest.mark.parametrize(
+    ("service", "option", "value"),
+    [
+        ("mcp", "interval", 45.0),
+        ("mcp", "cursors", Path("/tmp/cursors")),
+        ("observe", "host", "127.0.0.1"),
+        ("observe", "port", 9999),
+    ],
+)
+def test_an_mcp_agent_option_meant_for_the_other_service_is_refused(
+    tmp_path, capsys, service, option, value
+):
+    """Refused, not ignored.
+
+    `--service mcp --interval 45` is a coherent sentence that means nothing.
+    Dropping the flag silently would write a plist that loads, runs, and
+    supervises something other than what was asked, with nothing anywhere
+    recording that a flag was discarded.
+    """
+    import io
+
+    target = tmp_path / "never-written.plist"
+    args = _install_args(service=service, plist_path=target, **{option: value})
+    status = install_agent.run(args, out=io.StringIO(), on_status=lambda _message: None)
+
+    assert status == 2
+    assert f"--{option}" in capsys.readouterr().err
+    assert not target.exists(), "a refused invocation still wrote a plist"
+
+
+def test_the_mcp_agent_service_is_reachable_from_the_real_parser(tmp_path):
+    """The wiring check, and the reason it goes through `run` and not `render_plist`.
+
+    Tasks 6.3 and 6.4 both produced a fully-tested unit that nothing called.
+    Asserting on `render_plist(template_path=MCP_TEMPLATE_PATH)` would pass
+    identically if `--service` had never been registered on the parser. So
+    this drives the argv a user would actually type.
+    """
+    import io
+
+    from palaver.cli import build_parser
+
+    target = tmp_path / "from-parser.plist"
+    parsed = build_parser().parse_args(
+        [
+            "install-agent",
+            "--service",
+            "mcp",
+            "--port",
+            "9999",
+            "--plist-path",
+            str(target),
+        ]
+    )
+    assert parsed.service == "mcp"
+    assert parsed.handler is install_agent.run
+
+    status = parsed.handler(parsed, out=io.StringIO(), on_status=lambda _message: None)
+    assert status == 0
+
+    written = plistlib.loads(target.read_bytes())
+    assert written["Label"] == MCP_LABEL
+    assert written["ProcessType"] == "Standard"
+    assert written["ProgramArguments"][1] == "mcp"
+    assert written["ProgramArguments"][-2:] == ["--port", "9999"]
+
+
+def test_the_default_mcp_agent_service_is_still_the_observer(tmp_path):
+    """Task 5.0's invocation must keep meaning what it meant.
+
+    `palaver install-agent` shipped before `--service` existed. If the default
+    moved, an existing habit would silently install a different job.
+    """
+    import io
+
+    from palaver.cli import build_parser
+
+    target = tmp_path / "default.plist"
+    parsed = build_parser().parse_args(["install-agent", "--plist-path", str(target)])
+    assert parsed.service == "observe"
+
+    status = install_agent.run(parsed, out=io.StringIO(), on_status=lambda _message: None)
+    assert status == 0
+
+    written = plistlib.loads(target.read_bytes())
+    assert written["Label"] == OBSERVE_LABEL
+    assert written["ProgramArguments"][1] == "observe"
+
+
 # --- live launchd ----------------------------------------------------------
 
 
@@ -595,6 +843,224 @@ def test_the_selftest_label_is_never_the_one_a_user_installs():
     """Guards the isolation the rest of the live tests depend on."""
     assert SELFTEST_LABEL != DEFAULT_LABEL
     assert domain_target().startswith("gui/")
+
+
+# --- live launchd: the mcp agent (task 6.5) --------------------------------
+
+
+def _accepting(port: int, *, window: float, host: str = "127.0.0.1") -> bool:
+    """Wait until something actually accepts on the port.
+
+    Not `wait_for_running_pid`, and the difference is the whole reason this
+    helper exists. launchd publishes a pid the moment the process execs, but
+    this one is a Python interpreter that must import, open the store, and
+    only then bind. A client that proceeded on the pid alone would connect
+    into that gap and read `ECONNREFUSED` as a failed restart.
+    """
+    deadline = time.monotonic() + window
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+def _await_unloaded(label: str, *, window: float = STARTUP_WINDOW_SECONDS) -> bool:
+    """Wait until launchd no longer knows the label at all.
+
+    `bootout` returns as soon as launchd has *accepted* the request, not once
+    the job is gone, and bootstrapping a label that is still being torn down
+    fails with `Bootstrap failed: 5: Input/output error`. The observer's live
+    tests never hit that because there are three of them; four MCP tests
+    sharing one label hit it every run.
+
+    It is worse for this job than for the observer's, too: these tests SIGKILL
+    a process under `KeepAlive`, so at teardown launchd may be mid-restart —
+    booting out a job that is in the middle of coming back is exactly the race
+    this closes.
+    """
+    deadline = time.monotonic() + window
+    while time.monotonic() < deadline:
+        if print_service(label).returncode != 0:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+async def _recall_over_http(url: str) -> list[str]:
+    """Read the seeded project through a *fresh* client, and return statements."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    async with streamable_http_client(url) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            result = await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
+            assert not result.is_error, result.content[0].text
+            page = json.loads(result.content[0].text)
+    return [memory["statement"] for memory in page["memories"]]
+
+
+@pytest.fixture
+def loaded_mcp_agent(tmp_path):
+    """Bootstrap the MCP server under real launchd, on a port nobody else holds."""
+    db_path = tmp_path / "mcp-selftest.db"
+    _seed_memory(db_path)
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    port = mcp_cli._free_port()
+
+    plist = tmp_path / f"{MCP_SELFTEST_LABEL}.plist"
+    plist.write_text(
+        render_plist(
+            label=MCP_SELFTEST_LABEL,
+            program_arguments=mcp_program_arguments(
+                executable=install_agent._default_executable(),
+                db_path=db_path,
+                host="127.0.0.1",
+                port=port,
+            ),
+            stdout_path=logs / "out.log",
+            stderr_path=logs / "err.log",
+            working_directory=tmp_path,
+            template_path=MCP_TEMPLATE_PATH,
+        ),
+        encoding="utf-8",
+    )
+
+    bootout(MCP_SELFTEST_LABEL)
+    assert _await_unloaded(MCP_SELFTEST_LABEL), (
+        "a previous run's job is still loaded; bootstrapping over it would fail with EIO"
+    )
+    result = bootstrap(plist)
+    if result.returncode != 0:
+        bootout(MCP_SELFTEST_LABEL)
+        pytest.fail(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
+    try:
+        yield {"port": port, "url": f"http://127.0.0.1:{port}/mcp", "logs": logs}
+    finally:
+        bootout(MCP_SELFTEST_LABEL)
+        # Blocking here rather than in the next test's setup: teardown is
+        # where the job actually is, and leaving it half-removed makes the
+        # *following* test fail for a reason that has nothing to do with it.
+        _await_unloaded(MCP_SELFTEST_LABEL)
+
+
+@live
+def test_the_mcp_agent_loads_and_launchctl_print_reports_it(loaded_mcp_agent):
+    """The done-when's load check: `launchctl print` on the MCP label."""
+    result = print_service(MCP_SELFTEST_LABEL)
+    assert result.returncode == 0, (result.stdout + result.stderr)[:2000]
+    assert MCP_SELFTEST_LABEL in result.stdout
+
+    # The same control the observer's load test carries: a `print` that
+    # succeeded for any argument would pass the assertion above unchanged.
+    absent = print_service(f"{MCP_SELFTEST_LABEL}.absent")
+    assert absent.returncode != 0
+
+
+@live
+def test_killing_the_mcp_agent_brings_back_a_different_pid(loaded_mcp_agent):
+    """The done-when's restart check, against the real server and real launchd."""
+    assert _accepting(loaded_mcp_agent["port"], window=STARTUP_WINDOW_SECONDS), (
+        f"the server never bound {loaded_mcp_agent['port']} within "
+        f"{STARTUP_WINDOW_SECONDS}s of bootstrap"
+    )
+    original = _await_pid(MCP_SELFTEST_LABEL)
+    assert original is not None
+
+    os.kill(original, signal.SIGKILL)
+    restarted = wait_for_new_pid(MCP_SELFTEST_LABEL, original, on_status=lambda _message: None)
+
+    assert restarted is not None, (
+        f"no restart within {RESTART_WINDOW_SECONDS}s of killing pid {original}"
+    )
+    assert restarted != original
+
+
+@live
+def test_a_client_reading_across_the_mcp_agent_restart_gets_its_answer(loaded_mcp_agent):
+    """The done-when's reconnect check — corrected, because the premise was wrong.
+
+    The plan and README both said a restart is "invisible" to clients because
+    HTTP transports reconnect automatically. Half of that is true. The TCP
+    connection is re-established, but the MCP *session* is not: the restarted
+    server has never seen the `Mcp-Session-Id` the client is holding, answers
+    404, and the SDK surfaces that as `Session terminated` rather than
+    re-initializing (mcp/client/streamable_http.py). Re-establishing the
+    session is the host application's job, not the transport's.
+
+    So this asserts both halves, from one restart. The held session must fail
+    — that is the negative control, and without it "a fresh client works"
+    would pass even if the kill had never landed — and a client that
+    reconnects must get the same answer as before, from the same store, with
+    no connection error.
+    """
+    url = loaded_mcp_agent["url"]
+    port = loaded_mcp_agent["port"]
+
+    assert _accepting(port, window=STARTUP_WINDOW_SECONDS), "the server never bound its port"
+    before = asyncio.run(_recall_over_http(url))
+    assert before, "the fixture seeded no memory, so the reads below prove nothing"
+
+    original = _await_pid(MCP_SELFTEST_LABEL)
+    assert original is not None
+    os.kill(original, signal.SIGKILL)
+    restarted = wait_for_new_pid(MCP_SELFTEST_LABEL, original, on_status=lambda _message: None)
+    assert restarted is not None and restarted != original
+
+    # The pid is back; the socket need not be. Waiting on the port rather than
+    # on the pid is what keeps this from being a flaky race.
+    assert _accepting(port, window=RESTART_WINDOW_SECONDS), (
+        f"pid {restarted} exists but nothing is accepting on {port}"
+    )
+
+    after = asyncio.run(_recall_over_http(url))
+    assert after == before
+
+
+@live
+def test_a_held_session_does_not_survive_the_mcp_agent_restart(loaded_mcp_agent):
+    """Documents what actually happens, so the README's claim stays honest.
+
+    Kept separate from the reconnect test because it asserts the opposite
+    outcome and would otherwise read as a bug. It is the measured behaviour of
+    the SDK, and the reason the reconnect test opens a new client rather than
+    reusing one.
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    port = loaded_mcp_agent["port"]
+    assert _accepting(port, window=STARTUP_WINDOW_SECONDS)
+
+    async def hold_across_restart() -> str:
+        async with streamable_http_client(loaded_mcp_agent["url"]) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                first = await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
+                assert not first.is_error
+
+                original = _await_pid(MCP_SELFTEST_LABEL)
+                assert original is not None
+                os.kill(original, signal.SIGKILL)
+                assert (
+                    wait_for_new_pid(MCP_SELFTEST_LABEL, original, on_status=lambda _message: None)
+                    is not None
+                )
+                assert _accepting(port, window=RESTART_WINDOW_SECONDS)
+
+                try:
+                    await session.call_tool("palaver_recall", {"scope": {"project": "demo"}})
+                except Exception as exc:  # noqa: BLE001 - the escape is the finding
+                    return f"{type(exc).__name__}: {exc}"
+                return ""
+
+    outcome = asyncio.run(hold_across_restart())
+    assert outcome, "the held session survived the restart; the README claim may now be true"
+    assert "session" in outcome.lower(), outcome
 
 
 # ---------------------------------------------------------------------------

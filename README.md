@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** in progress, and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, and the Codex/OpenCode adapters are built and tested; the MCP read surface is landing now. Pagination, the single-writer socket, and `palaver_correct` are still to come.
+**Status:** built and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, the Codex/OpenCode adapters, and the MCP surface — reads, pagination, the single-writer socket, `palaver_correct`, and query events — are all in place, each supervised by its own launchd user agent.
 
 ## Problem
 
@@ -157,8 +157,16 @@ uv run palaver mcp --selftest --clients 6   # prove it serves six at once
 attached agents would be six processes writing one SQLite file — the opposite
 of the single-writer property the memory layer rests on. One HTTP server at a
 fixed localhost endpoint keeps the process count at one however many agents
-connect, and a Palaver restart is invisible to them because clients
-reconnect HTTP transports automatically.
+connect, and a Palaver restart costs each attached agent one reconnect
+rather than a dead tool.
+
+That last part is narrower than it first looks, and it was measured rather
+than assumed. The HTTP transport does reconnect, but the MCP **session** does
+not survive: the restarted server has never seen the `Mcp-Session-Id` the
+client is holding, so it answers 404 and the SDK reports `Session terminated`
+instead of re-initializing. Re-establishing the session is the host
+application's job. A client that does so reads exactly what it read before;
+one that holds a session across a restart gets an error, not stale data.
 
 Every read tool requires an explicit scope of exactly one of
 `{project: <name>}` or `{session: <session_key>}`. There is no default, on
@@ -174,12 +182,23 @@ Register it once:
 claude mcp add --transport http palaver http://127.0.0.1:8787/mcp
 ```
 
-Supervising the observer daemon is separate and needs no iTerm2:
+Supervising Palaver's two long-lived processes is separate and needs no
+iTerm2. Each gets its own launchd user agent:
 
 ```sh
-uv run palaver install-agent          # render the launchd user agent
-uv run palaver install-agent --load   # and load it
+uv run palaver install-agent                        # the observer daemon
+uv run palaver install-agent --load                 # and load it
+
+uv run palaver install-agent --service mcp --load   # the MCP server
 ```
+
+The two plists differ in more than their argv. The observer is `Background`
+with `LowPriorityIO` and a positive `Nice`, because its work is nobody's
+request and must never contend with the sessions it watches. The MCP server
+is `Standard` with neither, because every cycle it spends is inside an
+agent's blocking tool call. `Adaptive` is not an option for it: launchd
+promotes an Adaptive job out of Background on *XPC* activity, and this one
+speaks HTTP, so it would stay throttled forever.
 
 ## Conventions
 

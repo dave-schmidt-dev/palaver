@@ -1,10 +1,19 @@
-"""`palaver install-agent`: give the observer daemon a supervised home (task 5.0).
+"""`palaver install-agent`: supervised homes for Palaver's two long-lived processes.
 
-`palaver observe` is the single SQLite writer and the owner of the tick loop.
-Every later phase assumes it is running — the MCP write path in 6.3 posts to
-it, and the pane surface in Phase 5 renders what it wrote — but until now
-nothing restarted it when it died. This module renders
-`palaver/supervision/observe.plist.tmpl` into a launchd user agent that does.
+`palaver observe` (task 5.0) is the single SQLite writer and the owner of the
+tick loop. Every later phase assumes it is running — the MCP write path in 6.3
+posts to it, and the pane surface in Phase 5 renders what it wrote — but
+nothing restarted it when it died.
+
+`palaver mcp` (task 6.5) is the read surface other coding agents query. It
+needs supervising for a different reason: its endpoint is registered once in
+each client's config, so a dead listener is not an error an agent can route
+around, it is a tool that stopped existing without saying so.
+
+`--service` selects between them. Each has its own label and its own template
+under `palaver/supervision/`, because the two differ in launchd's scheduling
+keys and one of them differs by *omitting* keys the other sets — see
+`mcp.plist.tmpl` for why that ruled out a single parameterized template.
 
 Three decisions here are deliberate and would otherwise look arbitrary:
 
@@ -37,6 +46,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from typing import TextIO
@@ -45,16 +55,33 @@ from xml.sax.saxutils import escape
 from palaver.logging_setup import PROJECT_ROOT
 
 NAME = "install-agent"
-HELP = "render and optionally load the launchd user agent that supervises `palaver observe`"
+HELP = "render and optionally load a launchd user agent for `palaver observe` or `palaver mcp`"
 
 #: Reverse-DNS under the same prefix as the machine's other user agents, so
 #: `launchctl list | grep com.zerodelta` shows Palaver beside its siblings.
-DEFAULT_LABEL = "com.zerodelta.palaver.observe"
+OBSERVE_LABEL = "com.zerodelta.palaver.observe"
 
-#: The template rendered by `render_plist`. Kept beside the package rather
-#: than inlined as a string so the XML is readable, diffable, and lintable by
+#: The MCP server's label. A separate job rather than a second process under
+#: the observer's label, because launchd supervises one executable per label
+#: and these two fail independently: the server can be restarted mid-tick
+#: without interrupting extraction, and the observer can be restarted without
+#: dropping an agent's registered endpoint.
+MCP_LABEL = "com.zerodelta.palaver.mcp"
+
+#: Retained as the observer's label under its original name. Kept because it
+#: is what `--service observe` still installs and what task 5.0's tests
+#: import; `--service` selects between the two above.
+DEFAULT_LABEL = OBSERVE_LABEL
+
+#: The templates rendered by `render_plist`. Kept beside the package rather
+#: than inlined as strings so the XML is readable, diffable, and lintable by
 #: `plutil` on its own.
-TEMPLATE_PATH = PROJECT_ROOT / "palaver" / "supervision" / "observe.plist.tmpl"
+OBSERVE_TEMPLATE_PATH = PROJECT_ROOT / "palaver" / "supervision" / "observe.plist.tmpl"
+MCP_TEMPLATE_PATH = PROJECT_ROOT / "palaver" / "supervision" / "mcp.plist.tmpl"
+
+#: `render_plist`'s default, unchanged from task 5.0 so a caller that passes
+#: no template still gets the observer's.
+TEMPLATE_PATH = OBSERVE_TEMPLATE_PATH
 
 #: Where a loaded user agent lives. launchd will bootstrap a plist from any
 #: absolute path, but only this directory is re-read at login.
@@ -138,6 +165,107 @@ def observe_program_arguments(
     if interval is not None:
         argv += ["--interval", f"{interval:g}"]
     return argv
+
+
+def mcp_program_arguments(
+    *,
+    executable: Path,
+    db_path: Path | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> list[str]:
+    """Build the argv launchd should run for the MCP server (task 6.5).
+
+    Same omit-the-unset rule as `observe_program_arguments`, and it matters
+    more here: `palaver mcp`'s default port is the one clients registered
+    with `claude mcp add`, so restating it in the plist would create a second
+    place to change when it moves — and the plist is the copy nobody would
+    think to look at.
+
+    Args:
+        executable: Absolute path to the `palaver` console script.
+        db_path: Store to serve, or None to leave the server's default.
+        host: Interface to bind, or None for the server's default (loopback).
+        port: Port to bind, or None for the server's default.
+
+    Returns:
+        The argv, beginning with the executable.
+    """
+    argv = [str(executable), "mcp"]
+    if db_path is not None:
+        argv += ["--db", str(db_path)]
+    if host is not None:
+        argv += ["--host", str(host)]
+    if port is not None:
+        argv += ["--port", str(port)]
+    return argv
+
+
+@dataclass(frozen=True)
+class Service:
+    """One supervisable Palaver process, and everything that differs about it.
+
+    Attributes:
+        name: What `--service` is given.
+        label: launchd label, and the plist's filename.
+        template_path: The plist template to render.
+        build_argv: Builds the job's argv from `(executable, args)`.
+        options: The flags that apply to *this* service alone. `run` refuses
+            another service's options rather than ignoring them — a
+            `--interval` silently dropped from an MCP install renders a plist
+            that loads, runs, and does something other than what was asked.
+    """
+
+    name: str
+    label: str
+    template_path: Path
+    build_argv: Callable[[Path, object], list[str]]
+    options: tuple[str, ...]
+
+
+def _observe_argv(executable: Path, args) -> list[str]:
+    return observe_program_arguments(
+        executable=executable,
+        db_path=args.db,
+        cursor_root=args.cursors,
+        interval=args.interval,
+    )
+
+
+def _mcp_argv(executable: Path, args) -> list[str]:
+    return mcp_program_arguments(
+        executable=executable,
+        db_path=args.db,
+        host=args.host,
+        port=args.port,
+    )
+
+
+#: The installable services, keyed by what `--service` accepts. A mapping
+#: rather than an if/else in `run` so that `--service`'s choices, the label
+#: defaulting, and the option filtering all read from one place and cannot
+#: disagree about which services exist.
+SERVICES: dict[str, Service] = {
+    "observe": Service(
+        name="observe",
+        label=OBSERVE_LABEL,
+        template_path=OBSERVE_TEMPLATE_PATH,
+        build_argv=_observe_argv,
+        options=("cursors", "interval"),
+    ),
+    "mcp": Service(
+        name="mcp",
+        label=MCP_LABEL,
+        template_path=MCP_TEMPLATE_PATH,
+        build_argv=_mcp_argv,
+        options=("host", "port"),
+    ),
+}
+
+#: The service installed when `--service` is not given. `observe` rather than
+#: an explicit choice, because task 5.0 shipped `palaver install-agent` with
+#: no such flag and that invocation must keep installing the observer.
+DEFAULT_SERVICE = "observe"
 
 
 def render_plist(
@@ -355,27 +483,44 @@ def wait_for_new_pid(
 def add_arguments(parser) -> None:
     """Register `install-agent`'s flags on its subparser."""
     parser.add_argument(
+        "--service",
+        choices=sorted(SERVICES),
+        default=DEFAULT_SERVICE,
+        help=f"which process to supervise (default: {DEFAULT_SERVICE})",
+    )
+    parser.add_argument(
         "--label",
-        default=DEFAULT_LABEL,
-        help=f"launchd label, which is also the plist filename (default: {DEFAULT_LABEL})",
+        default=None,
+        help="launchd label, which is also the plist filename (default: the service's own)",
     )
     parser.add_argument(
         "--db",
         type=Path,
         default=None,
-        help="store the supervised daemon writes into (default: the daemon's own default)",
+        help="store the supervised process uses (default: its own default)",
     )
     parser.add_argument(
         "--cursors",
         type=Path,
         default=None,
-        help="cursor directory for the supervised daemon (default: the daemon's own default)",
+        help="cursor directory, `--service observe` only (default: the daemon's own default)",
     )
     parser.add_argument(
         "--interval",
         type=float,
         default=None,
-        help="seconds between ticks (default: the daemon's own default)",
+        help="seconds between ticks, `--service observe` only (default: the daemon's own)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="interface to bind, `--service mcp` only (default: the server's own, loopback)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port to bind, `--service mcp` only (default: the server's own)",
     )
     parser.add_argument(
         "--executable",
@@ -457,30 +602,51 @@ def run(
         on_status: Progress channel, defaulting to a stderr writer (INV-1).
 
     Returns:
-        0 on success, 1 when the plist cannot be rendered or written, and 1
-        when a requested load fails. Rendering without loading is a success
-        even though nothing is running afterwards — that is what was asked.
+        0 on success, 1 when the plist cannot be rendered or written, 1 when
+        a requested load fails, and 2 when a flag was given that does not
+        apply to the selected `--service`. Rendering without loading is a
+        success even though nothing is running afterwards — that is what was
+        asked.
     """
     out = sys.stdout if out is None else out
     on_status = _stderr_status if on_status is None else on_status
 
+    # Plain attribute access, not `getattr(args, "service", DEFAULT_SERVICE)`.
+    # A fallback here would make `run` keep working if `--service` were never
+    # registered on the parser — which is exactly the wiring bug the tests
+    # below exist to catch, quietly papered over.
+    service = SERVICES[args.service]
+
+    # Refused rather than ignored. `--service mcp --interval 45` is a coherent
+    # sentence that means nothing, and rendering it anyway would produce a
+    # plist that loads cleanly and supervises a server ticking at no
+    # particular interval, with nothing anywhere saying the flag was dropped.
+    for other in SERVICES.values():
+        if other.name == service.name:
+            continue
+        for option in other.options:
+            if getattr(args, option) is not None:
+                print(
+                    f"palaver install-agent: --{option} applies to --service "
+                    f"{other.name}, not --service {service.name}",
+                    file=sys.stderr,
+                )
+                return 2
+
+    label = service.label if args.label is None else args.label
     executable = _default_executable() if args.executable is None else args.executable
     log_dir = DEFAULT_LOG_DIR if args.log_dir is None else args.log_dir
     plist_path = (
-        LAUNCH_AGENTS_DIR / f"{args.label}.plist" if args.plist_path is None else args.plist_path
+        LAUNCH_AGENTS_DIR / f"{label}.plist" if args.plist_path is None else args.plist_path
     )
 
     try:
         rendered = render_plist(
-            label=args.label,
-            program_arguments=observe_program_arguments(
-                executable=executable,
-                db_path=args.db,
-                cursor_root=args.cursors,
-                interval=args.interval,
-            ),
-            stdout_path=log_dir / f"{args.label}.out.log",
-            stderr_path=log_dir / f"{args.label}.err.log",
+            label=label,
+            program_arguments=service.build_argv(executable, args),
+            stdout_path=log_dir / f"{label}.out.log",
+            stderr_path=log_dir / f"{label}.err.log",
+            template_path=service.template_path,
         )
     except InstallAgentError as exc:
         print(f"palaver install-agent: {exc}", file=sys.stderr)
@@ -502,20 +668,20 @@ def run(
 
     if not (args.load or args.reload):
         out.write(f"load it with:  launchctl bootstrap {domain_target()} {plist_path}\n")
-        out.write(f"unload it with:  launchctl bootout {service_target(args.label)}\n")
+        out.write(f"unload it with:  launchctl bootout {service_target(label)}\n")
         return 0
 
     if args.reload:
-        on_status(f"{args.label}: unloading any previously loaded job")
-        bootout(args.label)
+        on_status(f"{label}: unloading any previously loaded job")
+        bootout(label)
 
-    on_status(f"{args.label}: bootstrapping into {domain_target()}")
+    on_status(f"{label}: bootstrapping into {domain_target()}")
     result = bootstrap(plist_path)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or f"status {result.returncode}"
         print(f"palaver install-agent: launchctl bootstrap failed: {detail}", file=sys.stderr)
         return 1
 
-    pid = service_pid(args.label)
-    out.write(f"loaded {service_target(args.label)}" + (f" (pid {pid})\n" if pid else "\n"))
+    pid = service_pid(label)
+    out.write(f"loaded {service_target(label)}" + (f" (pid {pid})\n" if pid else "\n"))
     return 0

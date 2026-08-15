@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Palaver MCP server (LaunchAgent) — task 6.5.
+
+  TEMPLATE. `palaver install-agent` with the mcp service selected substitutes
+  every dollar-brace placeholder below and writes the result to
+  ~/Library/LaunchAgents/. Do not load this file directly; launchd would
+  reject the unsubstituted XML.
+
+  This comment names no placeholder literally, because string.Template treats
+  one inside a comment exactly as it treats one inside a value. It also names
+  no command-line flag literally: a double hyphen is illegal inside an XML
+  comment, and `plutil -lint` accepts one anyway while expat and plistlib
+  reject the file outright.
+
+  A near-copy of observe.plist.tmpl, and deliberately a copy rather than a
+  shared template with the scheduling keys parameterized: the difference
+  between the two is that this job *omits* LowPriorityIO and Nice entirely,
+  and a placeholder can substitute a value but cannot remove an element.
+  Rendering <false/> instead would not be the same thing — it is a claim
+  about priority rather than the absence of one — and injecting raw XML
+  through a placeholder would bypass the escaping render_plist exists to do.
+  tests/test_supervision.py asserts the two templates agree on every key
+  except the scheduling ones, so this copy cannot drift unnoticed.
+
+  This supervises `palaver mcp`, the Streamable HTTP read surface other
+  coding agents query. It holds a mode=ro SQLite connection and posts its two
+  writes to the observer daemon's socket, so it is not this machine's writer
+  and may be restarted independently of one (INV-2, and task 6.3).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${LABEL}</string>
+
+	<key>ProgramArguments</key>
+	<array>
+${PROGRAM_ARGUMENTS}
+	</array>
+
+	<!--
+	  KeepAlive is unconditional, for a different reason than the observer's.
+	  The observer restarts on any exit because nothing else writes; this one
+	  restarts on any exit because a client's registered URL is fixed in
+	  ~/.claude.json and a dead listener there is not an error the agent can
+	  route around — it is a tool that silently stopped existing.
+	-->
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!--
+	  Stated explicitly at launchd's own default rather than left implicit:
+	  the restart window asserted by tests/test_supervision.py is derived from
+	  this number, and a window derived from an undeclared default would start
+	  failing silently if the default ever moved.
+	-->
+	<key>ThrottleInterval</key>
+	<integer>${THROTTLE_INTERVAL}</integer>
+
+	<!--
+	  Standard, and NOT Background — the one place this job's scheduling
+	  differs from the observer's, and the reason it needs its own template.
+
+	  The observer is Background because its work is nobody's request: it
+	  ticks on a timer whether or not anyone is waiting. This process is the
+	  opposite. Every cycle it burns is inside an agent's blocking tool call,
+	  with a human watching that agent wait. launchd.plist(5) describes
+	  Background's resource limits as existing "to prevent them from
+	  disrupting the user experience", which is precisely the throttling this
+	  job must not get: an agent asking Palaver a question is the user
+	  experience.
+
+	  Adaptive is the value that looks right here and is not. It moves a job
+	  between Background and Interactive based on *XPC* transaction activity
+	  (see xpc_transaction_begin(3)). This server speaks Streamable HTTP over
+	  a TCP socket and never opens an XPC transaction, so launchd would see no
+	  activity to promote on and the job would sit in Background permanently —
+	  strictly worse than saying Background outright, because it would read
+	  like it had been thought about.
+
+	  Interactive is refused by the same man page unless responsiveness
+	  "depends on it, and cannot be made Adaptive". A local read answered in
+	  milliseconds does not clear that bar. Standard — launchd's own default
+	  scheduling, no throttle, no elevated claim — is what is left, and it is
+	  the correct answer rather than the residual one.
+
+	  LowPriorityIO and Nice are absent for the same reason, not merely unset:
+	  this job's I/O is a SQLite read an agent is blocked on.
+	-->
+	<key>ProcessType</key>
+	<string>Standard</string>
+
+	<!--
+	  launchd starts jobs in `/`. The server anchors its own log file to the
+	  project root by module path, but its stdout/stderr are launchd's to
+	  place, and relative paths here would land in the filesystem root.
+	-->
+	<key>WorkingDirectory</key>
+	<string>${WORKING_DIRECTORY}</string>
+
+	<key>StandardOutPath</key>
+	<string>${STDOUT_PATH}</string>
+	<key>StandardErrorPath</key>
+	<string>${STDERR_PATH}</string>
+</dict>
+</plist>
