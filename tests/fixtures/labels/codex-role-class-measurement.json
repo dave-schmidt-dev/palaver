@@ -1,0 +1,10 @@
+{
+  "n_records": 8,
+  "n_labelled_rows": 19,
+  "n_errors": 0,
+  "n_disagreements": 0,
+  "n_discriminating": 1,
+  "n_human_labels": 4,
+  "n_injected_labels": 15,
+  "threshold_met": false
+}
