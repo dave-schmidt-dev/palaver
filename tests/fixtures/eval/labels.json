@@ -1,0 +1,95 @@
+{
+  "$comment": "Ground truth for task 3.5's eval harness. `path` is relative to tests/fixtures/. Most entries reuse Phase 1's existing labelled-fixture corpus (chosen over authoring a parallel transcript corpus, since fixture-lint's allowlist applies tree-wide and these are already vetted); only decision-database-choice.jsonl is new, added here under tests/fixtures/eval/ because no existing fixture demonstrates a resolved user decision. forbidden_quote_substrings names text a correct extractor must never cite as a user decision's quote -- either because it is INJECTED-channel (misattribution) or AGENT-channel (fabrication), never HUMAN-channel.",
+  "fixtures": [
+    {
+      "id": "question-tool",
+      "path": "question-askuserquestion-unresolved.jsonl",
+      "expect_question": true,
+      "expect_blocker": false,
+      "expect_current_task": true,
+      "expect_decision": false,
+      "expect_completion": false,
+      "forbidden_quote_substrings": []
+    },
+    {
+      "id": "question-free-text",
+      "path": "waiting-for-user-reply.jsonl",
+      "expect_question": true,
+      "expect_blocker": false,
+      "expect_current_task": true,
+      "expect_decision": false,
+      "expect_completion": false,
+      "forbidden_quote_substrings": []
+    },
+    {
+      "id": "blocker-tool-error",
+      "path": "error-tool-result.jsonl",
+      "expect_question": false,
+      "expect_blocker": true,
+      "expect_current_task": true,
+      "expect_decision": false,
+      "expect_completion": false,
+      "forbidden_quote_substrings": ["command not found"]
+    },
+    {
+      "id": "current-task-in-progress",
+      "path": "working-mid-tool-use.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": true,
+      "expect_decision": false,
+      "expect_completion": false,
+      "forbidden_quote_substrings": []
+    },
+    {
+      "id": "completion-clean",
+      "path": "finished-session.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": false,
+      "expect_decision": false,
+      "expect_completion": true,
+      "forbidden_quote_substrings": ["the test suite is green"]
+    },
+    {
+      "id": "completion-stop-hook",
+      "path": "ended-with-stop-hook.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": false,
+      "expect_decision": false,
+      "expect_completion": true,
+      "forbidden_quote_substrings": ["the deploy finished"]
+    },
+    {
+      "id": "negative-control-bookkeeping",
+      "path": "bookkeeping-only.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": false,
+      "expect_decision": false,
+      "expect_completion": false,
+      "forbidden_quote_substrings": []
+    },
+    {
+      "id": "misattribution-injected-slash-command",
+      "path": "slash-command-after-reply.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": false,
+      "expect_decision": false,
+      "expect_completion": true,
+      "forbidden_quote_substrings": ["<command-name>/status</command-name>", "the auth module is refactored"]
+    },
+    {
+      "id": "decision-database-choice",
+      "path": "eval/decision-database-choice.jsonl",
+      "expect_question": false,
+      "expect_blocker": false,
+      "expect_current_task": false,
+      "expect_decision": true,
+      "expect_completion": true,
+      "forbidden_quote_substrings": ["which database should the worker use?"]
+    }
+  ]
+}

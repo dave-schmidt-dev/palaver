@@ -1,0 +1,85 @@
+{
+  "blocker-tool-error": {
+    "blockers_now": [
+      "command not found"
+    ],
+    "current_task": "run the test suite",
+    "questions_for_user": [],
+    "session_complete": false,
+    "user_decisions": []
+  },
+  "completion-clean": {
+    "blockers_now": [],
+    "current_task": "",
+    "questions_for_user": [],
+    "session_complete": true,
+    "user_decisions": []
+  },
+  "completion-stop-hook": {
+    "blockers_now": [],
+    "current_task": "",
+    "questions_for_user": [],
+    "session_complete": true,
+    "user_decisions": []
+  },
+  "current-task-in-progress": {
+    "blockers_now": [],
+    "current_task": "Running the test suite",
+    "questions_for_user": [],
+    "session_complete": false,
+    "user_decisions": [
+      {
+        "quote": "run the test suite",
+        "statement": "The user requested the agent run the test suite."
+      }
+    ]
+  },
+  "decision-database-choice": {
+    "blockers_now": [],
+    "current_task": "Refactor the auth module",
+    "questions_for_user": [],
+    "session_complete": true,
+    "user_decisions": [
+      {
+        "quote": "refactor the auth module",
+        "statement": "refactor the auth module"
+      },
+      {
+        "quote": "postgres",
+        "statement": "which database should the worker use?"
+      }
+    ]
+  },
+  "misattribution-injected-slash-command": {
+    "blockers_now": [],
+    "current_task": "",
+    "questions_for_user": [],
+    "session_complete": true,
+    "user_decisions": []
+  },
+  "negative-control-bookkeeping": {
+    "blockers_now": [],
+    "current_task": "",
+    "questions_for_user": [],
+    "session_complete": false,
+    "user_decisions": []
+  },
+  "question-free-text": {
+    "blockers_now": [],
+    "current_task": "Refactor the auth module",
+    "questions_for_user": [
+      "should i also rename the helper?"
+    ],
+    "session_complete": false,
+    "user_decisions": []
+  },
+  "question-tool": {
+    "blockers_now": [],
+    "current_task": "refactor the auth module",
+    "questions_for_user": [
+      "which database should the worker use?"
+    ],
+    "session_complete": false,
+    "user_decisions": []
+  }
+}

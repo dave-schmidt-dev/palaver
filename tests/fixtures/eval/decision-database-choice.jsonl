@@ -1,0 +1,4 @@
+{"type": "user", "sessionId": "fixture-decision-database-choice", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "refactor the auth module"}]}}
+{"type": "assistant", "sessionId": "fixture-decision-database-choice", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu-1", "name": "AskUserQuestion", "input": {"questions": [{"question": "which database should the worker use?", "header": "Database", "multiSelect": false, "options": [{"label": "postgres", "description": "the shared instance"}, {"label": "sqlite", "description": "a file next to the worker"}]}]}}]}}
+{"type": "user", "sessionId": "fixture-decision-database-choice", "isMeta": false, "message": {"role": "user", "content": [{"type": "text", "text": "postgres"}]}}
+{"type": "assistant", "sessionId": "fixture-decision-database-choice", "message": {"role": "assistant", "content": [{"type": "text", "text": "the auth module is refactored"}]}}
