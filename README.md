@@ -223,6 +223,7 @@ leave a `KeepAlive` job on disk retrying a forbidden bind every ten seconds.
 - Components that touch external surfaces (capture, inference runtime, UI) sit behind interfaces so they can be swapped without rewriting the memory layer.
 - Tests verify real behavior. A gate asserts what a measurement *says*, never merely that the measurement ran.
 - Every invariant in `INVARIANTS.md` gets a negative test that attacks its enforcement layer, not the Python API above it.
+- The charter is itself under test. `tests/test_invariants.py` parses `INVARIANTS.md` and asserts every `gate_test:` resolves to a real function and every `area:` glob matches at least one file on disk. Those fields are read by `harvest`, which maps bug entries to invariants through `area:` — a glob matching nothing produces an invariant that reads as clean because nothing can reach it.
 
 ## License
 

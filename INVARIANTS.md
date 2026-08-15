@@ -54,7 +54,7 @@ rationale: The brief is explicit — "Do not destroy old memories" — and the r
   and are stored separately from durable memories precisely so this invariant can be absolute.
 
 ### INV-5 — Provenance ordering is enforced in the database, not in prompt text
-area: ["palaver/memory/provenance.py", "palaver/memory/schema.py"]
+area: ["palaver/store/schema.py", "palaver/memory/supersede.py"]
 gate_test: tests/test_memory.py::test_lower_tier_cannot_supersede_higher_tier
 threshold: 3
 rationale: Tiers, highest first: (1) explicit user instruction or correction, (2) explicit main-agent
@@ -89,7 +89,7 @@ rationale: **Amended 2026-08-14 (task 3.3), and the word "raw" was dropped from 
   quote from injected content passes a check it should fail.
 
 ### INV-7 — Status is computed from deterministic signals; the model never sets it
-area: ["palaver/observer/signals.py", "palaver/observer/state.py"]
+area: ["palaver/observer/signals.py"]
 gate_test: tests/test_signals.py::test_status_is_never_model_supplied
 threshold: 3
 rationale: Measured, not assumed. Spike run 1: E4B extracted 17/17 user decisions correctly but got
@@ -120,6 +120,7 @@ gate_test: tests/test_invariants.py::test_no_outbound_http_clients
 gate_test: tests/test_invariants.py::test_the_http_client_gate_does_not_see_dependencies
 gate_test: tests/test_invariants.py::test_the_runtime_dependency_set_is_an_allowlist
 gate_test: tests/test_fixture_lint.py::test_unclassified_record_fails
+gate_test: tests/test_fixture_lint.py::test_every_file_under_the_committed_corpus_is_read
 threshold: 3
 rationale: The brief's first engineering preference and the reason the whole design tolerates a 4B
   model instead of a frontier one. Palaver's database aggregates the full unredacted content of every
@@ -148,3 +149,11 @@ rationale: The brief's first engineering preference and the reason the whole des
   with prose written for the fixture; `palaver fixture-lint` enforces that as an allowlist and fails
   on any record it cannot classify. A fixture pushed to a public remote leaves the machine as surely
   as an HTTP POST does, and unlike a POST it cannot be recalled.
+  **Two gate tests, because the fixture surface has two ways to fail.**
+  `test_unclassified_record_fails` proves a record the allowlist does not cover is rejected. It says
+  nothing about whether that record was ever handed to the allowlist, and until 2026-08-15 seven of
+  the twenty-eight committed files were not: discovery was a `*.jsonl` glob, so the gate reported
+  clean over a subset and read as clean over the corpus.
+  `test_every_file_under_the_committed_corpus_is_read` closes the other half — the set of files the
+  linter opens equals the set present, and an extension no checker claims is a rejection rather than
+  a skip. Caught and read are separate claims; one gate test cannot carry both.
