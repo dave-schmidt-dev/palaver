@@ -10,7 +10,17 @@ span anchors instead of a copied `quote` string (see
 `palaver/memory/evidence.py`). Migration 5 makes supersession a derived
 view rather than a stored flag, and closes the `REPLACE`-shaped holes
 through which a row could still be destroyed or rewritten (see
-`palaver/memory/supersede.py`).
+`palaver/memory/supersede.py`). Migration 6 adds `latency_ms` and
+`prompt_tokens` to `model_runs` (see `palaver/extract/client.py`, task 3.2):
+migration 1 shipped `model_runs` with nowhere to put either value, which
+made "every request and its latency lands in `model_runs`" unreachable.
+Both columns are nullable — a run that fails before a response arrives has
+a latency but no prompt token count — and are added with `ALTER TABLE ...
+ADD COLUMN`, not by editing migration 1's `_V1_STATEMENTS` in place: the
+test suite builds every other test database fresh from the latest
+migration, so an in-place edit would pass every test here while leaving any
+already-migrated store (this project has none yet, but the next one won't
+get a second chance) permanently missing both columns.
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -394,6 +404,19 @@ _V5_STATEMENTS = (
     """,
 )
 
+# task 3.2 / palaver/extract/client.py: every model_runs row starts 'running'
+# at request time and is updated once the request settles, successfully or
+# not, so latency_ms is set on both a 'done' and an 'error' row. prompt_tokens
+# is only ever known on a 'done' row (it comes from the response's `usage`
+# object), so it stays NULL on a run that never got a response — hence
+# nullable columns with a non-negative CHECK rather than NOT NULL.
+_V6_STATEMENTS = (
+    "ALTER TABLE model_runs ADD COLUMN latency_ms INTEGER "
+    "CHECK (latency_ms IS NULL OR latency_ms >= 0)",
+    "ALTER TABLE model_runs ADD COLUMN prompt_tokens INTEGER "
+    "CHECK (prompt_tokens IS NULL OR prompt_tokens >= 0)",
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -432,6 +455,14 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
             "undeletable and unrewritable including via REPLACE (INV-4/INV-5)"
         ),
         statements=_V5_STATEMENTS,
+    ),
+    Migration(
+        version=6,
+        description=(
+            "model_runs gains latency_ms and prompt_tokens, both nullable "
+            "(task 3.2, palaver/extract/client.py)"
+        ),
+        statements=_V6_STATEMENTS,
     ),
 )
 

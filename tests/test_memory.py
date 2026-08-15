@@ -106,7 +106,7 @@ from palaver.memory.tiers import (
 )
 from palaver.memory.write import write_memory
 from palaver.store.migrate import MigrationError, connect, current_version, migrate
-from palaver.store.schema import SCHEMA_MIGRATIONS
+from palaver.store.schema import LATEST_VERSION, SCHEMA_MIGRATIONS
 
 MEMORY_DIR = Path(palaver.__file__).resolve().parent / "memory"
 
@@ -1631,7 +1631,11 @@ def test_supersede_guards_are_added_by_migration_5_not_migration_1(tmp_path):
 
     conn = connect(db_path)
     try:
-        assert current_version(conn) == 5
+        # LATEST_VERSION, not the literal 5: this asserts the store migrated
+        # all the way forward, and every migration added after this test was
+        # written would otherwise break an assertion that has nothing to do
+        # with what it is testing.
+        assert current_version(conn) == LATEST_VERSION
         assert conn.execute("SELECT * FROM superseded_memories").fetchall() == []
 
         with pytest.raises(sqlite3.IntegrityError, match="never reused"):
@@ -1771,7 +1775,7 @@ def test_migration_5_rolls_back_a_store_that_already_has_two_rows_that_supersede
     finally:
         clean.close()
 
-    assert migrate(clean_path) == 5
+    assert migrate(clean_path) == LATEST_VERSION
     clean = connect(clean_path)
     try:
         assert clean.execute("SELECT memory_id FROM superseded_memories").fetchall() == [
