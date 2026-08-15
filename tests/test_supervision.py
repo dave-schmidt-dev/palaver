@@ -159,19 +159,48 @@ def _await_pid(label: str, *, window: float = STARTUP_WINDOW_SECONDS) -> int | N
     return wait_for_running_pid(label, window=window)
 
 
+def _await_unloaded(label: str, *, window: float = STARTUP_WINDOW_SECONDS) -> bool:
+    """Wait until launchd no longer knows the label at all.
+
+    `bootout` returns as soon as launchd has *accepted* the request, not once
+    the job is gone. Bootstrapping a label still being torn down fails with
+    `Bootstrap failed: 5: Input/output error`, and because every live test in
+    this file reuses one label per service, that lands on whichever test runs
+    next rather than on the one that left the job behind.
+
+    This was a real intermittent failure, not a precaution: a whole-suite run
+    lost `test_an_agent_without_keepalive_stays_dead_when_killed` to exactly
+    that error while the same test passed in isolation minutes earlier. It is
+    worse for jobs under `KeepAlive` that these tests SIGKILL, because
+    teardown can then race a restart that launchd has already scheduled.
+    """
+    deadline = time.monotonic() + window
+    while time.monotonic() < deadline:
+        if print_service(label).returncode != 0:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _bootout_and_settle(label: str) -> None:
+    """Unload a label and do not return until launchd has finished with it."""
+    bootout(label)
+    _await_unloaded(label)
+
+
 @pytest.fixture
 def loaded_selftest_agent(tmp_path):
     """Bootstrap the selftest agent, yield its plist path, and always unload."""
     plist = _render_selftest_plist(tmp_path)
-    bootout(SELFTEST_LABEL)
+    _bootout_and_settle(SELFTEST_LABEL)
     result = bootstrap(plist)
     if result.returncode != 0:
-        bootout(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL)
         pytest.fail(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
     try:
         yield plist
     finally:
-        bootout(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL)
 
 
 # --- rendering -------------------------------------------------------------
@@ -817,8 +846,9 @@ def test_an_agent_without_keepalive_stays_dead_when_killed(tmp_path):
     stripped.write_text(without, encoding="utf-8")
 
     plist = _render_selftest_plist(tmp_path, template_path=stripped)
-    bootout(SELFTEST_LABEL)
-    assert bootstrap(plist).returncode == 0
+    _bootout_and_settle(SELFTEST_LABEL)
+    result = bootstrap(plist)
+    assert result.returncode == 0, (result.stderr or result.stdout).strip()
     try:
         original = _await_pid(SELFTEST_LABEL)
         assert original is not None, (
@@ -835,7 +865,7 @@ def test_an_agent_without_keepalive_stays_dead_when_killed(tmp_path):
         )
         assert revived is None, f"a job with no KeepAlive came back as pid {revived}"
     finally:
-        bootout(SELFTEST_LABEL)
+        _bootout_and_settle(SELFTEST_LABEL)
 
 
 @live
@@ -864,28 +894,6 @@ def _accepting(port: int, *, window: float, host: str = "127.0.0.1") -> bool:
                 return True
         except OSError:
             time.sleep(0.2)
-    return False
-
-
-def _await_unloaded(label: str, *, window: float = STARTUP_WINDOW_SECONDS) -> bool:
-    """Wait until launchd no longer knows the label at all.
-
-    `bootout` returns as soon as launchd has *accepted* the request, not once
-    the job is gone, and bootstrapping a label that is still being torn down
-    fails with `Bootstrap failed: 5: Input/output error`. The observer's live
-    tests never hit that because there are three of them; four MCP tests
-    sharing one label hit it every run.
-
-    It is worse for this job than for the observer's, too: these tests SIGKILL
-    a process under `KeepAlive`, so at teardown launchd may be mid-restart —
-    booting out a job that is in the middle of coming back is exactly the race
-    this closes.
-    """
-    deadline = time.monotonic() + window
-    while time.monotonic() < deadline:
-        if print_service(label).returncode != 0:
-            return True
-        time.sleep(0.2)
     return False
 
 
@@ -930,22 +938,18 @@ def loaded_mcp_agent(tmp_path):
         encoding="utf-8",
     )
 
-    bootout(MCP_SELFTEST_LABEL)
-    assert _await_unloaded(MCP_SELFTEST_LABEL), (
-        "a previous run's job is still loaded; bootstrapping over it would fail with EIO"
-    )
+    _bootout_and_settle(MCP_SELFTEST_LABEL)
     result = bootstrap(plist)
     if result.returncode != 0:
-        bootout(MCP_SELFTEST_LABEL)
+        _bootout_and_settle(MCP_SELFTEST_LABEL)
         pytest.fail(f"launchctl bootstrap failed: {(result.stderr or result.stdout).strip()}")
     try:
         yield {"port": port, "url": f"http://127.0.0.1:{port}/mcp", "logs": logs}
     finally:
-        bootout(MCP_SELFTEST_LABEL)
-        # Blocking here rather than in the next test's setup: teardown is
+        # Settling at teardown rather than only at the next setup: teardown is
         # where the job actually is, and leaving it half-removed makes the
         # *following* test fail for a reason that has nothing to do with it.
-        _await_unloaded(MCP_SELFTEST_LABEL)
+        _bootout_and_settle(MCP_SELFTEST_LABEL)
 
 
 @live
