@@ -892,3 +892,61 @@ def test_growth_reports_page_bytes_as_unavailable_when_dbstat_is_absent(monkeypa
 
     assert "pages unavailable (no dbstat in this SQLite build)" in rendered
     assert "0.0 KiB of pages" not in rendered
+
+
+def test_growth_db_flag_measures_the_named_store_not_the_benchmark_one(
+    stub_server, tmp_path, capsys
+):
+    """`--growth-db` is wired end to end, not merely accepted by the parser.
+
+    The failure this excludes is a name mismatch between `args.growth_db` and
+    `run_bench(growth_db_path=...)`, which would silently measure the throwaway
+    benchmark store while the report claimed otherwise — and which every other
+    growth test passes through, because none of them set the flag.
+    """
+    other = tmp_path / "other.db"
+    migrate(other)
+    conn = connect(other)
+    try:
+        project_id = conn.execute(
+            "INSERT INTO projects(name, path) VALUES ('other', '/tmp/fixture/other')"
+        ).lastrowid
+        session_id = conn.execute(
+            "INSERT INTO sessions(project_id, source, external_id) VALUES (?,'bench','other-1')",
+            (project_id,),
+        ).lastrowid
+        for seq in range(200):
+            conn.execute(
+                "INSERT INTO transcript_chunks(session_id, seq, role, content) "
+                "VALUES (?, ?, 'user', ?)",
+                (session_id, seq, "fixture: invented line " * 20),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    handle = stub_server()
+    argv = [
+        "bench",
+        "--sessions",
+        "1",
+        "--report",
+        "--host",
+        handle.host,
+        "--port",
+        str(handle.port),
+        "--prompt-words",
+        str(TEST_PROMPT_WORDS),
+        "--db",
+        str(tmp_path / "bench.db"),
+    ]
+
+    assert _cli([*argv, "--growth-db", str(other)], sys.stdout) == 0
+    pointed = capsys.readouterr().out
+    assert _cli(argv, sys.stdout) == 0
+    default = capsys.readouterr().out
+
+    assert "transcript_chunks: 200 row(s)" in pointed
+    # The control: without the flag the same command measures the benchmark
+    # store, which holds no transcript chunks at all.
+    assert "transcript_chunks: 0 row(s)" in default
