@@ -806,3 +806,82 @@ def test_the_gate_test_check_reads_definitions_not_text():
     here = _defined_test_names(Path(__file__))
     assert "test_status_is_never_model_supplied" not in here
     assert "test_every_area_glob_matches_something_on_disk" in here
+
+
+# =============================================================================
+# The ledger tracks the charter
+#
+# `ledger.yaml` is the other half of the machine state `harvest` reads: the
+# charter says what the invariants are, the ledger says what state each is in.
+# The failure this guards is quiet — an INV-10 added to the charter with no
+# ledger entry is not an error to `harvest`, it is an invariant whose
+# `gate_test_status` is simply unknown, reported as nothing at all.
+#
+# Only that one correspondence is asserted. `resolutions` and `maturity` are
+# owner decisions the ledger exists to record, and a test that failed when
+# `maturity.status` flipped to `mvp` would fire on the correct action.
+#
+# Parsed by regex rather than `yaml.safe_load` because pyyaml is not a
+# dependency of this project and adding one for a single assertion is a worse
+# trade than hand-parsing a flat block — the same call already made for
+# `INVARIANTS.md` above. The cost is that this does not prove the file is
+# well-formed YAML; `harvest` raises on read if it is not, which is loud.
+# =============================================================================
+
+LEDGER_PATH = REPO_ROOT / "ledger.yaml"
+LEDGER_BLOCK_KEY = re.compile(r"^(?P<key>\w+):\s*$")
+LEDGER_INVARIANT_KEY = re.compile(r"^\s+(?P<id>INV-[\w.-]+):")
+
+
+def _ledger_invariant_ids(text: str) -> set[str]:
+    """The `INV-*` keys nested under the ledger's `invariants:` block.
+
+    Scoped to that block on purpose: `resolutions:` carries the same key
+    shape, so an unscoped scan would report an invariant as present in the
+    ledger on the strength of a resolution entry alone.
+    """
+    ids: set[str] = set()
+    in_block = False
+    for line in text.splitlines():
+        block = LEDGER_BLOCK_KEY.match(line)
+        if block:
+            in_block = block.group("key") == "invariants"
+            continue
+        if not in_block:
+            continue
+        key = LEDGER_INVARIANT_KEY.match(line)
+        if key:
+            ids.add(key.group("id"))
+    return ids
+
+
+def test_the_ledger_carries_an_entry_for_every_charter_invariant():
+    """Done-when: `ledger.yaml`'s `invariants:` keys equal the charter's.
+
+    Equality both ways. A charter invariant missing from the ledger has no
+    tracked state; a ledger entry naming an invariant the charter dropped is
+    state for something that no longer exists.
+    """
+    assert LEDGER_PATH.is_file(), "ledger.yaml is missing — harvest has no state to read"
+    ledger_ids = _ledger_invariant_ids(LEDGER_PATH.read_text(encoding="utf-8"))
+    assert ledger_ids == set(CHARTER_IDS), (
+        f"ledger.yaml and INVARIANTS.md disagree: {ledger_ids ^ set(CHARTER_IDS)}"
+    )
+
+
+def test_the_ledger_scan_is_scoped_to_the_invariants_block():
+    """Negative control: keys under `resolutions:` are not counted as entries.
+
+    Without the block scope the check above would pass on a ledger that
+    tracked an invariant's resolution date and nothing else, which is the
+    field it is not supposed to be reading.
+    """
+    text = (
+        "invariants:\n"
+        "  INV-1: {gate_test_status: covered}\n"
+        "resolutions:\n"
+        '  INV-2: {resolved_at_date: "2026-08-15"}\n'
+        "maturity:\n"
+        "  status: pre-mvp\n"
+    )
+    assert _ledger_invariant_ids(text) == {"INV-1"}

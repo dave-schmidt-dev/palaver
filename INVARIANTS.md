@@ -18,6 +18,13 @@ rationale: Palaver is a
   tick on a 30–60s cadence, so a silent inference stall is indistinguishable from a hung observer.
   Every such call takes an `on_status` channel; the channel never writes to stdout, which belongs to
   the CLI's own output contract.
+  **The `area:` glob is the whole package on purpose, and that has a cost worth stating.** Any
+  module can perform a blocking operation, so narrowing the glob would mean maintaining a list of
+  which ones currently do — a list that goes stale the first time someone adds a subprocess call
+  somewhere new. The cost is that `harvest` maps every *untagged* `HISTORY.md` bug entry here by
+  glob, whatever it was actually about: on 2026-08-15 the recurrence count read 51, of which 8
+  carried an explicit `inv:` tag. Read this invariant's count as an upper bound unless the entries
+  behind it are tagged.
 
 ### INV-2 — Palaver never writes to, controls, or interrupts an observed agent session
 area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py"]

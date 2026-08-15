@@ -1,0 +1,59 @@
+# palaver ledger — minimal machine state. NO `freeze` field (computed on read).
+#
+# Owner decision, 2026-08-15: palaver is in initial development — the repo's
+# first commit is 2026-08-14 — and the ~109 `[bug]` entries HISTORY has
+# accumulated since are development-loop findings against a contract that was
+# never settled, not regressions against one that was. They are nulled here.
+#
+# Two levers do that, and both are needed. `maturity.status: pre-mvp` sets
+# harvest's project gate inactive, which only demotes a breach from gating to
+# reported — harvest would still print `would otherwise be FROZEN` and list
+# them. The per-invariant `resolutions` cutoffs below take the counts to zero,
+# so there is nothing left to report. This is the same mechanism harvest
+# already applies project-wide through `mvp_since` (see `_effective_cutoff`,
+# which takes the later of the two): a date cutoff is a baseline, not
+# exclusively a fix claim. The notes say which one this is.
+#
+# Boundary worth knowing: the cutoff test is `entry.date <= resolved_at_date`,
+# so every HISTORY entry dated 2026-08-15 is nulled, including any logged later
+# today. Recurrence counting starts fresh from 2026-08-16.
+
+invariants:
+  # `covered` here is asserted, not stamped: tests/test_invariants.py::
+  # test_every_gate_test_named_by_the_charter_exists resolves every charter
+  # `gate_test:` to a real function definition by AST across all nine.
+  INV-1: {gate_test_status: covered}    # covered | missing
+  INV-2: {gate_test_status: covered}
+  INV-3: {gate_test_status: covered}
+  INV-4: {gate_test_status: covered}
+  INV-5: {gate_test_status: covered}
+  INV-6: {gate_test_status: covered}
+  INV-7: {gate_test_status: covered}
+  INV-8: {gate_test_status: covered}
+  INV-9: {gate_test_status: covered}
+
+# INV-x: {resolved_at_date: "YYYY-MM-DD", note: "..."}
+#
+# All nine carry the same baseline date on purpose, including INV-3 and INV-8
+# whose counts are already 0. An `area:` glob widened later would otherwise let
+# pre-baseline entries start counting against an invariant that had none —
+# a baseline with holes in it is not a baseline.
+resolutions:
+  INV-1: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 51 recurrences, of which only 8 carried an explicit inv: tag — the area is palaver/**/*.py, the whole package, so every untagged HISTORY bug entry glob-mapped here. The count was mostly an artifact of that glob's width."}
+  INV-2: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 3 recurrences."}
+  INV-3: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline. Count was already 0; the date is here so a later area: widening cannot resurrect pre-baseline entries."}
+  INV-4: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 1 recurrence."}
+  INV-5: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 1 recurrence."}
+  INV-6: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 1 recurrence."}
+  INV-7: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 20 recurrences. This was the one count that looked like real signal rather than glob width — status derivation churned repeatedly while the signal set was being worked out."}
+  INV-8: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline. Count was already 0; the date is here so a later area: widening cannot resurrect pre-baseline entries."}
+  INV-9: {resolved_at_date: "2026-08-15", note: "Pre-MVP baseline, not a fix claim. Nulls 10 recurrences. Note that pre-mvp suppression applies to this invariant like any other; no invariant here sets always_active: true, so a future breach of the no-egress contract reports without gating until the project settles to mvp."}
+
+maturity:
+  status: pre-mvp        # pre-mvp | mvp — while pre-mvp, harvest still tracks recurrence counts
+                         # (for visibility) but the freeze gate never stops a plan. Flip to mvp
+                         # once the project has reached a settled MVP (`harvest settle` does this
+                         # safely), and set mvp_since so recurrences accrued during pre-mvp don't
+                         # instantly trip a freeze.
+  pre_mvp_since: "2026-08-14"   # charter authored and repo initialized the same day
+  mvp_since: null        # "YYYY-MM-DD" — set when flipping status to mvp
