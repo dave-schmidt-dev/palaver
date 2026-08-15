@@ -88,8 +88,17 @@ Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
 uv sync                 # install, including dev dependencies
 uv run pytest -q        # test suite
 uv run ruff check .     # lint and dead-code check
-uv run pre-commit install   # fast lint hook on commit
+uv run pre-commit install   # installs both hooks (see below)
 ```
+
+`pre-commit install` wires two stages. On **commit**, ruff runs over the files
+that commit touches — fast, and silent about the rest of the tree. On **push**,
+ruff runs over the whole tree and then the full suite runs, which takes about
+two minutes. The push hook is where the fixture-corpus gate lives:
+`palaver fixture-lint` is not a hook of its own, it is a test, so a fixture
+carrying real session prose fails the suite and the push stops. That gate is
+still skippable with `git push --no-verify`, which is a deliberate escape hatch
+and not a check.
 
 ## Setup: the iTerm2 pane surface
 

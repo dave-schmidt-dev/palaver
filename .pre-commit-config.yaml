@@ -1,11 +1,19 @@
-# Pre-commit hooks: fast checks only (lint + dead-code detection).
+# Two stages, two different assertions.
 #
-# The heavy suite belongs in a pre-push hook, but that hook is NOT wired yet:
-# the Phase 1 gate is `pytest -q tests/ && ruff check . && palaver status
-# --once`, and `palaver status` does not exist until plan task 1.9. The
-# pre-push stage is added there, against the real gate command, rather than
-# stubbed here against a command that would fail on every push until then.
-default_install_hook_types: [pre-commit]
+# pre-commit is the fast one: ruff over the files this commit touches. It
+# receives filenames, so it says nothing about the rest of the tree.
+#
+# pre-push is the real gate: ruff over the whole tree, then the whole suite.
+# Both pass `pass_filenames: false` and `always_run: true` deliberately. Left
+# to its defaults pre-commit would append the changed-file list to the entry,
+# so `pytest` would collect only the pushed paths and report green on a
+# one-file run; and the file-type filter would skip the suite entirely on a
+# push carrying only `.md`/`.json`, which is most of what the fixture corpus
+# is. A gate that narrows itself to the change under test is not a gate.
+#
+# This stage was deferred while `palaver status` did not exist (plan task
+# 1.9). It does now, and the suite covers it, so the gate is the suite.
+default_install_hook_types: [pre-commit, pre-push]
 
 repos:
   - repo: local
@@ -17,3 +25,21 @@ repos:
         types_or: [python, pyi]
         require_serial: true
         stages: [pre-commit]
+
+      - id: ruff-check-all
+        name: ruff check . (lint + dead-code, whole tree)
+        entry: uv run ruff check .
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        stages: [pre-push]
+
+      - id: pytest-all
+        name: pytest -q (full suite, ~2 min)
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        stages: [pre-push]
