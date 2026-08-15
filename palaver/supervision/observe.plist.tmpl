@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Palaver observer daemon (LaunchAgent) — task 5.0.
+
+  TEMPLATE. `palaver install-agent` substitutes every dollar-brace placeholder
+  below and writes the result to ~/Library/LaunchAgents/. Do not load this file
+  directly; launchd would reject the unsubstituted XML.
+
+  This comment names no placeholder literally, because string.Template treats
+  one inside a comment exactly as it treats one inside a value.
+
+  This supervises `palaver observe`, which owns the single SQLite writer and
+  the tick loop. It reads observed sessions read-only (INV-2) and sends nothing
+  off the machine (INV-9), so it needs no Full Disk Access grant beyond what
+  the sources themselves already require.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${LABEL}</string>
+
+	<key>ProgramArguments</key>
+	<array>
+${PROGRAM_ARGUMENTS}
+	</array>
+
+	<!--
+	  KeepAlive is unconditional rather than a dict of conditions: the daemon
+	  is the system's only writer, so *any* exit — clean, crashed, or killed —
+	  means nothing is observing, and that state should never persist because
+	  the process managed to exit with status 0.
+	-->
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!--
+	  Stated explicitly at launchd's own default rather than left implicit:
+	  the restart window asserted by tests/test_supervision.py is derived from
+	  this number, and a window derived from an undeclared default would start
+	  failing silently if the default ever moved.
+	-->
+	<key>ThrottleInterval</key>
+	<integer>${THROTTLE_INTERVAL}</integer>
+
+	<!-- Never contend with the foreground agent sessions being observed. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<!--
+	  launchd starts jobs in `/`. The daemon anchors its own log file to the
+	  project root by module path, but its stdout/stderr are launchd's to
+	  place, and relative paths here would land in the filesystem root.
+	-->
+	<key>WorkingDirectory</key>
+	<string>${WORKING_DIRECTORY}</string>
+
+	<key>StandardOutPath</key>
+	<string>${STDOUT_PATH}</string>
+	<key>StandardErrorPath</key>
+	<string>${STDERR_PATH}</string>
+</dict>
+</plist>

@@ -16,6 +16,11 @@ where = ["."]
 include = ["palaver*"]
 exclude = ["tests*", "spikes*"]
 
+# The launchd templates are read at runtime by `palaver install-agent`, so an
+# installed distribution that shipped only the .py files would render nothing.
+[tool.setuptools.package-data]
+"palaver.supervision" = ["*.plist.tmpl"]
+
 [dependency-groups]
 dev = [
     "ruff>=0.6.0",

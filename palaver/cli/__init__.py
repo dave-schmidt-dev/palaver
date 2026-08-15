@@ -29,6 +29,7 @@ from palaver.cli import (
     eval,
     fixture_lint,
     inspect,
+    install_agent,
     observe,
     replay,
     status,
@@ -36,7 +37,18 @@ from palaver.cli import (
 from palaver.logging_setup import setup_logging
 
 #: Every registered subcommand module, in help-listing order.
-SUBCOMMANDS = (bench, diagnose, doctor, eval, fixture_lint, inspect, observe, replay, status)
+SUBCOMMANDS = (
+    bench,
+    diagnose,
+    doctor,
+    eval,
+    fixture_lint,
+    inspect,
+    install_agent,
+    observe,
+    replay,
+    status,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
