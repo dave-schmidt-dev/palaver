@@ -36,6 +36,30 @@ whatever rate iTerm2 is willing to dispatch. `RenderTicker` keeps the counter
 on this side of the connection, so the tick is write-only from iTerm2's point
 of view and observable by anything that reads the variable.
 
+**A status that cannot be refreshed must stop being shown (task 5.5).** The
+variable outlives the process that wrote it: kill the daemon and
+`user.palaver_status` keeps its last value in iTerm2 for as long as the pane
+lives, so the bar goes on confidently reporting `working: reading a file`
+hours after anything was reading anything. That is precisely the failure
+INV-7 exists to prevent, and no amount of exception handling reaches it,
+because nothing has failed -- there is simply nobody left to push. So every
+payload carries the epoch second it was pushed, and a payload older than
+`STALE_AFTER` decodes to `UNKNOWN` with **no task text**: `unknown: reading a
+file` would still be a confident claim about what the pane is doing.
+`UPDATE_CADENCE` is what makes this visible with no push at all -- the
+component re-renders on its own timer, re-reads the same stale value, and
+degrades it.
+
+**The ladybug is the other half, for the failures that are failures.** iTerm2
+shows 🐞 for a component that is not registered or whose RPC errored, and its
+own troubleshooting page documents it as clickable for detail. Palaver
+catches its render exceptions and returns the glyph itself, which trades that
+popover away for a traceback in `.logs/palaver.log` and a return value a
+headless test can assert. What Palaver does not catch -- a failed
+registration, a dropped connection -- still gets iTerm2's own ladybug, so the
+indicator means the same thing on both paths: this component is broken, not
+this pane is idle.
+
 Nothing here reads observed session content. It writes two `user.` variables
 into panes Palaver already tracks, and reads profile properties (INV-9).
 """
@@ -46,6 +70,7 @@ import base64
 import binascii
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -85,6 +110,19 @@ STATUS_REFERENCE = f"{STATUS_VARIABLE}?"
 #: tick" is a claim about something rather than vacuously true.
 UPDATE_CADENCE = 30.0
 
+#: How long a pushed status stays believable without being refreshed. Three
+#: cadence ticks: one missed render is a busy machine, three in a row is
+#: nobody home. Derived from `UPDATE_CADENCE` rather than chosen separately,
+#: so raising the cadence cannot silently make the horizon too tight to ever
+#: be met.
+STALE_AFTER = 3.0 * UPDATE_CADENCE
+
+#: What the bar shows when Palaver itself is broken, matching the glyph
+#: iTerm2 shows for a component it cannot reach. Never a `Status` label: it
+#: means "this component failed", and a status word would make it compete
+#: with the nine things the pane could legitimately be doing.
+LADYBUG = "🐞"
+
 #: Characters, matching `render`'s contract. iTerm2 sizes components in
 #: points and the maximum width is a user knob, so this is a determinism
 #: budget rather than a fit.
@@ -106,27 +144,72 @@ SHOW_BAR_REMEDY = (
     "turn the status bar on in iTerm2 > Settings > Profiles > Session > Status bar enabled"
 )
 
+#: The payload's freshness stamp: absolute epoch seconds from `time.time()`,
+#: never a monotonic clock and never a formatted timestamp. The value crosses
+#: a process boundary -- one process writes it, another reads it, possibly
+#: after a restart -- and a monotonic clock is meaningless outside the process
+#: that read it.
+PUSHED_AT_KEY = "pushed_at"
+
 #: An async `(session_id, name, value) -> None`. Injected rather than reached
 #: for, so every path through this module is testable without iTerm2 running.
 SetVariable = Callable[[str, str, Any], Awaitable[None]]
 
 
-def encode_status(status: Status, task: str | None = None) -> str:
+def encode_status(status: Status, task: str | None = None, *, now: float | None = None) -> str:
     """Serialize what a pane should show into the value of one variable.
 
     Args:
         status: The pane's derived status.
         task: What it is doing, if anything is known.
+        now: Epoch seconds to stamp the payload with, defaulting to the
+            current time. A parameter so tests can age a payload without
+            sleeping, not so callers can choose a clock.
 
     Returns:
         A JSON object string. JSON rather than a bare word because the task
         text is arbitrary session-derived prose and a delimiter-joined pair
-        would break on the first colon or newline in it.
+        would break on the first colon or newline in it -- and because the
+        freshness stamp needs somewhere to live.
     """
-    return json.dumps({"status": status.name, "task": task}, ensure_ascii=False)
+    return json.dumps(
+        {
+            "status": status.name,
+            "task": task,
+            PUSHED_AT_KEY: time.time() if now is None else float(now),
+        },
+        ensure_ascii=False,
+    )
 
 
-def decode_status(raw: Any) -> tuple[Status, str | None]:
+def is_fresh(stamp: Any, *, now: float | None = None, horizon: float = STALE_AFTER) -> bool:
+    """Report whether a payload's stamp is recent enough to still believe.
+
+    An absent or unreadable stamp is **not** fresh. Nothing but `push_status`
+    writes this variable and it always stamps, so the only way to see one
+    without a stamp is a payload left behind by an older build -- exactly the
+    case where its age is unknowable and could be days. One blank render
+    immediately after upgrading a running daemon is the cost, and the next
+    push clears it.
+
+    A stamp from the future fails too, by the same absolute bound. Clock
+    skew large enough to matter would otherwise pin a pane to a status that
+    can never expire.
+
+    Args:
+        stamp: The payload's `pushed_at` value, or anything else.
+        now: Epoch seconds to compare against, defaulting to the current time.
+        horizon: How many seconds of age is still believable.
+
+    Returns:
+        True if the stamp is a real number within `horizon` seconds of `now`.
+    """
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return False
+    return abs((time.time() if now is None else now) - float(stamp)) <= horizon
+
+
+def decode_status(raw: Any, *, now: float | None = None) -> tuple[Status, str | None]:
     """Read back what `encode_status` wrote, tolerating anything else.
 
     Total by construction. Every caller is inside a status bar coroutine, and
@@ -134,9 +217,16 @@ def decode_status(raw: Any) -> tuple[Status, str | None]:
     stops updating, so an unreadable value has to degrade to a renderable one
     instead.
 
+    A stale payload degrades the same way an unreadable one does, and loses
+    its task text with it. See the module docstring: `unknown` is the honest
+    reading of a value nobody is refreshing, and `unknown: reading a file`
+    would keep making the claim this is meant to withdraw.
+
     Args:
         raw: The variable's value: the JSON string, `None` before anything
             has ever been pushed, or whatever a stale build left behind.
+        now: Epoch seconds to judge freshness against, defaulting to the
+            current time.
 
     Returns:
         A `(status, task)` pair, falling back to `(Status.UNKNOWN, None)`.
@@ -149,6 +239,8 @@ def decode_status(raw: Any) -> tuple[Status, str | None]:
         except TypeError, ValueError:
             return Status.UNKNOWN, None
     if not isinstance(raw, Mapping):
+        return Status.UNKNOWN, None
+    if not is_fresh(raw.get(PUSHED_AT_KEY), now=now):
         return Status.UNKNOWN, None
 
     name = raw.get("status")
@@ -163,18 +255,19 @@ def decode_status(raw: Any) -> tuple[Status, str | None]:
     return status, task if isinstance(task, str) else None
 
 
-def line_for(raw: Any, width: int = DEFAULT_WIDTH) -> str:
+def line_for(raw: Any, width: int = DEFAULT_WIDTH, *, now: float | None = None) -> str:
     """Render the line a pane should show, from the raw variable value.
 
     Args:
         raw: As `decode_status`.
         width: Character budget. Clamped rather than validated, for the same
             reason `decode_status` is total.
+        now: Epoch seconds to judge freshness against.
 
     Returns:
         One line of text, always.
     """
-    status, task = decode_status(raw)
+    status, task = decode_status(raw, now=now)
     return render(status, task, max(1, width))
 
 
@@ -183,6 +276,8 @@ async def push_status(
     session_id: str,
     status: Status,
     task: str | None = None,
+    *,
+    now: float | None = None,
 ) -> str:
     """Push a pane's new state, as exactly one variable write.
 
@@ -195,12 +290,16 @@ async def push_status(
         session_id: The pane to write to.
         status: Its new status.
         task: What it is doing, if known.
+        now: Epoch seconds to stamp the payload with.
 
     Returns:
         The encoded payload, so a caller can suppress an unchanged push
-        without re-deriving it.
+        without re-deriving it. Note that two pushes of the same state are
+        **not** byte-equal, because the stamp moves: comparing payloads to
+        suppress a redundant write would suppress nothing. Compare the
+        `(status, task)` pair.
     """
-    payload = encode_status(status, task)
+    payload = encode_status(status, task, now=now)
     await set_variable(session_id, STATUS_VARIABLE, payload)
     return payload
 
@@ -236,6 +335,7 @@ async def render_for_session(
     ticker: RenderTicker,
     set_variable: SetVariable,
     width: int = DEFAULT_WIDTH,
+    now: float | None = None,
 ) -> str:
     """The body of the status bar coroutine, with its dependencies passed in.
 
@@ -253,11 +353,19 @@ async def render_for_session(
         ticker: Where render counts are kept.
         set_variable: The variable writer.
         width: Character budget.
+        now: Epoch seconds to judge the status's freshness against.
 
     Returns:
         The line to display.
+
+    Raises:
+        Exception: Whatever the render or the tick write raised. This is the
+            *inner* body and it is allowed to fail; `render_or_ladybug` is
+            the boundary that turns a failure into something displayable.
+            Keeping the raise here is what makes "the tick is not written
+            when no line was produced" an assertable claim.
     """
-    line = line_for(raw_status, width)
+    line = line_for(raw_status, width, now=now)
     if session_id:
         try:
             await set_variable(session_id, TICK_VARIABLE, ticker.advance(session_id))
@@ -266,6 +374,57 @@ async def render_for_session(
             # the user the line itself, which is the actual product.
             log.warning("could not write %s for %s", TICK_VARIABLE, session_id, exc_info=True)
     return line
+
+
+async def render_or_ladybug(
+    session_id: str | None,
+    raw_status: Any,
+    *,
+    ticker: RenderTicker,
+    set_variable: SetVariable,
+    width: int = DEFAULT_WIDTH,
+    now: float | None = None,
+) -> str:
+    """Render a pane's line, or say so visibly when that is not possible.
+
+    The boundary iTerm2 actually calls. `generic_handle_rpc` in the library
+    catches whatever escapes and reports an error back to iTerm2, which draws
+    its own ladybug -- so an uncaught raise is not silent, but the traceback
+    ends up in iTerm2's dialog rather than in Palaver's log, and nothing
+    headless can assert on it.
+
+    Catching here costs the user iTerm2's clickable error popover for this
+    class of failure. It buys a traceback in `.logs/palaver.log`, which is
+    where Palaver's other failures already are, and a return value tests can
+    assert. Registration failures and dropped connections never reach this
+    function and still get iTerm2's own ladybug, so the glyph means one thing
+    either way.
+
+    There is no cache in this path, deliberately. A failed render returns the
+    glyph and nothing else; the last good line is not held anywhere to fall
+    back on, because falling back on it would be the stale-value failure
+    arriving by a different route.
+
+    Args:
+        session_id: The pane being rendered, or `None` if iTerm2 did not say.
+        raw_status: The pane's `user.palaver_status` value.
+        ticker: Where render counts are kept.
+        set_variable: The variable writer.
+        width: Character budget.
+        now: Epoch seconds to judge the status's freshness against.
+
+    Returns:
+        The line to display, or `LADYBUG` if producing one raised.
+    """
+    try:
+        return await render_for_session(
+            session_id, raw_status, ticker=ticker, set_variable=set_variable, width=width, now=now
+        )
+    except Exception:
+        # Logged before the glyph is chosen: the glyph is all the user gets,
+        # and without the traceback there would be nothing to act on.
+        log.exception("status bar render failed for %s", session_id)
+        return LADYBUG
 
 
 def make_variable_writer(connection: Any) -> SetVariable:
@@ -334,7 +493,7 @@ def build_component(
         # `knobs` is required by the decorator even with no knobs declared:
         # it reflects on this signature to build the RPC.
         del knobs
-        return await render_for_session(
+        return await render_or_ladybug(
             session_id, status, ticker=ticks, set_variable=writer, width=width
         )
 
@@ -519,8 +678,10 @@ async def show_status_bar(profile: Any, *, shown: bool = True) -> None:
 
     Switching the status bar on changes what every pane using the profile
     looks like, so it is its own named step that a human asks for -- from
-    `palaver ui --selftest` or by hand -- rather than something attaching to
-    iTerm2 does on the way past. Palaver observes; it does not redecorate.
+    `palaver ui --enable-status-bar` or by hand -- rather than something
+    attaching to iTerm2 does on the way past. `palaver ui --selftest`
+    deliberately does not call this: it reports that the bar is off and
+    leaves the decision alone. Palaver observes; it does not redecorate.
 
     The library has no accessor for this key, so this goes through the
     generic setter it uses for every property it *does* name.

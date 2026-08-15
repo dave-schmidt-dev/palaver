@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from palaver.ui.component import (
     IDENTIFIER,
     LAYOUT_KEY,
     ORIGINAL_GUID_KEY,
+    PUSHED_AT_KEY,
     SHOW_BAR_KEY,
     STATUS_REFERENCE,
     STATUS_VARIABLE,
@@ -643,6 +645,19 @@ def _stub_status_bar_api(monkeypatch):
     return module
 
 
+def _stamped(payload: str, *, age: float = 0.0) -> str:
+    """Add task 5.5's freshness stamp to a hand-written payload.
+
+    Hand-written JSON is how these tests say things `encode_status` cannot
+    say — an unknown status name, a wrong type — and an unstamped payload now
+    decodes to `UNKNOWN` before any of that is looked at. The stamp keeps the
+    test about the thing it is about.
+    """
+    decoded = json.loads(payload)
+    decoded[PUSHED_AT_KEY] = time.time() - age
+    return json.dumps(decoded)
+
+
 def test_a_configured_profile_passes_the_layout_check():
     check = check_layout(_props(entries=[_plain_entry(IDENTIFIER)]), expected_guid=SHARED_GUID)
     assert check.ok
@@ -734,7 +749,13 @@ def test_a_state_change_emits_exactly_one_variable_write():
     assert len(writes.calls) == 1
     assert writes.calls[0][:2] == (PANE, STATUS_VARIABLE)
     assert writes.named(TICK_VARIABLE) == []
-    assert json.loads(payload) == {"status": "WORKING", "task": "reading a file"}
+
+    decoded = json.loads(payload)
+    # Still exact about the shape — task 5.5 added the stamp and nothing else,
+    # and a fourth key appearing unnoticed is what this pins.
+    assert set(decoded) == {"status", "task", PUSHED_AT_KEY}
+    assert (decoded["status"], decoded["task"]) == ("WORKING", "reading a file")
+    assert abs(decoded[PUSHED_AT_KEY] - time.time()) < 60, "the stamp is epoch seconds, now-ish"
 
 
 def test_the_render_tick_rises_with_each_render_of_the_same_pane():
@@ -804,9 +825,10 @@ def test_a_status_name_this_build_does_not_have_reads_as_unknown():
     is worth more to someone scanning a wall of panes than the status word
     it could not spell.
     """
-    assert decode_status('{"status": "TRANSCENDENT", "task": "x"}') == (Status.UNKNOWN, "x")
-    assert decode_status('{"status": "WORKING", "task": "x"}') == (Status.WORKING, "x")
-    assert line_for('{"status": "TRANSCENDENT", "task": "x"}') == "unknown: x"
+    unknown_name = _stamped('{"status": "TRANSCENDENT", "task": "x"}')
+    assert decode_status(unknown_name) == (Status.UNKNOWN, "x")
+    assert decode_status(_stamped('{"status": "WORKING", "task": "x"}')) == (Status.WORKING, "x")
+    assert line_for(unknown_name) == "unknown: x"
 
 
 def test_a_task_containing_the_separator_survives_the_round_trip():

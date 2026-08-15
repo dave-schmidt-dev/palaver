@@ -120,6 +120,21 @@ socket is absent, rather than falling back to the library's loopback TCP
 listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
 credential and is passed only through the environment, never on a command line.
 
+To check whether the pane surface actually works on this machine:
+
+```sh
+uv run palaver ui --selftest            # registers, round-trips a variable, renders
+uv run palaver ui --enable-status-bar   # turns the bar on; changes how every pane looks
+```
+
+The selftest reports rather than judges. A profile with the component not yet
+added to its status bar layout is normal on a fresh machine, so that exits 0
+with the remedy printed; it fails only for things Palaver owns — registration
+refused, a variable that will not round-trip, a render tick that does not
+advance. Adding the component to the layout is a one-time manual step in
+iTerm2 > Settings > Profiles > Session > Configure Status Bar, and turning the
+bar on is a separate flag because it changes what every pane looks like.
+
 Supervising the observer daemon is separate and needs no iTerm2:
 
 ```sh

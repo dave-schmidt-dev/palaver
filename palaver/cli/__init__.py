@@ -33,6 +33,7 @@ from palaver.cli import (
     observe,
     replay,
     status,
+    ui,
 )
 from palaver.logging_setup import setup_logging
 
@@ -48,6 +49,7 @@ SUBCOMMANDS = (
     observe,
     replay,
     status,
+    ui,
 )
 
 
