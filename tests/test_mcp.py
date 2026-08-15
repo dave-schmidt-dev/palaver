@@ -1125,11 +1125,17 @@ def test_paginating_to_exhaustion_returns_every_memory_exactly_once(store):
     for an offset cursor too, and prove nothing about the one that matters.
     """
     db_path, seeded = store
+    conn = _conn(db_path)
+    try:
+        before = len(read_memories(conn, session=seeded["session_ids"][0]))
+    finally:
+        conn.close()
     _fill_memories(db_path, seeded, count=500, size=6000)
 
     seen: list[str] = []
     cursor = None
     pages = 0
+    inserted = 0
     while True:
         conn = _conn(db_path)
         try:
@@ -1143,6 +1149,7 @@ def test_paginating_to_exhaustion_returns_every_memory_exactly_once(store):
             break
         assert pages < 100, "paging is not converging"
         _fill_memories(db_path, seeded, count=1, size=6000)  # observe, mid-read
+        inserted += 1
 
     assert pages > 1, "the fixture must be large enough to actually paginate"
     conn = _conn(db_path)
@@ -1154,6 +1161,15 @@ def test_paginating_to_exhaustion_returns_every_memory_exactly_once(store):
         conn.close()
     assert len(seen) == len(set(seen)), "a row came back twice"
     assert seen == expected, "the pages did not reconstruct the store in order"
+    # `expected` is read *after* the inserts, so `seen == expected` already
+    # fails if a mid-read write was skipped. This states the count outright
+    # anyway: the pair of lists could in principle agree while both being
+    # short, and "the concurrent writes were visible to a later page" is the
+    # property the whole test exists for. Naming it means a future change
+    # that quietly stops exercising concurrency fails here rather than
+    # passing as a quiescent-store test wearing this one's name.
+    assert inserted > 0, "no write landed mid-read, so nothing about concurrency was tested"
+    assert len(seen) == before + 500 + inserted
 
 
 def test_a_single_memory_over_the_budget_is_refused_rather_than_paged_forever(store):
@@ -1288,3 +1304,120 @@ async def _follow_cursors(url: str, session_key: str) -> list[dict]:
                 cursor = page["next_cursor"]
                 if cursor is None or len(pages) > 100:
                     return pages
+
+
+def test_paginate_wire_size_includes_the_framing_the_budget_is_measured_against():
+    """The budget is per *SSE event*, not per tool payload.
+
+    `httpx2` counts the `event:`/`data:` lines and everything the JSON-RPC
+    envelope adds around the result. A `wire_size` that returned only the
+    tool's own JSON would report a page as fitting when the event it becomes
+    does not — and with 25% headroom in the budget, no size-based test would
+    notice. Mutation testing found exactly that hole.
+    """
+    payload = {"scope": {"session": "demo/x"}, "memories": [{"statement": "y" * 1000}]}
+    inner = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode())
+    framed = pagination.wire_size(payload)
+    # `event: message\r\ndata: ` + `\r\n\r\n` is 26 bytes before the envelope
+    # keys, so anything at or below the bare payload is not counting them.
+    assert framed >= inner + 26
+
+    # The request id belongs to the transport, so a tool cannot know it and
+    # must model it at its widest. A one-digit placeholder would make this
+    # function under-report late in a long session, which is the one
+    # direction an estimate of a ceiling must never be wrong in.
+    actual = len(
+        (
+            "event: message\r\ndata: "
+            + json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4_294_967_295,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    payload, ensure_ascii=False, separators=(",", ":")
+                                ),
+                            }
+                        ],
+                        "isError": False,
+                    },
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\r\n\r\n"
+        ).encode()
+    )
+    assert framed >= actual, "wire_size under-reports once request ids grow past one digit"
+
+
+def test_a_paginate_cursor_from_an_older_encoding_is_refused_by_version(store):
+    """A version bump has to be the reason, not the scope check downstream.
+
+    Every malformed cursor in the test above also fails the scope
+    fingerprint, so the version check could be deleted and nothing would
+    fail. This builds a cursor whose fingerprint is *correct* and whose
+    version is not, which only the version check can catch. A future
+    encoding change would otherwise be read as if it were the current one.
+    """
+    _, seeded = store
+    echo = {"session": seeded["session_key"]}
+    forged = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "v": pagination._CURSOR_VERSION + 1,
+                    "s": pagination._scope_fingerprint(echo),
+                    "a": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+
+    with pytest.raises(pagination.CursorError) as excinfo:
+        pagination.decode_cursor(forged, echo)
+    assert "version" in str(excinfo.value)
+
+
+def test_paginating_a_project_scope_to_exhaustion_returns_every_memory_once(store):
+    """The project branch has its own query, and its own chance to lose the keyset.
+
+    `read_memories` builds two separate SQL statements. The session one is
+    covered above; a keyset dropped from the project one would re-read from
+    the start every page and loop, or duplicate rows, with nothing else
+    noticing. Mutation testing found this branch uncovered.
+    """
+    db_path, seeded = store
+    _fill_memories(db_path, seeded, count=500, size=6000)
+
+    seen: list[int] = []
+    cursor = None
+    pages = 0
+    while True:
+        conn = _conn(db_path)
+        try:
+            page = tools_read.recall(conn, {"project": "demo"}, cursor)
+        finally:
+            conn.close()
+        seen.extend(memory["id"] for memory in page["memories"])
+        pages += 1
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+        assert pages < 100, "project-scoped paging is not converging"
+
+    assert pages > 1, "the fixture must be large enough to actually paginate"
+    conn = _conn(db_path)
+    try:
+        expected = [row["id"] for row in read_memories(conn, project="demo")]
+    finally:
+        conn.close()
+    assert seen == expected
+    assert len(seen) == len(set(seen))

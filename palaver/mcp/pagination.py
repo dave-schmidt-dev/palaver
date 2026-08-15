@@ -64,6 +64,13 @@ RESPONSE_BUDGET = 768 * 1024
 #: refused by name instead of being misread as a new one.
 _CURSOR_VERSION = 1
 
+#: A stand-in for the JSON-RPC request id in `wire_size`'s envelope, wide
+#: enough that no real session's id is wider. The actual id is not knowable
+#: from inside a tool — it belongs to the transport — so it is modelled at
+#: its maximum. Erring long costs 19 bytes; erring short means the estimate
+#: says a page fits and the wire disagrees.
+_WIDEST_REQUEST_ID = 9_999_999_999_999_999_999
+
 
 class CursorError(ValueError):
     """A cursor that is malformed, stale, or from a different question."""
@@ -173,6 +180,13 @@ def wire_size(payload: Mapping[str, Any]) -> int:
     JSON; over a pathological all-quotes payload it is 1.851x. A row budget
     calibrated on the first would be 70% over on the second.
 
+    The request `id` is modelled at its widest rather than at `0`. A live
+    session's ids increment, so a one-digit placeholder makes this function
+    *under*-report by a few bytes late in a long session — the one direction
+    an estimator of a ceiling must never err in. `_WIDEST_REQUEST_ID` costs
+    19 bytes against a 256 KiB gap to the real limit, which is the right
+    trade for never being optimistic.
+
     Args:
         payload: The dict the tool is about to return.
 
@@ -182,7 +196,7 @@ def wire_size(payload: Mapping[str, Any]) -> int:
     inner = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     envelope = {
         "jsonrpc": "2.0",
-        "id": 0,
+        "id": _WIDEST_REQUEST_ID,
         "result": {"content": [{"type": "text", "text": inner}], "isError": False},
     }
     framed = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
@@ -226,6 +240,14 @@ def paginate(
             unless the incremental sizing below has drifted from `wire_size`;
             it is checked on the real serialized payload because that is the
             only check that cannot be fooled by an estimator bug.
+
+            **No test kills a mutant that deletes this assertion, and none
+            can.** The incremental sizing is exact today, so the branch never
+            fires and its removal is unobservable. It is kept as a guard
+            against a future change to either `wire_size` or the per-row
+            accounting drifting apart silently — the case where the estimate
+            says a page fits and the wire says otherwise. Recorded here
+            rather than reported as a killed mutant it is not.
     """
     # Reserve for a cursor rather than for `null`: a page that fills to the
     # budget and *then* discovers it needs a ~60-byte token would go over.
