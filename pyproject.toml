@@ -7,6 +7,17 @@ name = "palaver"
 version = "0.1.0"
 description = "Local-first observer, memory, and situational awareness"
 requires-python = ">=3.14"
+# Palaver's first runtime dependency, and the only one. The version was
+# verified against `pypi.org/pypi/mcp/json` on 2026-08-15 rather than pinned
+# from memory: v2 renamed `FastMCP` to `MCPServer` with no back-compat alias,
+# so a stale pin fails at import rather than at review. The upper bound is
+# deliberate — v2 was itself a rework of v1, and the next major will be too.
+#
+# This pulls `httpx2`, `starlette`, and `uvicorn` in transitively. That is the
+# first third-party code in the tree that can open a socket, which is why
+# INV-9's gate now states the layer it covers; see `INVARIANTS.md` INV-9 and
+# `tests/test_invariants.py::test_the_http_client_gate_does_not_see_dependencies`.
+dependencies = ["mcp>=2.0.0,<3"]
 
 [project.scripts]
 palaver = "palaver.cli:main"

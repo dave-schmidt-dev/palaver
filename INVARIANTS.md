@@ -117,6 +117,8 @@ rationale: Tier-1 provenance means "the user said this", and it is the tier ever
 ### INV-9 — Observed-session content never leaves this machine
 area: ["palaver/**/*.py", "pyproject.toml", "tests/fixtures/**"]
 gate_test: tests/test_invariants.py::test_no_outbound_http_clients
+gate_test: tests/test_invariants.py::test_the_http_client_gate_does_not_see_dependencies
+gate_test: tests/test_invariants.py::test_the_runtime_dependency_set_is_an_allowlist
 gate_test: tests/test_fixture_lint.py::test_unclassified_record_fails
 threshold: 3
 rationale: The brief's first engineering preference and the reason the whole design tolerates a 4B
@@ -128,6 +130,19 @@ rationale: The brief's first engineering preference and the reason the whole des
   (1) **Sockets.** The only ones opened are `127.0.0.1` inference and the local MCP listener. No
   telemetry, no crash reporting, no model API that is not local. The database is gitignored and must
   never sit in a cloud-synced path.
+  **Which layer the socket gate covers, stated plainly:** `test_no_outbound_http_clients` is a static
+  AST scan of first-party source (`palaver/**`) and nothing else. It proves Palaver's own code
+  constructs no outbound HTTP client. It does **not**, and cannot, constrain what a dependency does —
+  task 6.1's `mcp` pulls `httpx2` transitively, so an outbound client is now installed and reachable
+  in this environment for the first time. The scan's blind spot is pinned by
+  `test_the_http_client_gate_does_not_see_dependencies` rather than left to be discovered. What covers
+  the dependency layer instead is an allowlist: `test_the_runtime_dependency_set_is_an_allowlist`
+  compares `pyproject.toml`'s declared runtime dependencies against a named set, each entry carrying
+  the reason that package may open sockets on Palaver's behalf. Adding a dependency therefore fails
+  the gate until it is declared and justified. The claim that buys is not "dependencies are safe" —
+  no test can vendor an opinion about every transitive package — but "no dependency arrives
+  unreviewed", which is checkable and is what actually controls the risk. A passing source scan
+  means "Palaver does not phone home", never "nothing in this process can".
   (2) **Git.** Test fixtures are transcripts, so a committed fixture is an export. A record ships
   only if it matches a structural shape carrying no free text, or its free-text payload was replaced
   with prose written for the fixture; `palaver fixture-lint` enforces that as an allowlist and fails

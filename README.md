@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** pre-implementation. Research and planning are done; Phase 1 of the implementation is starting now. There is no working system yet.
+**Status:** in progress, and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, and the Codex/OpenCode adapters are built and tested; the MCP read surface is landing now. Pagination, the single-writer socket, and `palaver_correct` are still to come.
 
 ## Problem
 
@@ -48,6 +48,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 | `palaver/ingest/adapters/` | One adapter per agent session store. |
 | `palaver/observer/` | Deterministic signals and status derivation. |
 | `palaver/memory/` | Append-only memory with provenance tiers. |
+| `palaver/mcp/` | The MCP read surface other agents query. |
 | `palaver/cli/` | `palaver status`, `inspect`, and friends. |
 | `tests/` | Test suite, including a sanitized transcript fixture corpus. |
 | `INVARIANTS.md` | The system contract. Read this before changing behavior. |
@@ -75,7 +76,6 @@ Test fixtures are transcripts, so the corpus is sanitized under an **allowlist**
 - The iTerm2 status bar rendering budget — iTerm2 documents no character limit, only a user-configurable width in points.
 - Whether the iTerm2 API can prove a status bar component is *registered and attached*, as opposed to merely round-tripping a variable.
 - Whether a 30–60s observer tick feels live in actual use.
-- Whether one MCP server over Streamable HTTP sustains 6 concurrent local clients.
 - Whether the structural turn boundary is *correct*, not merely computable on 100% of transcripts.
 
 ## Development
@@ -142,6 +142,37 @@ on disk, and pushes on a heartbeat. The heartbeat is the point rather than an
 implementation detail — a status carries the time it was pushed, and one that
 stops being refreshed stops being shown, so a publisher that skipped an
 unchanged status would blank the pane of an agent working steadily.
+
+## Serving memory to other agents
+
+Palaver exposes its memory to Claude Code, Codex, and anything else that
+speaks MCP:
+
+```sh
+uv run palaver mcp                       # serve on http://127.0.0.1:8787/mcp
+uv run palaver mcp --selftest --clients 6   # prove it serves six at once
+```
+
+**Streamable HTTP, not stdio.** stdio is subprocess-per-client, so six
+attached agents would be six processes writing one SQLite file — the opposite
+of the single-writer property the memory layer rests on. One HTTP server at a
+fixed localhost endpoint keeps the process count at one however many agents
+connect, and a Palaver restart is invisible to them because clients
+reconnect HTTP transports automatically.
+
+Every read tool requires an explicit scope of exactly one of
+`{project: <name>}` or `{session: <session_key>}`. There is no default, on
+purpose: project memory returned where session memory was meant reads exactly
+as authoritative as the right answer, and nothing downstream can tell the
+difference. Session keys are the `<project>/<session-id>` form `palaver
+status` prints; `palaver_sessions` lists them, and an internal rowid is
+refused rather than resolved.
+
+Register it once:
+
+```sh
+claude mcp add --transport http palaver http://127.0.0.1:8787/mcp
+```
 
 Supervising the observer daemon is separate and needs no iTerm2:
 

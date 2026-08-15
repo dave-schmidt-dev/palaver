@@ -49,7 +49,9 @@ calls `open(`/`os.open` directly — every read must go through
 from __future__ import annotations
 
 import ast
+import re
 import sqlite3
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -242,19 +244,25 @@ def test_open_guarded_readonly_uses_mode_ro_uri(fixture_opencode_db, monkeypatch
 # INV-9 — no Phase 1 module constructs an outbound HTTP client
 # =============================================================================
 
-#: Modules whose presence anywhere in the Phase 1 import graph is a
-#: violation. `urllib.request` is stdlib and always "installed"; `httpx`,
-#: `requests`, and `openai` are third-party and (checked directly, see
-#: CONCERNS in the task report) not installed in this environment at all.
-FORBIDDEN_HTTP_MODULES = ("httpx", "requests", "urllib.request", "openai")
+#: Modules whose presence anywhere in first-party source is a violation.
+#: `urllib.request` is stdlib and always "installed"; the rest are
+#: third-party. `httpx2` is listed separately from `httpx` on purpose: the
+#: matcher below keys on the exact dotted name, so `httpx` does not cover
+#: `httpx2`, and task 6.1's `mcp` dependency put a real `httpx2` in this
+#: environment for the first time. A list that had silently stopped covering
+#: the one HTTP client actually installed would be worse than no list.
+FORBIDDEN_HTTP_MODULES = ("httpx", "httpx2", "requests", "urllib.request", "openai")
 
 
 def _phase1_source_paths() -> list[Path]:
-    """Every `.py` file in the Phase 1 import graph.
+    """Every first-party `.py` file.
 
-    Nothing under a later-phase package (`palaver/memory/`, an inference
-    client, an MCP server) exists yet, so the whole `palaver` package as it
-    stands today *is* the Phase 1 import graph.
+    Written for Phase 1, when the whole package was the Phase 1 import
+    graph. It still sweeps the entire package, so the later phases that have
+    since landed — `palaver/memory/`, the inference client, `palaver/mcp/` —
+    are covered without the sweep needing to enumerate them. What it does
+    *not* cover is anything outside `palaver/`; see
+    `test_the_http_client_gate_does_not_see_dependencies`.
     """
     return sorted(PALAVER_ROOT.rglob("*.py"))
 
@@ -354,6 +362,75 @@ def test_no_outbound_http_clients_check_is_not_vacuous(tmp_path):
     clean = tmp_path / "clean.py"
     clean.write_text("import json\nimport os\n\ndef f():\n    return json.dumps({})\n")
     assert count_http_client_references([clean]) == {name: 0 for name in FORBIDDEN_HTTP_MODULES}
+
+
+@pytest.mark.inv9
+def test_the_http_client_gate_does_not_see_dependencies():
+    """States the layer this gate covers, so the limit is known rather than assumed.
+
+    Task 6.1 added `mcp`, which pulls `httpx2` transitively — the first
+    third-party code in this environment that can open an outbound socket.
+    The gate above is a static scan of `palaver/**` and therefore cannot say
+    anything about it. That is a real limit, and the honest response is to
+    pin it with a test rather than to let the passing gate read as a
+    guarantee it never made.
+
+    What INV-9 actually rests on for dependencies is different and stronger:
+    the dependency list is one line of `pyproject.toml`, itself inside
+    INV-9's declared area, so adding a package is a reviewable event. This
+    test asserts the scan's blind spot exists exactly where that review
+    takes over.
+    """
+    import httpx2  # noqa: PLC0415 - imported to prove it is installed and reachable
+
+    assert httpx2.AsyncClient is not None
+
+    # Installed and importable, yet the first-party sweep reports zero —
+    # because no file under `palaver/` imports it.
+    counts = count_http_client_references(_phase1_source_paths())
+    assert counts["httpx2"] == 0
+
+    # And the gate would not have caught it had the reference been in a
+    # dependency: the sweep never visits a path outside `palaver/`.
+    dependency_path = Path(httpx2.__file__)
+    assert PALAVER_ROOT not in dependency_path.parents
+    assert dependency_path not in _phase1_source_paths()
+
+
+#: Every runtime dependency Palaver is allowed to declare, and why it is
+#: allowed. An entry here is a decision that this package may open sockets on
+#: Palaver's behalf; `mcp` may, because INV-9 permits exactly one local MCP
+#: listener and that listener is what this package is.
+RUNTIME_DEPENDENCY_ALLOWLIST = {"mcp": "the local MCP listener INV-9 permits, task 6.1"}
+
+
+@pytest.mark.inv9
+def test_the_runtime_dependency_set_is_an_allowlist():
+    """INV-9 at the layer the source scan cannot reach.
+
+    The scan above proves Palaver's own code opens nothing. Nothing proves
+    the same of a dependency, and no test can without vendoring an opinion
+    about every transitive package. What *is* checkable, and what actually
+    controls the risk, is the declared set: a new runtime dependency is one
+    line of `pyproject.toml`, and this fails until that line is added here
+    too, with a reason.
+
+    So the gate is not "dependencies are safe" — it is "no dependency
+    arrives unreviewed". That is a claim this test can actually keep.
+    """
+    pyproject = tomllib.loads((PALAVER_ROOT.parent / "pyproject.toml").read_text())
+    declared = pyproject["project"].get("dependencies", [])
+
+    # Names only; the version pin is 6.1's business, not this invariant's.
+    names = {re.split(r"[<>=!~\[ ]", spec, maxsplit=1)[0].strip() for spec in declared}
+    assert names == set(RUNTIME_DEPENDENCY_ALLOWLIST), (
+        f"undeclared runtime dependency change: {names ^ set(RUNTIME_DEPENDENCY_ALLOWLIST)}. "
+        "Add it to RUNTIME_DEPENDENCY_ALLOWLIST with the reason it may open sockets."
+    )
+
+    # Positive control: the parser really does extract a name from a pin,
+    # so an allowlist that matched by accident would be visible here.
+    assert re.split(r"[<>=!~\[ ]", "mcp>=2.0.0,<3", maxsplit=1)[0] == "mcp"
 
 
 # =============================================================================

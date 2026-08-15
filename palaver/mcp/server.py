@@ -1,0 +1,153 @@
+"""The `MCPServer` instance, its transport, and how a tool reaches SQLite.
+
+**Every tool call opens its own read-only connection and closes it.** The
+2026-07-28 protocol revision removed session state, so there is no
+per-connection place to keep a handle even if holding one were wise — and it
+is not: one long-lived connection shared across six concurrent clients
+serialises them behind a single cursor, and a connection that outlives a
+`palaver observe` restart reads a database file that has since been replaced
+underneath it.
+
+**Read-only at the SQLite layer, not merely by convention.** The tools here
+only read, but "only reads" is a property of the code as written, which the
+next task can change without noticing. Opening `mode=ro` makes the database
+itself refuse a write, so the read surface stays a read surface even if a
+future tool forgets. Task 6.3's `palaver_correct` writes through the
+daemon's single-writer socket rather than through this connection, which is
+exactly why this one can stay closed to writes.
+
+A missing database is an error rather than an empty answer: `palaver status`
+with no store behind it should say so, not report that this machine has no
+memories.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from mcp.server import MCPServer
+
+from palaver.mcp import tools_read
+
+log = logging.getLogger(__name__)
+
+#: The server name clients see, and the name `claude mcp add` registers.
+SERVER_NAME = "palaver"
+
+#: Bound to loopback and nowhere else. INV-9 permits exactly one local MCP
+#: listener; a server reachable off-machine would make the aggregated store
+#: of every observed session remotely queryable.
+DEFAULT_HOST = "127.0.0.1"
+
+#: The default port. Fixed rather than ephemeral because clients register a
+#: URL once in `~/.claude.json` or `~/.codex/config.toml` and a port that
+#: moved on every restart would break every registration.
+DEFAULT_PORT = 8787
+
+#: The HTTP path the Streamable HTTP transport is mounted at.
+DEFAULT_PATH = "/mcp"
+
+INSTRUCTIONS = (
+    "Palaver observes coding-agent sessions on this machine and keeps "
+    "evidence-backed memory about them. Every read tool requires an explicit "
+    "scope of exactly one of {project: <name>} or {session: <session_key>}; "
+    "scope is never defaulted, because a project-wide answer returned where a "
+    "session was meant is indistinguishable from the right one. Session keys "
+    "look like <project>/<session-id> and can be listed with palaver_sessions."
+)
+
+
+def open_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open Palaver's database read-only.
+
+    Args:
+        db_path: The database file.
+
+    Returns:
+        A connection that will refuse writes.
+
+    Raises:
+        FileNotFoundError: `db_path` does not exist. Reported by name rather
+            than as an empty result set — "no database" and "a database with
+            nothing in it" are different answers to every tool here.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"no Palaver database at {db_path}. Run `palaver observe` first, or pass --db."
+        )
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def build_server(
+    db_path: Path,
+    *,
+    name: str = SERVER_NAME,
+    connect: Callable[[Path], sqlite3.Connection] = open_readonly,
+) -> MCPServer:
+    """Build the server with every read tool registered.
+
+    Args:
+        db_path: The database each tool call reads.
+        name: The server name clients see.
+        connect: Connection factory, injected so a test can hand in an
+            already-populated in-memory database.
+
+    Returns:
+        The configured `MCPServer`. The Streamable HTTP app is not built
+        here — `streamable_http_app()` is what creates the session manager,
+        and building it eagerly would tie server construction to a transport
+        a caller might not want yet.
+    """
+    server = MCPServer(name=name, instructions=INSTRUCTIONS)
+
+    def _register(tool_name: str, handler: Callable[[sqlite3.Connection, Any], dict]) -> None:
+        # Bound in a closure per tool rather than in the loop body directly:
+        # a late-binding `handler` would register every tool against the last
+        # one in the mapping, and every tool would answer identically.
+        def _call(scope: dict[str, str]) -> dict[str, Any]:
+            conn = connect(db_path)
+            try:
+                return handler(conn, scope)
+            finally:
+                conn.close()
+
+        _call.__name__ = tool_name
+        _call.__doc__ = handler.__doc__
+        server.add_tool(_call, name=tool_name, structured_output=False)
+
+    for tool_name, handler in tools_read.READ_TOOLS.items():
+        _register(tool_name, handler)
+
+    return server
+
+
+def build_app(
+    db_path: Path,
+    *,
+    host: str = DEFAULT_HOST,
+    path: str = DEFAULT_PATH,
+    connect: Callable[[Path], sqlite3.Connection] = open_readonly,
+) -> tuple[MCPServer, Any]:
+    """Build the server and its Streamable HTTP ASGI app together.
+
+    Returns both because they are not independently useful: the session
+    manager only exists once the app has been built, so a caller handed only
+    the server cannot serve it, and a caller handed only the app cannot
+    inspect what it registered.
+
+    Args:
+        db_path: The database each tool call reads.
+        host: Interface to advertise; loopback by default.
+        path: HTTP path to mount the transport at.
+        connect: Connection factory, injected for tests.
+
+    Returns:
+        A `(server, app)` pair, where `app` is a Starlette application.
+    """
+    server = build_server(db_path, connect=connect)
+    app = server.streamable_http_app(streamable_http_path=path, host=host)
+    return server, app
