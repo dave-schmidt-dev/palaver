@@ -560,6 +560,54 @@ def test_system_records_render_a_line_with_no_chunk_to_anchor_it(tmp_path):
     assert "".join(content for _, content in rows) != full
 
 
+def test_fts_index_stays_consistent_when_a_store_mixes_content_rules(tmp_path):
+    """A store holding both raw-JSON and normalized chunks keeps a valid FTS index.
+
+    `transcript_chunks.content` is an FTS5 *external-content* column
+    (`palaver/store/schema.py`), whose shadow index is not rebuilt
+    automatically -- so the question is whether changing what replay writes
+    can desync a store that already holds rows written the old way. It
+    cannot: the index is maintained by an `AFTER INSERT` trigger, so every
+    row was indexed from the bytes it actually holds, and replay only ever
+    inserts chunks (never updates or deletes one). This test builds the
+    mixed store on purpose -- a normalized row from `replay()`, then a
+    raw-JSON row inserted directly, which fires the identical trigger the
+    pre-change code path fired -- and asserts FTS5's own `integrity-check`
+    accepts the result. Nothing in the package issues a `rebuild`, and this
+    is the measurement saying none is needed.
+    """
+    fixture = _write_session(tmp_path, [_user_text_record("alpha migration")])
+    db_path = tmp_path / "store" / "replay.db"
+    replay(fixture, db_path, now=NOW)
+
+    conn = connect(db_path)
+    try:
+        stale = json.dumps(_user_text_record("beta rollout"), sort_keys=True)
+        conn.execute(
+            "INSERT INTO transcript_chunks(session_id, seq, role, content) VALUES (?, ?, ?, ?)",
+            (1, 99, "user", stale),
+        )
+        conn.commit()
+
+        # FTS5 raises if the index disagrees with the content table.
+        conn.execute(
+            "INSERT INTO transcript_chunks_fts(transcript_chunks_fts) VALUES('integrity-check')"
+        )
+
+        def matches(term: str) -> int:
+            row = conn.execute(
+                "SELECT count(*) FROM transcript_chunks_fts WHERE transcript_chunks_fts MATCH ?",
+                (term,),
+            ).fetchone()
+            return row[0]
+
+        assert matches("alpha") == 1  # the normalized row is searchable
+        assert matches("beta") == 1  # so is the raw-JSON one, from its own bytes
+        assert matches("HUMAN") == 1  # only the normalized row carries the channel tag
+    finally:
+        conn.close()
+
+
 # --- CLI: palaver replay -----------------------------------------------------
 
 
