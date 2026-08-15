@@ -1294,3 +1294,123 @@ def _free_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+#: Takes the writer lock and nothing else -- no socket, no listener. The only
+#: thing that can refuse a daemon against this is the `flock` itself.
+_LOCK_ONLY = """
+import fcntl, os, sys, time
+from pathlib import Path
+from palaver.observer.socket import lock_path_for
+
+db_path = Path(sys.argv[1])
+db_path.parent.mkdir(parents=True, exist_ok=True)
+fd = os.open(lock_path_for(db_path), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+print("LOCKED", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+def test_the_lock_alone_refuses_a_second_daemon_when_no_socket_exists_yet(short_tmp):
+    """The case the lock exists for, and the one the other tests never reach.
+
+    `test_a_second_daemon_refuses_to_start_while_the_first_still_serves` was
+    passing on the *connect probe*: the first daemon was already listening,
+    so the intruder was turned away by a successful connect and the `flock`
+    was never the reason. Deleting the `flock` outright left that test green
+    -- which mutation testing found and no amount of reading would have.
+
+    Here there is no socket at all, which is the state two daemons racing
+    from cold start are both in. The lock is the only thing that can refuse,
+    so if it is not taken, the second daemon binds and there are two writers.
+    """
+    db_path = short_tmp / "palaver.db"
+    socket_path = writer_socket.socket_path_for(db_path)
+
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_ONLY, str(db_path), "30"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert _line_within(holder, 30.0) == "LOCKED"
+        assert not socket_path.exists(), "the fixture must leave no socket to probe"
+
+        second = subprocess.run(
+            [sys.executable, "-c", _HOLDER, str(db_path), "1"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert second.returncode != 0, "a second daemon started with the lock already held"
+        assert "DaemonAlreadyRunningError" in second.stdout, second.stdout + second.stderr
+        assert not socket_path.exists(), "the refused daemon bound a socket anyway"
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_a_daemon_starts_once_that_lock_is_released(short_tmp):
+    """The positive control: the refusal above is the lock, not the path.
+
+    Without this, a `single_writer` that refused every start for an
+    unrelated reason -- a permissions problem on the lock file, say --
+    would satisfy the test above perfectly.
+    """
+    db_path = short_tmp / "palaver.db"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_ONLY, str(db_path), "0.1"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert _line_within(holder, 30.0) == "LOCKED"
+    holder.wait(timeout=30)
+
+    started = subprocess.run(
+        [sys.executable, "-c", _HOLDER, str(db_path), "0.1"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    assert "HELD" in started.stdout
+
+
+def test_correcting_a_memory_with_no_evidence_names_the_evidence_as_the_problem(short_tmp):
+    """INV-6 is refused either way; what is under test is the diagnosis.
+
+    Without the explicit check the write still fails -- `write_memory`
+    raises on empty evidence -- but it reports "evidence must not be empty"
+    about a memory the caller never mentioned, which sends a reader looking
+    at the wrong row. The store is equally safe and the message is useless.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+
+    # INV-6 is enforced in Python, not by the schema (TASKS.md Task 13's
+    # sibling), so a row with no evidence is reachable on a raw connection --
+    # which is exactly the inconsistent store this branch reports on.
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("DELETE FROM memory_evidence WHERE memory_id = ?", (memory_id,))
+        raw.commit()
+    finally:
+        raw.close()
+
+    conn = connect(db_path)
+    try:
+        reply = writer_socket.apply_request(
+            conn, {"op": "correct", "memory_id": memory_id, "statement": "no evidence to inherit"}
+        )
+    finally:
+        conn.close()
+
+    assert reply["ok"] is False
+    assert "evidence to inherit" in reply["detail"], reply
+    assert str(memory_id) in reply["detail"], "the message names no memory"
+    assert _row_count(db_path) == 1

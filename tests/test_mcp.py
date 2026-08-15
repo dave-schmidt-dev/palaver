@@ -1728,3 +1728,51 @@ def test_correcting_an_already_superseded_memory_is_refused_before_the_prompt(st
     with pytest.raises(LookupError, match="already superseded"):
         _correct(db_path, ctx, seeded["memory_id"], "a second correction")
     assert ctx.message is None
+
+
+def test_a_refusal_from_the_daemon_is_not_reported_as_a_successful_correction(store, monkeypatch):
+    """The branch a live daemon almost never takes, and must not get wrong.
+
+    Consent given and the daemon reachable is the path where everything
+    looks fine; if the daemon then refuses -- the memory was superseded by
+    someone else in between, the store is inconsistent -- reporting its
+    `{"ok": false}` verbatim as the tool's result reads as success, and the
+    caller believes a correction landed that did not.
+
+    The refusal is injected because provoking it against a real daemon means
+    winning a race deliberately, and a test that depended on winning one
+    would be the flaky kind.
+    """
+    db_path, seeded = store
+    monkeypatch.setattr(
+        tools_write,
+        "request",
+        lambda *_args, **_kwargs: {"ok": False, "error": "IntegrityError", "detail": "refused"},
+    )
+
+    with pytest.raises(tools_write.WriteRefused) as excinfo:
+        _correct(db_path, _StubContext(), seeded["memory_id"], "the daemon will refuse this")
+    assert "IntegrityError" in str(excinfo.value)
+    assert "refused" in str(excinfo.value)
+
+
+def test_an_accepted_reply_from_the_daemon_is_returned_to_the_caller(store, monkeypatch):
+    """The positive control for the refusal above.
+
+    Without it, a `correct` that raised on *every* reply would pass the test
+    above and never write anything at all.
+    """
+    db_path, seeded = store
+    monkeypatch.setattr(
+        tools_write,
+        "request",
+        lambda *_args, **_kwargs: {"ok": True, "memory_id": 99, "supersedes": seeded["memory_id"]},
+    )
+
+    result = _correct(db_path, _StubContext(note="looks right"), seeded["memory_id"], "corrected")
+    assert result["ok"] is True
+    assert result["memory_id"] == 99
+    assert result["note"] == "looks right"
+    # The caller sees what they replaced, so a correction is auditable from
+    # the reply alone without a second round trip to read the old row.
+    assert result["superseded_statement"] == "the first session decided to use SQLite"
