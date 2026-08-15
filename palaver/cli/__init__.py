@@ -22,11 +22,21 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from palaver.cli import diagnose, doctor, eval, fixture_lint, inspect, observe, replay, status
+from palaver.cli import (
+    bench,
+    diagnose,
+    doctor,
+    eval,
+    fixture_lint,
+    inspect,
+    observe,
+    replay,
+    status,
+)
 from palaver.logging_setup import setup_logging
 
 #: Every registered subcommand module, in help-listing order.
-SUBCOMMANDS = (diagnose, doctor, eval, fixture_lint, inspect, observe, replay, status)
+SUBCOMMANDS = (bench, diagnose, doctor, eval, fixture_lint, inspect, observe, replay, status)
 
 
 def build_parser() -> argparse.ArgumentParser:

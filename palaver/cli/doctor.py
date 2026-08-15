@@ -17,9 +17,13 @@ llama.cpp's `/props` endpoint carries no invocation. Its keys are `bos_token`,
 `model_alias`, `model_ftype`, `model_path`, `total_slots`, `ui`, and
 `ui_settings` — verified against the running server and against
 `tools/server/server-context.cpp` on 2026-08-15. There is no `argv`, no
-`cmdline`, no `params`. Recovering the literal argv would mean going outside
-HTTP entirely (port to pid, pid to `ps`), which is untestable without a real
-local server, unavailable when the server is not on this machine, and prints
+`cmdline`, and no top-level `params`. The one nested `params` object,
+`default_generation_settings.params`, was re-read live the same day and holds
+sampling settings (`temperature`, `top_k`, `seed`, `samplers`) — nothing about
+the invocation, and in particular no `slot_save_path`. Recovering the literal
+argv would mean going outside HTTP entirely (port to pid, pid to `ps`), which
+is untestable without a real local server, unavailable when the server is not
+on this machine, and prints
 another process's full command line for no gain the report below does not
 already deliver. So the flag keeps the plan's name and the report states plainly
 what it is showing: the *effective* configuration, observed, not the invocation.
