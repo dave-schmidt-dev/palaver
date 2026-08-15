@@ -32,12 +32,16 @@ could just as well mean the kill never landed.
 
 from __future__ import annotations
 
+import concurrent.futures
+import ctypes
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -59,6 +63,12 @@ from palaver.cli.install_agent import (
     service_target,
     wait_for_new_pid,
     wait_for_running_pid,
+)
+from palaver.observer import socket as writer_socket
+from palaver.observer.socket import (
+    DaemonAlreadyRunningError,
+    NonLocalFilesystemError,
+    single_writer,
 )
 
 #: Never `DEFAULT_LABEL`. See the module docstring.
@@ -582,3 +592,273 @@ def test_the_selftest_label_is_never_the_one_a_user_installs():
     """Guards the isolation the rest of the live tests depend on."""
     assert SELFTEST_LABEL != DEFAULT_LABEL
     assert domain_target().startswith("gui/")
+
+
+# ---------------------------------------------------------------------------
+# Task 6.3: the single-writer lock, the socket, and the order between them.
+#
+# The interesting failures here are all races, so most of these tests use real
+# processes rather than monkeypatched primitives. A `flock` mocked out proves
+# nothing about a `flock` -- the whole question is what the kernel does when
+# two processes ask at once.
+#
+# None of them use `tmp_path`. pytest's is ~90 bytes before the test's own
+# name is appended, and `sun_path` holds 103 -- so every socket test would
+# fail on the path length rather than on the property it is checking. That is
+# not a test-only quirk: it is the same limit a user with a deeply nested
+# project hits, which is why `socket_path_for` reports it by name.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def short_tmp():
+    """A scratch directory short enough to hold an `AF_UNIX` socket."""
+    directory = Path(tempfile.mkdtemp(prefix="plv", dir="/tmp"))  # noqa: S108
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+#: Holds the writer role and reports what happened, so a parent can assert on
+
+#: Holds the writer role and reports what happened, so a parent can assert on
+#: a *second* process's outcome rather than on a same-process call that shares
+#: this one's file descriptors. `flock` is per-open-file-description: two
+#: `single_writer` calls inside one interpreter would each get their own
+#: descriptor and would in fact conflict, but relying on that would leave the
+#: cross-process case -- the only one that matters in production -- untested.
+_HOLDER = """
+import sys, time
+from pathlib import Path
+from palaver.observer.socket import single_writer
+
+db_path = Path(sys.argv[1])
+try:
+    with single_writer(db_path) as server:
+        print("HELD", flush=True)
+        time.sleep(float(sys.argv[2]))
+except Exception as exc:
+    print(f"REFUSED {type(exc).__name__}: {exc}", flush=True)
+    sys.exit(3)
+"""
+
+
+def _holder(db_path, seconds=30.0):
+    """Start a writer-role holder and wait until it actually holds it."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(db_path), str(seconds)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    line = _line_within(proc, 30.0)
+    assert line == "HELD", f"holder did not take the role: {line!r}"
+    return proc
+
+
+def _line_within(proc, deadline):
+    """One line of stdout, or a failure -- never an unbounded wait."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(proc.stdout.readline).result(timeout=deadline).strip()
+    except concurrent.futures.TimeoutError:
+        proc.kill()
+        raise AssertionError(f"no output within {deadline}s") from None
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_a_second_daemon_refuses_to_start_while_the_first_still_serves(short_tmp):
+    """The property the whole architecture rests on.
+
+    Two writers on one SQLite file is not a performance problem, it is a
+    correctness one, and nothing downstream can detect it after the fact.
+    """
+    db_path = short_tmp / "palaver.db"
+    first = _holder(db_path)
+    try:
+        second = subprocess.run(
+            [sys.executable, "-c", _HOLDER, str(db_path), "1"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert second.returncode != 0, "a second daemon started alongside the first"
+        assert "DaemonAlreadyRunningError" in second.stdout
+        assert first.poll() is None, "the first daemon died, so this proved nothing"
+    finally:
+        first.kill()
+        first.wait(timeout=10)
+
+
+def test_the_writer_role_is_released_when_the_first_daemon_exits(short_tmp):
+    """The positive control for the test above.
+
+    Without it, "the second process exited non-zero" would be equally
+    consistent with a lock that can never be taken by anyone.
+    """
+    db_path = short_tmp / "palaver.db"
+    first = _holder(db_path, seconds=0.1)
+    first.wait(timeout=30)
+
+    second = subprocess.run(
+        [sys.executable, "-c", _HOLDER, str(db_path), "0.1"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert second.returncode == 0, f"the role never came back: {second.stdout}{second.stderr}"
+    assert "HELD" in second.stdout
+
+
+def test_a_stale_socket_node_is_unlinked_and_replaced_under_the_held_lock(short_tmp):
+    """A crash leaves the node behind; the next daemon must not be blocked by it.
+
+    The node is created by binding and abandoning a socket without ever
+    listening, which is what a daemon killed between `bind` and `listen`
+    leaves on disk: a filesystem entry that refuses every connect.
+    """
+    db_path = short_tmp / "palaver.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path = writer_socket.socket_path_for(db_path)
+
+    abandoned = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    abandoned.bind(str(socket_path))
+    abandoned.close()  # the node outlives the socket
+    assert socket_path.exists(), "the fixture did not leave a stale node"
+    stale_inode = socket_path.stat().st_ino
+
+    with single_writer(db_path) as server:
+        assert socket_path.exists()
+        assert socket_path.stat().st_ino != stale_inode, "the stale node was reused, not replaced"
+        # Bound *and* listening: a node that exists but refuses is exactly the
+        # state this test started from, so existence alone proves nothing.
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        try:
+            client.connect(str(socket_path))
+        finally:
+            client.close()
+        assert server.fileno() >= 0
+
+
+def test_a_live_socket_is_never_unlinked_even_when_its_owner_holds_no_lock(short_tmp):
+    """The reason the probe exists alongside the lock.
+
+    A pathname socket keeps serving through its owner's descriptor no matter
+    what happens to the name, so unlinking one that still has a listener does
+    not stop it -- it just frees the name for a second listener nobody can
+    see. This stands in for an older build, or a daemon started by hand.
+    """
+    db_path = short_tmp / "palaver.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path = writer_socket.socket_path_for(db_path)
+
+    squatter = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    squatter.bind(str(socket_path))
+    squatter.listen(4)
+    inode = socket_path.stat().st_ino
+    try:
+        with pytest.raises(DaemonAlreadyRunningError, match="without holding"):
+            with single_writer(db_path):
+                pass
+        assert socket_path.stat().st_ino == inode, "the live socket's node was unlinked"
+    finally:
+        squatter.close()
+
+
+def test_a_data_directory_on_an_unverified_filesystem_stops_startup(short_tmp, monkeypatch):
+    """`flock` returning success is not evidence that it locked anything.
+
+    On NFS without lockd, and on some FUSE and SMB mounts, it is a no-op --
+    which is indistinguishable from a working lock at the call site. The
+    filesystem name is the only signal available, so an unrecognised one has
+    to fail closed.
+    """
+    db_path = short_tmp / "palaver.db"
+    monkeypatch.setattr(writer_socket, "filesystem_type", lambda _path: "nfs")
+
+    with pytest.raises(NonLocalFilesystemError, match="nfs"):
+        with single_writer(db_path):
+            pass
+
+    assert not writer_socket.socket_path_for(db_path).exists(), (
+        "a socket was bound before the check"
+    )
+
+
+def test_the_filesystem_check_is_an_allowlist_not_a_denylist(short_tmp, monkeypatch):
+    """A filesystem nobody here has tested must fail, not pass by omission.
+
+    A denylist would admit every filesystem invented after this line was
+    written, which is the population most likely to break `flock`.
+    """
+    db_path = short_tmp / "palaver.db"
+    monkeypatch.setattr(writer_socket, "filesystem_type", lambda _path: "somethingnew")
+    with pytest.raises(NonLocalFilesystemError, match="somethingnew"):
+        with single_writer(db_path):
+            pass
+
+
+def test_this_repository_lives_on_a_filesystem_the_allowlist_accepts():
+    """The positive control for both tests above.
+
+    They monkeypatch `filesystem_type`, so together they would still pass if
+    the real one returned garbage for every path. This one calls it for real.
+    """
+    fstype = writer_socket.filesystem_type(Path(__file__).parent)
+    assert fstype in writer_socket.LOCAL_FILESYSTEMS, f"unexpected filesystem {fstype!r}"
+
+
+def test_the_statfs_struct_matches_the_layout_it_was_checked_against():
+    """A ctypes layout that drifts reads a plausible string from the wrong offset.
+
+    `statfs` would still return 0, and the wrong bytes would still decode --
+    a confident answer from the wrong field, which is INV-7's shape. The size
+    is the cheapest check that catches it.
+    """
+    assert ctypes.sizeof(writer_socket._Statfs) == writer_socket._STATFS_SIZE
+
+
+def test_a_socket_path_over_the_sun_path_limit_is_named_rather_than_raised_raw(short_tmp):
+    """`OSError: AF_UNIX path too long` names neither the limit nor the path.
+
+    `sun_path` is a fixed 104-byte array, so 103 bytes is the most that can
+    be bound -- bisected, not assumed. A user whose project sits deep enough
+    to cross that gets a kernel error naming none of: which path, how long,
+    or what the ceiling is. Reported here instead, with all three.
+    """
+    deep = short_tmp / ("d" * 120)
+    with pytest.raises(writer_socket.SocketPathTooLongError) as caught:
+        writer_socket.socket_path_for(deep / "palaver.db")
+    message = str(caught.value)
+    assert str(writer_socket.MAX_SOCKET_PATH_BYTES) in message
+    assert "palaver.sock" in message
+
+
+def test_a_path_at_the_limit_binds_and_one_byte_over_does_not(short_tmp):
+    """The positive control: the limit is the measured one, off by nothing.
+
+    Without this, `MAX_SOCKET_PATH_BYTES` could be any conservative number
+    and the test above would still pass -- including one so low it refused
+    paths that work perfectly well.
+    """
+    limit = writer_socket.MAX_SOCKET_PATH_BYTES
+    # `<short_tmp>` + `/` + padding + `/x` + `/palaver.sock`
+    padding = limit - len(str(short_tmp)) - len("/") - len("/x") - len("/palaver.sock")
+    assert padding > 0, "the scratch directory is already too long to test the boundary"
+
+    at_limit = short_tmp / ("x" * padding) / "x"
+    at_limit.mkdir(parents=True)
+    path = writer_socket.socket_path_for(at_limit / "palaver.db")
+    assert len(str(path)) == limit
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(path))  # the kernel agrees this length is fine
+    finally:
+        server.close()
+
+    with pytest.raises(writer_socket.SocketPathTooLongError):
+        writer_socket.socket_path_for(at_limit / "yy" / "palaver.db")
