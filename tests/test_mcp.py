@@ -25,10 +25,12 @@ import concurrent.futures
 import errno
 import io
 import json
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from argparse import Namespace
 from pathlib import Path
 
@@ -38,7 +40,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import palaver
 from palaver.cli import SUBCOMMANDS
 from palaver.cli import mcp as mcp_cli
-from palaver.mcp import pagination, tools_read
+from palaver.mcp import pagination, tools_read, tools_write
 from palaver.mcp import server as mcp_server
 from palaver.memory.evidence import EvidenceAnchor
 from palaver.memory.scope import read_memories
@@ -95,6 +97,22 @@ def _seed(db_path: Path, *, sources=("claude-code",), external_id="session-aaa")
         "external_id": external_id,
         "session_key": f"demo/{external_id}",
     }
+
+
+@pytest.fixture
+def short_store():
+    """A seeded store on a path short enough for the daemon socket.
+
+    pytest's `tmp_path` is ~90 bytes before a test name is appended, and
+    `sun_path` holds 103 -- so any test that must reach the *real* socket
+    path needs a shorter home than the default fixture provides.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="plv", dir="/tmp"))  # noqa: S108
+    try:
+        db_path = directory / "palaver.db"
+        yield db_path, _seed(db_path)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.fixture
@@ -194,13 +212,38 @@ def test_the_scope_refusal_holds_through_a_real_tool_call(store):
 
 
 def test_every_registered_read_tool_takes_a_scope(store):
-    """A tool added later without a scope argument fails here, not in review."""
+    """A tool added later without a scope argument fails here, not in review.
+
+    The registered set is pinned to `READ_TOOLS | WRITE_TOOLS` rather than
+    just iterated: a tool registered from neither mapping -- a debug helper
+    left in, say -- would otherwise be exempt from every check below simply
+    by not being in a list this test reads.
+    """
     db_path, _ = store
     server = mcp_server.build_server(db_path)
-    tools = asyncio.run(server.list_tools())
-    assert {tool.name for tool in tools} == set(tools_read.READ_TOOLS)
-    for tool in tools:
-        assert "scope" in tool.input_schema["required"], tool.name
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    assert set(tools) == set(tools_read.READ_TOOLS) | set(tools_write.WRITE_TOOLS)
+
+    for name in tools_read.READ_TOOLS:
+        assert "scope" in tools[name].input_schema["required"], name
+
+
+def test_the_write_tool_takes_a_memory_id_and_never_a_scope(store):
+    """`palaver_correct` names one row, so a scope would be the wrong shape.
+
+    A scoped correction would be a bulk edit -- exactly the operation an
+    append-only store must not offer -- and `memory_id` comes from a prior
+    recall, so the caller has already chosen a scope to get it.
+    """
+    db_path, _ = store
+    server = mcp_server.build_server(db_path)
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    schema = tools["palaver_correct"].input_schema
+    assert set(schema["required"]) == {"memory_id", "statement"}
+    assert "scope" not in schema["properties"]
+    # `ctx` is the server's, not the caller's: a client that could pass one
+    # would be choosing which session the elicitation goes to.
+    assert "ctx" not in schema["properties"]
 
 
 # =============================================================================
@@ -1421,3 +1464,267 @@ def test_paginating_a_project_scope_to_exhaustion_returns_every_memory_once(stor
         conn.close()
     assert seen == expected
     assert len(seen) == len(set(seen))
+
+
+# =============================================================================
+# Task 6.3: the MCP process reads, the daemon writes, and every read says when
+# =============================================================================
+
+
+def test_the_mcp_processes_connection_string_opens_the_store_read_only(store, monkeypatch):
+    """Asserted on the URI the production factory actually builds.
+
+    Not on a connection a test constructed: that would prove the test knows
+    how to spell `mode=ro`. This captures what `open_readonly` passes to
+    sqlite3, which is the string the server runs with.
+    """
+    db_path, _ = store
+    seen = []
+    real = sqlite3.connect
+
+    def capture(target, *args, **kwargs):
+        seen.append(target)
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", capture)
+    mcp_server.open_readonly(db_path).close()
+    assert seen and all("mode=ro" in target for target in seen), seen
+
+
+def test_the_read_only_connection_really_refuses_a_write(store):
+    """The positive control for the string check above.
+
+    `mode=ro` appearing in a URI proves the spelling, not the behaviour --
+    a typo'd parameter name is silently ignored by SQLite, leaving a fully
+    writable connection whose URI still contains the text being asserted on.
+    """
+    db_path, seeded = store
+    conn = mcp_server.open_readonly(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("UPDATE memories SET statement = 'x' WHERE id = ?", (seeded["memory_id"],))
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("tool", ["palaver_recall", "palaver_sessions"])
+def test_every_read_tool_reports_when_the_store_was_last_written_and_who_is_watching(store, tool):
+    """A crashed daemon and a quiet one are otherwise identical from here.
+
+    Same memories, same timestamps, same shape. A reader who cannot tell
+    them apart will read a two-day-old store as current, which is INV-7's
+    failure -- and the likelier reading, since a store that answers at all
+    looks healthy.
+    """
+    db_path, _ = store
+    server = mcp_server.build_server(db_path)
+    result = _call(server, tool, {"scope": {"project": "demo"}})
+    payload = json.loads(result.content[0].text)
+
+    assert "observed_at" in payload, "no freshness stamp, so a stale answer looks current"
+    assert "daemon_running" in payload
+    assert payload["daemon_running"] is False, "nothing is serving this test store"
+
+
+def test_the_freshness_stamp_is_the_newest_memory_not_the_time_of_the_call(store):
+    """`observed_at` answers "what has this store seen", not "what time is it".
+
+    A wall-clock stamp would advance on every call and would therefore
+    describe a dead store as freshly observed -- the precise confusion the
+    field exists to prevent.
+    """
+    db_path, seeded = store
+    conn = _conn(db_path)
+    try:
+        expected = conn.execute(
+            "SELECT created_at FROM memories WHERE id = ?", (seeded["memory_id"],)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    server = mcp_server.build_server(db_path)
+    payload = json.loads(
+        _call(server, "palaver_recall", {"scope": {"project": "demo"}}).content[0].text
+    )
+    assert payload["observed_at"] == expected
+
+
+def test_the_freshness_keys_are_counted_inside_the_byte_budget(store):
+    """Keys merged after `paginate` returns are outside the bound it asserted.
+
+    The budget has 25% headroom, so two extra keys would never actually
+    overflow -- which is exactly why this needs asserting rather than
+    trusting. The claim `paginate` makes is that the response it returns is
+    the one it measured, and a caller bolting fields on afterwards quietly
+    makes that false.
+    """
+    scope = {"project": "demo"}
+    extras = {"observed_at": "2026-08-15T00:00:00Z", "daemon_running": False}
+    # A small explicit budget and small rows, so the ~60 bytes the extras cost
+    # is several rows rather than a rounding error. At the production budget
+    # the same extras hide inside one 4KB row's slack, and the count would be
+    # identical whether they were charged for or not.
+    budget = 2000
+    rows = [(index, {"s": "x" * 20}) for index in range(1, 200)]
+
+    without = pagination.paginate(rows, scope=scope, items_key="memories", budget=budget)
+    with_extras = pagination.paginate(
+        rows, scope=scope, items_key="memories", extra=extras, budget=budget
+    )
+
+    assert pagination.wire_size(with_extras) <= budget
+    assert with_extras["observed_at"] == extras["observed_at"]
+    # The extras cost real bytes, so the page they leave room for is smaller.
+    # Equal counts would mean the overhead was never charged for.
+    assert len(with_extras["memories"]) < len(without["memories"])
+
+
+# =============================================================================
+# Sign-off: the write happens only after a human says so
+# =============================================================================
+
+
+class _StubContext:
+    """A request context that answers an elicitation however a test needs.
+
+    Stands in for the client's side of the round trip. The transport itself
+    is exercised separately in `tests/test_supervision.py`; what is under
+    test here is what `correct` does with each of the three answers, which
+    would be tedious and slow to drive through a real client three times.
+    """
+
+    def __init__(self, action="accept", approved=True, note=""):
+        self.action = action
+        self.approved = approved
+        self.note = note
+        self.message = None
+
+    async def elicit(self, message, schema):
+        from mcp.server.elicitation import (
+            AcceptedElicitation,
+            CancelledElicitation,
+            DeclinedElicitation,
+        )
+
+        self.message = message
+        if self.action == "decline":
+            return DeclinedElicitation()
+        if self.action == "cancel":
+            return CancelledElicitation()
+        return AcceptedElicitation(data=schema(approved=self.approved, note=self.note))
+
+
+def _correct(db_path, ctx, memory_id, statement):
+    conn = mcp_server.open_readonly(db_path)
+    try:
+        return asyncio.run(tools_write.correct(conn, db_path, ctx, memory_id, statement))
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "approved"),
+    [("decline", True), ("cancel", True), ("accept", False)],
+)
+def test_a_correction_without_a_yes_writes_nothing(store, action, approved):
+    """Three ways to say no, and none of them may write.
+
+    "accept" with `approved=false` is the one worth naming: the elicitation
+    itself succeeded, so a check that only looked at `result.action` would
+    treat a refusal as consent.
+    """
+    db_path, seeded = store
+    ctx = _StubContext(action=action, approved=approved)
+
+    with pytest.raises(tools_write.WriteRefused):
+        _correct(db_path, ctx, seeded["memory_id"], "should never land")
+
+    conn = _conn(db_path)
+    try:
+        assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_the_sign_off_prompt_quotes_both_statements_in_full(store):
+    """Approving text you cannot see is a keystroke, not sign-off."""
+    db_path, seeded = store
+    ctx = _StubContext(action="decline")
+    with pytest.raises(tools_write.WriteRefused):
+        _correct(db_path, ctx, seeded["memory_id"], "the corrected reading")
+
+    conn = _conn(db_path)
+    try:
+        original = conn.execute(
+            "SELECT statement FROM memories WHERE id = ?", (seeded["memory_id"],)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert original in ctx.message
+    assert "the corrected reading" in ctx.message
+
+
+def test_an_approved_correction_with_no_daemon_still_writes_nothing(short_store):
+    """Consent is not the last gate; the single writer is.
+
+    A human saying yes does not create a writer. This is the case where the
+    tool is most tempted to "just do it" -- permission has been granted and
+    only the plumbing is missing -- and it is exactly where a second writer
+    would be opened.
+
+    Uses `short_store` because pytest's `tmp_path` overruns `sun_path`, and
+    the resulting `SocketPathTooLongError` would let this pass for the wrong
+    reason: no write happens either way, but the refusal under test is the
+    missing daemon.
+    """
+    db_path, seeded = short_store
+    with pytest.raises(Exception) as excinfo:
+        _correct(db_path, _StubContext(), seeded["memory_id"], "approved but undeliverable")
+    assert "no palaver observe daemon" in str(excinfo.value)
+    assert "second" in str(excinfo.value)
+
+    conn = _conn(db_path)
+    try:
+        assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_correcting_a_memory_that_does_not_exist_asks_nobody_anything(store):
+    """The lookup precedes the prompt, deliberately.
+
+    A sign-off dialog quoting a memory that is not there invites approval of
+    a change that cannot happen, and the error that follows arrives after
+    the human has already said yes.
+    """
+    db_path, _ = store
+    ctx = _StubContext()
+    with pytest.raises(LookupError):
+        _correct(db_path, ctx, 999_999, "no such memory")
+    assert ctx.message is None, "the human was asked about a memory that does not exist"
+
+
+def test_correcting_an_already_superseded_memory_is_refused_before_the_prompt(store):
+    """A memory has at most one successor (INV-4), so this could never land."""
+    db_path, seeded = store
+    conn = connect(db_path)
+    try:
+        chunk_id = conn.execute("SELECT id FROM transcript_chunks LIMIT 1").fetchone()[0]
+        write_memory(
+            conn,
+            project_id=seeded["project_id"],
+            session_id=seeded["session_ids"][0],
+            statement="the first correction",
+            origin="user-correction",
+            tier=1,
+            evidence=[EvidenceAnchor(start_offset=0, end_offset=8, transcript_chunk_id=chunk_id)],
+            supersedes=seeded["memory_id"],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ctx = _StubContext()
+    with pytest.raises(LookupError, match="already superseded"):
+        _correct(db_path, ctx, seeded["memory_id"], "a second correction")
+    assert ctx.message is None

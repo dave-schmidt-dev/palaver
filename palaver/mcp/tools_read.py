@@ -168,7 +168,12 @@ def resolve_session_id(conn: sqlite3.Connection, session: str) -> int:
     return int(matches[0][0])
 
 
-def recall(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> dict:
+def recall(
+    conn: sqlite3.Connection,
+    scope: Any,
+    cursor: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict:
     """Read the memories in one scope, each carrying its provenance tier.
 
     Args:
@@ -178,6 +183,9 @@ def recall(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> d
             page stopped. Omitted or `None` starts at the beginning. A cursor
             issued for a different scope is refused rather than honoured —
             see `pagination.decode_cursor`.
+        extra: Response keys to merge in *inside* the byte budget, rather
+            than after it has been asserted. `server.build_server` passes
+            freshness here for that reason.
 
     Returns:
         A dict with the resolved `scope` echoed back, a `memories` list, and
@@ -217,10 +225,16 @@ def recall(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> d
         [(int(row["id"]), {**row, "tier_name": tier_name(row["tier"])}) for row in rows],
         scope=echo,
         items_key="memories",
+        extra=extra,
     )
 
 
-def sessions(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) -> dict:
+def sessions(
+    conn: sqlite3.Connection,
+    scope: Any,
+    cursor: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict:
     """List the sessions in one scope, so a caller can obtain a session key.
 
     This is the companion to `recall`'s session scope: a caller that holds
@@ -235,6 +249,8 @@ def sessions(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) ->
             confirms an identifier means what they think before using it.
         cursor: The `next_cursor` from a previous call, to resume where that
             page stopped. Omitted or `None` starts at the beginning.
+        extra: Response keys to merge in *inside* the byte budget; see
+            `recall`.
 
     Returns:
         A dict with the resolved `scope` echoed back, a `sessions` list —
@@ -297,6 +313,7 @@ def sessions(conn: sqlite3.Connection, scope: Any, cursor: str | None = None) ->
         ],
         scope=echo,
         items_key="sessions",
+        extra=extra,
     )
 
 

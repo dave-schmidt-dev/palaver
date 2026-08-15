@@ -59,6 +59,7 @@ import logging
 import os
 import platform
 import socket as socket_module
+import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,10 @@ class SocketPathTooLongError(SingleWriterError):
 
 class DaemonUnavailableError(RuntimeError):
     """No daemon is listening, so a write cannot be performed at all."""
+
+
+class UnsupportedOperationError(ValueError):
+    """A request naming an operation the write path does not perform."""
 
 
 class _Statfs(ctypes.Structure):
@@ -391,6 +396,13 @@ def daemon_alive(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool:
         db_path: The database whose daemon to check.
         timeout: Seconds to allow the connect.
 
+    A *read* must never fail because of this probe. A socket path too long
+    to bind is a real misconfiguration, but it is one the daemon reports
+    loudly at startup, where it can be acted on; raising it again on every
+    recall would turn a working read into an error about a write path the
+    caller never asked to use. So it is logged and answered as "no daemon",
+    which is exactly what it means for the reader.
+
     Returns:
         True if a listener answered. False if the socket is absent, refuses,
         or errors — from a reader's side, every one of those means "no
@@ -399,6 +411,9 @@ def daemon_alive(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool:
     """
     try:
         return _probe(socket_path_for(db_path), timeout)
+    except SocketPathTooLongError as exc:
+        log.warning("cannot probe for a daemon: %s", exc)
+        return False
     except OSError:
         return False
 
@@ -465,3 +480,159 @@ def request(db_path: Path, payload: Mapping[str, Any], *, timeout: float = DEFAU
             "The write was not acknowledged and must not be assumed to have landed."
         )
     return json.loads(body)
+
+
+# ---------------------------------------------------------------------------
+# The daemon side: what a request is allowed to ask for, and how it is served.
+# ---------------------------------------------------------------------------
+
+#: Every operation the write path performs, by name. A closed set, checked
+#: before anything touches the database.
+#:
+#: The protocol carries an operation *name* and typed arguments — never SQL,
+#: and never a table or column name. That is what makes "an UPDATE or DELETE
+#: naming an existing memory row" unreachable from a caller rather than
+#: merely discouraged: there is no request shape that expresses one. The
+#: schema's own triggers (`memories_no_delete`, `memories_id_immutable`, and
+#: the rest) are the second layer, and they are what would catch a future
+#: operation added here carelessly.
+WRITE_OPERATIONS = frozenset({"correct"})
+
+#: What `palaver_correct` records as a memory's origin, so a correction is
+#: distinguishable from an extraction in any later read.
+CORRECTION_ORIGIN = "user-correction"
+
+
+def apply_request(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
+    """Perform one write request on the daemon's connection.
+
+    Args:
+        conn: The daemon's single writable connection.
+        payload: A decoded request. `op` names the operation; the remaining
+            keys are its arguments.
+
+    Returns:
+        A reply dict. `{"ok": True, ...}` on success; `{"ok": False,
+        "error": ..., "detail": ...}` when the request was refused, so a
+        refusal reaches the caller as data rather than as a dropped
+        connection they would have to guess about.
+
+    Raises:
+        Nothing. Every failure is turned into a reply. A daemon that let an
+        exception escape here would drop the connection, and the MCP process
+        would report "the daemon did not reply" — which is what it says when
+        the daemon has *crashed*. Two very different situations must not
+        produce the same message (INV-7).
+    """
+    op = payload.get("op")
+    try:
+        if op not in WRITE_OPERATIONS:
+            raise UnsupportedOperationError(
+                f"{op!r} is not something the write path does. It performs exactly "
+                f"{sorted(WRITE_OPERATIONS)}, and takes an operation name with typed "
+                "arguments — never SQL, a table name, or a column name. Memories are "
+                "append-only (INV-4): a correction is a new row that supersedes the "
+                "old one, and the old row is never modified or removed."
+            )
+        return _correct(conn, payload)
+    except Exception as exc:  # noqa: BLE001 - the reply *is* the error channel
+        log.warning("write request %r refused: %s", op, exc)
+        return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
+
+
+def _correct(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
+    """Supersede one memory with a corrected statement at tier 1.
+
+    The successor inherits the predecessor's evidence anchors rather than
+    inventing new ones. That is the honest reading of a human correction:
+    the same span of transcript is being pointed at, and what changed is the
+    reading of it. Fabricating an anchor to satisfy INV-6 would put a
+    citation in the store that leads somewhere the statement does not come
+    from, which is worse than no citation at all.
+    """
+    from palaver.memory.evidence import EvidenceAnchor  # noqa: PLC0415 - cycle
+    from palaver.memory.supersede import supersede_memory  # noqa: PLC0415 - cycle
+    from palaver.memory.tiers import TIER_USER_INSTRUCTION  # noqa: PLC0415 - cycle
+
+    memory_id = payload.get("memory_id")
+    statement = payload.get("statement")
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool):
+        raise ValueError(f"memory_id must be an integer, got {memory_id!r}")
+    if not isinstance(statement, str) or not statement.strip():
+        raise ValueError("statement must be a non-empty string")
+
+    anchors = [
+        EvidenceAnchor(
+            start_offset=start,
+            end_offset=end,
+            transcript_chunk_id=chunk_id,
+            event_id=event_id,
+        )
+        for start, end, chunk_id, event_id in conn.execute(
+            "SELECT start_offset, end_offset, transcript_chunk_id, event_id "
+            "FROM memory_evidence WHERE memory_id = ? ORDER BY id",
+            (memory_id,),
+        ).fetchall()
+    ]
+    if not anchors:
+        raise LookupError(
+            f"memory {memory_id} has no evidence to inherit, so a correction of it "
+            "would have none either (INV-6). Either the id names no memory, or the "
+            "store is inconsistent."
+        )
+
+    successor_id = supersede_memory(
+        conn,
+        predecessor_id=memory_id,
+        statement=statement.strip(),
+        origin=CORRECTION_ORIGIN,
+        tier=TIER_USER_INSTRUCTION,
+        evidence=anchors,
+    )
+    conn.commit()
+    return {"ok": True, "memory_id": successor_id, "supersedes": memory_id}
+
+
+def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> bool:
+    """Accept one connection, apply its request, and reply.
+
+    Args:
+        server: The listening socket from `single_writer`.
+        conn: The daemon's writable connection.
+
+    Returns:
+        True if a request was served. False if the connection carried
+        nothing — which is what the startup liveness probe leaves behind,
+        and what `daemon_alive` does on every read. Those must not be logged
+        as malformed requests; they are the mechanism working.
+    """
+    client, _ = server.accept()
+    try:
+        client.settimeout(DEFAULT_TIMEOUT)
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if chunks[-1].endswith(b"\n"):
+                break
+        body = b"".join(chunks).strip()
+        if not body:
+            return False
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            reply: dict = {"ok": False, "error": "JSONDecodeError", "detail": str(exc)}
+        else:
+            reply = apply_request(conn, payload)
+
+        client.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+        return True
+    except (TimeoutError, ConnectionError, BrokenPipeError) as exc:
+        # One client that hangs up or stalls is not the daemon's failure.
+        log.warning("write request abandoned: %s", exc)
+        return False
+    finally:
+        client.close()

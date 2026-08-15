@@ -32,13 +32,16 @@ could just as well mean the kill never landed.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import ctypes
+import json
 import os
 import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -862,3 +865,432 @@ def test_a_path_at_the_limit_binds_and_one_byte_over_does_not(short_tmp):
 
     with pytest.raises(writer_socket.SocketPathTooLongError):
         writer_socket.socket_path_for(at_limit / "yy" / "palaver.db")
+
+
+# ---------------------------------------------------------------------------
+# The write path: what it will do, what it refuses, and what it never touches.
+# ---------------------------------------------------------------------------
+
+#: A daemon that actually serves. Holds the writer role, opens the one
+#: writable connection, and answers requests until told to stop -- which is
+#: the only way to test `request()` against something that can really reply.
+_SERVER = """
+import sys
+from pathlib import Path
+from palaver.observer.socket import single_writer, serve_request
+from palaver.store.migrate import connect
+
+db_path = Path(sys.argv[1])
+conn = connect(db_path)
+try:
+    with single_writer(db_path) as server:
+        print("HELD", flush=True)
+        while True:
+            serve_request(server, conn)
+finally:
+    conn.close()
+"""
+
+
+def _seed_memory(db_path):
+    """One project, one session, one chunk, one memory at tier 4."""
+    from palaver.memory.evidence import EvidenceAnchor
+    from palaver.memory.write import write_memory
+    from palaver.store.migrate import connect, migrate
+
+    migrate(db_path)
+    conn = connect(db_path)
+    project_id = conn.execute(
+        "INSERT INTO projects (name, path) VALUES (?, ?) RETURNING id",
+        ("demo", str(db_path.parent)),
+    ).fetchone()[0]
+    session_id = conn.execute(
+        "INSERT INTO sessions (project_id, source, external_id) VALUES (?, ?, ?) RETURNING id",
+        (project_id, "claude-code", "session-aaa"),
+    ).fetchone()[0]
+    chunk_id = conn.execute(
+        "INSERT INTO transcript_chunks (session_id, seq, role, content) VALUES (?, ?, ?, ?) "
+        "RETURNING id",
+        (session_id, 0, "assistant", "the recorded evidence text"),
+    ).fetchone()[0]
+    memory_id = write_memory(
+        conn,
+        project_id=project_id,
+        session_id=session_id,
+        statement="the observer's original reading",
+        origin="observer",
+        tier=4,
+        evidence=[EvidenceAnchor(start_offset=0, end_offset=8, transcript_chunk_id=chunk_id)],
+    )
+    conn.commit()
+    conn.close()
+    return memory_id
+
+
+def _raw_row(db_path, memory_id):
+    """Every column of one memory, read with a bare sqlite3 connection.
+
+    Deliberately not through Palaver's own helpers: a test that asserts
+    immutability using the same layer it is testing can be fooled by that
+    layer. `sqlite3` sees what is actually on disk.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def test_a_correction_writes_a_new_row_and_leaves_the_original_byte_identical(short_tmp):
+    """INV-4: supersede, never edit. Asserted column by column.
+
+    Checking only the statement would miss a correction that rewrote the
+    predecessor's tier or origin in passing, and INV-5 makes tier the field
+    most worth watching.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    before = _raw_row(db_path, memory_id)
+
+    conn = connect(db_path)
+    try:
+        reply = writer_socket.apply_request(
+            conn, {"op": "correct", "memory_id": memory_id, "statement": "what really happened"}
+        )
+    finally:
+        conn.close()
+
+    assert reply["ok"], reply
+    assert reply["supersedes"] == memory_id
+    assert _raw_row(db_path, memory_id) == before, "the corrected row was modified in place"
+
+    successor = _raw_row(db_path, reply["memory_id"])
+    assert successor["statement"] == "what really happened"
+    assert successor["supersedes"] == memory_id
+    assert successor["tier"] == 1, "a correction is a user instruction, the highest tier"
+    assert successor["origin"] == writer_socket.CORRECTION_ORIGIN
+
+
+def test_the_correction_inherits_the_evidence_rather_than_inventing_any(short_tmp):
+    """INV-6 without a fabricated citation.
+
+    A correction reinterprets the same span of transcript, so it points at
+    the same anchors. Synthesising an anchor to satisfy the non-empty rule
+    would put a citation in the store leading somewhere the statement does
+    not come from -- worse than no citation, because it reads as grounded.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+
+    conn = connect(db_path)
+    try:
+        reply = writer_socket.apply_request(
+            conn, {"op": "correct", "memory_id": memory_id, "statement": "corrected"}
+        )
+    finally:
+        conn.close()
+
+    raw = sqlite3.connect(db_path)
+    try:
+        original = raw.execute(
+            "SELECT start_offset, end_offset, transcript_chunk_id, event_id "
+            "FROM memory_evidence WHERE memory_id = ? ORDER BY id",
+            (memory_id,),
+        ).fetchall()
+        inherited = raw.execute(
+            "SELECT start_offset, end_offset, transcript_chunk_id, event_id "
+            "FROM memory_evidence WHERE memory_id = ? ORDER BY id",
+            (reply["memory_id"],),
+        ).fetchall()
+    finally:
+        raw.close()
+    assert inherited == original
+    assert inherited, "a memory with no evidence would violate INV-6"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"op": "update", "memory_id": 1, "statement": "rewritten"},
+        {"op": "delete", "memory_id": 1},
+        {"op": "sql", "sql": "UPDATE memories SET statement = 'x' WHERE id = 1"},
+        {"op": "sql", "sql": "DELETE FROM memories WHERE id = 1"},
+        {"memory_id": 1, "statement": "no op at all"},
+    ],
+)
+def test_an_update_or_delete_naming_a_memory_is_refused_by_the_write_path(short_tmp, payload):
+    """There is no request shape that expresses an edit.
+
+    The protocol carries an operation *name* and typed arguments, never SQL
+    and never a table or column name, so this is not a filter that could be
+    bypassed with different spelling -- there is nothing to spell.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    payload = {**payload, "memory_id": memory_id} if "memory_id" in payload else payload
+    before = _raw_row(db_path, memory_id)
+
+    conn = connect(db_path)
+    try:
+        reply = writer_socket.apply_request(conn, payload)
+    finally:
+        conn.close()
+
+    assert reply["ok"] is False
+    assert reply["error"] == "UnsupportedOperationError"
+    assert _raw_row(db_path, memory_id) == before
+    assert _row_count(db_path) == 1, "a refused request still wrote something"
+
+
+def test_an_ordinary_correction_lands_on_that_same_connection(short_tmp):
+    """The positive control for the refusals above.
+
+    Without it, every one of them would pass against a write path that
+    refused *everything* -- including a connection opened read-only by
+    mistake, or a store with no writable table at all.
+    """
+    from palaver.store.migrate import connect
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+
+    conn = connect(db_path)
+    try:
+        refused = writer_socket.apply_request(conn, {"op": "delete", "memory_id": memory_id})
+        accepted = writer_socket.apply_request(
+            conn, {"op": "correct", "memory_id": memory_id, "statement": "this one lands"}
+        )
+    finally:
+        conn.close()
+
+    assert refused["ok"] is False
+    assert accepted["ok"] is True
+    assert _row_count(db_path) == 2, "the correction did not write its row"
+
+
+def _row_count(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_correction_travels_over_the_real_socket_to_a_real_daemon(short_tmp):
+    """End to end: a separate process holds the writer role and applies it.
+
+    Every in-process test above shares this interpreter's connection, which
+    is exactly the arrangement production does not have. This one has the
+    writer in another process, reached only through the socket.
+    """
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SERVER, str(db_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert _line_within(proc, 30.0) == "HELD"
+        assert writer_socket.daemon_alive(db_path) is True
+
+        reply = writer_socket.request(
+            db_path, {"op": "correct", "memory_id": memory_id, "statement": "over the wire"}
+        )
+        assert reply["ok"], reply
+        assert _raw_row(db_path, reply["memory_id"])["statement"] == "over the wire"
+
+        refused = writer_socket.request(db_path, {"op": "delete", "memory_id": memory_id})
+        assert refused["ok"] is False
+        assert refused["error"] == "UnsupportedOperationError"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_a_write_with_no_daemon_fails_loudly_rather_than_opening_a_second_writer(short_tmp):
+    """The refusal is the feature.
+
+    A fallback to a direct write would be invisible and would end the
+    single-writer guarantee precisely when the daemon is already unhealthy
+    -- the moment it is least safe to have two processes writing.
+    """
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    assert writer_socket.daemon_alive(db_path) is False
+
+    with pytest.raises(writer_socket.DaemonUnavailableError, match="second"):
+        writer_socket.request(
+            db_path, {"op": "correct", "memory_id": memory_id, "statement": "no daemon"}
+        )
+    assert _row_count(db_path) == 1, "a write happened with no daemon running"
+
+
+#: The MCP server, as `palaver mcp` runs it.
+_MCP_SERVE = """
+import sys
+from palaver.cli import main
+db, port = sys.argv[1], sys.argv[2]
+sys.argv = ["palaver", "mcp", "--db", db, "--port", port]
+sys.exit(main())
+"""
+
+
+async def _correct_over_the_wire(url, memory_id, statement, *, approve):
+    """Drive `palaver_correct` the way a real client would, sign-off included."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.types import ElicitResult
+
+    prompts = []
+
+    async def elicitation_callback(_ctx, params):
+        prompts.append(params.message)
+        return ElicitResult(action="accept", content={"approved": approve, "note": "checked"})
+
+    async with streamable_http_client(url) as streams:
+        async with ClientSession(
+            streams[0], streams[1], elicitation_callback=elicitation_callback
+        ) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "palaver_correct", {"memory_id": memory_id, "statement": statement}
+            )
+            return result, prompts
+
+
+@pytest.mark.parametrize("approve", [True, False])
+def test_a_correction_crosses_the_real_transport_and_the_real_socket(short_tmp, approve):
+    """The whole path, with nothing stubbed: client, server, daemon, store.
+
+    Every other test here replaces at least one link -- an in-process
+    connection, a stub context. This one has a real client eliciting over a
+    real streamable-HTTP back-channel, a real MCP server holding a `mode=ro`
+    connection, and a real daemon in a third process applying the write. It
+    is the only test that would catch a break in how those three meet.
+
+    Parametrised on the answer because the negative case is the one that
+    matters: a sign-off gate that writes regardless is worse than none, and
+    it looks identical from the accept side.
+    """
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    port = _free_port()
+
+    daemon = subprocess.Popen(
+        [sys.executable, "-c", _SERVER, str(db_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    server = None
+    try:
+        assert _line_within(daemon, 30.0) == "HELD"
+        server = subprocess.Popen(
+            [sys.executable, "-c", _MCP_SERVE, str(db_path), str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        url = _line_within(server, 30.0)
+        assert url.startswith("http://"), url
+
+        result, prompts = asyncio.run(
+            asyncio.wait_for(
+                _correct_over_the_wire(url, memory_id, "corrected over the wire", approve=approve),
+                timeout=60,
+            )
+        )
+    finally:
+        for proc in (server, daemon):
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    assert prompts, "the client was never asked to sign off"
+    assert "the observer's original reading" in prompts[0], "the prompt hid what changes"
+
+    if approve:
+        assert not result.is_error, result.content[0].text
+        assert _row_count(db_path) == 2
+        successor = json.loads(result.content[0].text)
+        assert _raw_row(db_path, successor["memory_id"])["statement"] == "corrected over the wire"
+    else:
+        assert result.is_error, "a refused sign-off returned success"
+        assert _row_count(db_path) == 1, "the store was written despite a refusal"
+
+
+def test_a_client_that_cannot_elicit_is_refused_rather_than_written_for(short_tmp):
+    """No back-channel means no sign-off, and no sign-off means no write.
+
+    The SDK reports this as `MCPError: Elicitation not supported` -- named
+    and immediate, not a hang. Failing closed is the only safe direction: a
+    memory rewritten at tier 1 because nobody could be asked is exactly the
+    confidently-wrong state the tier system exists to prevent.
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    db_path = short_tmp / "palaver.db"
+    memory_id = _seed_memory(db_path)
+    port = _free_port()
+
+    daemon = subprocess.Popen(
+        [sys.executable, "-c", _SERVER, str(db_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    server = None
+    try:
+        assert _line_within(daemon, 30.0) == "HELD"
+        server = subprocess.Popen(
+            [sys.executable, "-c", _MCP_SERVE, str(db_path), str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        url = _line_within(server, 30.0)
+
+        async def call_without_elicitation():
+            # No `elicitation_callback`, so the client declares no such
+            # capability -- which is what an older or simpler client is.
+            async with streamable_http_client(url) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    return await session.call_tool(
+                        "palaver_correct",
+                        {"memory_id": memory_id, "statement": "written without consent"},
+                    )
+
+        result = asyncio.run(asyncio.wait_for(call_without_elicitation(), timeout=60))
+        message = result.content[0].text
+    finally:
+        for proc in (server, daemon):
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    assert result.is_error, "a client that cannot ask its user got a write anyway"
+    # The SDK's own wording is "Elicitation not supported", which names
+    # neither the correction nor whether it landed. The refusal has to say
+    # both, or a caller is left guessing about the state of their store.
+    assert "was not corrected" in message, message
+    assert "nothing was written" in message, message
+    assert _row_count(db_path) == 1
+
+
+def _free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]

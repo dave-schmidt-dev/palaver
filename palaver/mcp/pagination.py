@@ -208,6 +208,7 @@ def paginate(
     *,
     scope: Mapping[str, Any],
     items_key: str,
+    extra: Mapping[str, Any] | None = None,
     budget: int = RESPONSE_BUDGET,
 ) -> dict:
     """Cut `rows` at the last one that fits, and hand back a resume token.
@@ -224,6 +225,12 @@ def paginate(
             the cursor.
         items_key: The response key the items go under (`memories`,
             `sessions`).
+        extra: Response keys a caller will want alongside the items, merged
+            in here rather than added afterwards. Anything bolted on *after*
+            `paginate` returns is outside the budget it just asserted, so
+            the check would be passing on a payload that is not the one sent
+            — the exact estimator drift the final assertion exists to catch.
+            Passing them in keeps the measurement honest.
         budget: Maximum serialized event bytes; `RESPONSE_BUDGET` by default.
 
     Returns:
@@ -252,10 +259,12 @@ def paginate(
     # Reserve for a cursor rather than for `null`: a page that fills to the
     # budget and *then* discovers it needs a ~60-byte token would go over.
     # A large id gives the longest token this encoding produces.
+    extras = dict(extra or {})
     empty: dict[str, Any] = {
         "scope": dict(scope),
         items_key: [],
         "next_cursor": encode_cursor(scope, 2**62),
+        **extras,
     }
     overhead = wire_size(empty)
 
@@ -288,6 +297,7 @@ def paginate(
         "scope": dict(scope),
         items_key: list(page),
         "next_cursor": None if complete else encode_cursor(scope, last_id),
+        **extras,
     }
 
     actual = wire_size(response)

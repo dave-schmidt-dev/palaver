@@ -30,9 +30,11 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
 
 from palaver import __version__
-from palaver.mcp import tools_read
+from palaver.mcp import tools_read, tools_write
+from palaver.observer.socket import daemon_alive
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +121,15 @@ def build_server(
         def _call(scope: dict[str, str], cursor: str | None = None) -> dict[str, Any]:
             conn = connect(db_path)
             try:
-                return handler(conn, scope, cursor)
+                # Passed *into* the tool rather than merged onto its
+                # result: `paginate` asserts the assembled response fits the
+                # byte budget, and keys added after that assertion are not
+                # the ones it measured. Freshness is stamped here rather
+                # than inside each tool because it is a property of the
+                # store this server points at, not of the question asked —
+                # so a tool added later cannot answer without saying how
+                # current its answer is.
+                return handler(conn, scope, cursor, freshness(conn, db_path))
             finally:
                 conn.close()
 
@@ -130,7 +140,49 @@ def build_server(
     for tool_name, handler in tools_read.READ_TOOLS.items():
         _register(tool_name, handler)
 
+    def _register_write(tool_name: str, handler: Callable[..., Any]) -> None:
+        # Async, and given the context, because a write is gated on an
+        # elicitation round trip to the client — see `tools_write`.
+        async def _call(ctx: Context, memory_id: int, statement: str) -> dict[str, Any]:
+            conn = connect(db_path)
+            try:
+                return await handler(conn, db_path, ctx, memory_id, statement)
+            finally:
+                conn.close()
+
+        _call.__name__ = tool_name
+        _call.__doc__ = handler.__doc__
+        server.add_tool(_call, name=tool_name, structured_output=False)
+
+    for tool_name, handler in tools_write.WRITE_TOOLS.items():
+        _register_write(tool_name, handler)
+
     return server
+
+
+def freshness(conn: sqlite3.Connection, db_path: Path) -> dict:
+    """How current this store is, and whether anything is still maintaining it.
+
+    Every read tool carries both. A crashed daemon and a quiet one return
+    byte-identical results otherwise — same memories, same timestamps — so a
+    reader has no way to tell "nothing has happened" from "nothing has been
+    watching for two days". Taking the first for the second is INV-7's
+    failure exactly, and it is the likelier reading, because a store that
+    answers at all looks healthy.
+
+    Args:
+        conn: The tool's read-only connection.
+        db_path: The store, which is where the daemon's socket is looked for.
+
+    Returns:
+        `observed_at`, the newest memory's timestamp — the honest upper
+        bound on what this store has seen, and `None` for a store with no
+        memories yet — and `daemon_running`, a live connect probe rather
+        than a cached flag, because a flag written at startup says only that
+        the daemon once existed.
+    """
+    row = conn.execute("SELECT max(created_at) FROM memories").fetchone()
+    return {"observed_at": row[0] if row else None, "daemon_running": daemon_alive(db_path)}
 
 
 def build_app(
