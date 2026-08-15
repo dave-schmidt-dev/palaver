@@ -11,6 +11,12 @@ requires-python = ">=3.14"
 [project.scripts]
 palaver = "palaver.cli:main"
 
+# The pane surface is the only part of Palaver that needs iTerm2, and it is
+# the only part that cannot run headless. Keeping it an extra means `observe`
+# and the MCP server install and run on a machine with no iTerm2 at all.
+[project.optional-dependencies]
+ui = ["iterm2>=2.20"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["palaver*"]
@@ -25,6 +31,9 @@ exclude = ["tests*", "spikes*"]
 dev = [
     "ruff>=0.6.0",
     "pytest>=7.4.0",
+    # Present in dev so the pane-surface suite always runs rather than
+    # silently skipping on a machine that merely forgot the extra.
+    "iterm2>=2.20",
 ]
 
 [tool.ruff]

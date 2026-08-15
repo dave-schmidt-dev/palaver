@@ -89,6 +89,44 @@ uv run ruff check .     # lint and dead-code check
 uv run pre-commit install   # fast lint hook on commit
 ```
 
+## Setup: the iTerm2 pane surface
+
+The status Palaver shows inside each pane needs iTerm2's Python API, and **that
+preference is off by default**. Until it is on, iTerm2 creates no API socket, no
+script can connect, and nothing anywhere reports why — the surface is simply
+absent. Turn it on first:
+
+1. **iTerm2 > Settings > General > Magic > Enable Python API.**
+2. Install the extra and the AutoLaunch script:
+
+   ```sh
+   uv sync --extra ui
+   uv run python -m palaver.ui.autolaunch --install
+   ```
+
+   That writes a small shim to `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/palaver.py`.
+   iTerm2 runs everything in `AutoLaunch` at launch, so the surface comes back
+   on its own after a restart; the shim also restarts the attachment with a
+   backoff if it exits.
+
+3. Restart iTerm2, or run the attachment by hand for a session:
+
+   ```sh
+   uv run python -m palaver.ui.autolaunch
+   ```
+
+Palaver connects over iTerm2's Unix domain socket and **refuses to run** if that
+socket is absent, rather than falling back to the library's loopback TCP
+listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
+credential and is passed only through the environment, never on a command line.
+
+Supervising the observer daemon is separate and needs no iTerm2:
+
+```sh
+uv run palaver install-agent          # render the launchd user agent
+uv run palaver install-agent --load   # and load it
+```
+
 ## Conventions
 
 - Components that touch external surfaces (capture, inference runtime, UI) sit behind interfaces so they can be swapped without rewriting the memory layer.
