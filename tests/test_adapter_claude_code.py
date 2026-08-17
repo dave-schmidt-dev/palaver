@@ -390,21 +390,25 @@ def test_tail_no_error_event_for_successful_tool_result(tmp_path):
     assert not any(e.kind == "error" for e in result.events)
 
 
-def test_tail_logs_warning_and_skips_unparseable_line_but_keeps_going(tmp_path, caplog):
+def test_tail_counts_complete_malformed_records_without_logging_source_content(tmp_path, caplog):
     """A structurally complete but non-JSON line is logged at WARNING and
     skipped, rather than raised or silently dropped — later valid records in
     the same tail call are still returned."""
     project_dir = _project_dir(tmp_path)
     path = project_dir / "session-1.jsonl"
     good = _user_record("hello")
-    path.write_bytes(_jsonl_line(good) + b"{not valid json\n" + _jsonl_line(good))
+    malformed = b"{not valid json secret-source-content\n"
+    path.write_bytes(_jsonl_line(good) + malformed + _jsonl_line(good))
 
     adapter = ClaudeCodeAdapter(root=tmp_path / "projects")
     with caplog.at_level(logging.WARNING, logger="palaver.ingest.adapters.claude_code"):
         result = adapter.tail(path, Cursor())
 
     assert [e.payload for e in result.events] == [good, good]
+    assert result.malformed_records == 1
+    assert result.cursor.offset == path.stat().st_size
     assert any(
         record.levelno == logging.WARNING and "Unparseable" in record.message
         for record in caplog.records
     )
+    assert "secret-source-content" not in caplog.text

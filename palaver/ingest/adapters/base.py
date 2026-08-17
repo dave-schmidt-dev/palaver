@@ -114,10 +114,14 @@ class TailResult:
             the file's current length, which is necessarily behind the
             input cursor. See `read_complete_records` for why that repair
             is the deliberate choice rather than a bug.
+        malformed_records: Number of complete source records skipped because
+            they could not be decoded into a JSON object. Torn trailing
+            writes are not complete records and therefore are not counted.
     """
 
     events: tuple[Event, ...]
     cursor: Cursor
+    malformed_records: int = 0
 
 
 def open_source_readonly(path: str | Path) -> BinaryIO:

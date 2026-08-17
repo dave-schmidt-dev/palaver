@@ -113,10 +113,10 @@ def _parse_record(raw: bytes, path: Path) -> dict | None:
     try:
         record = json.loads(raw)
     except json.JSONDecodeError, UnicodeDecodeError:
-        logger.warning("Unparseable Claude Code JSONL record in %s: %r", path, raw[:200])
+        logger.warning("Unparseable Claude Code JSONL record in %s", path)
         return None
     if not isinstance(record, dict):
-        logger.warning("Non-object Claude Code JSONL record in %s: %r", path, raw[:200])
+        logger.warning("Non-object Claude Code JSONL record in %s", path)
         return None
     return record
 
@@ -339,9 +339,15 @@ class ClaudeCodeAdapter(Adapter):
         raw_records, new_offset = read_complete_records(path, cursor.offset)
         session_key = self.session_key_for(path)
         events: list[Event] = []
+        malformed_records = 0
         for raw in raw_records:
             record = _parse_record(raw, path)
             if record is None:
+                malformed_records += 1
                 continue
             events.extend(_events_for_record(session_key, record))
-        return TailResult(events=tuple(events), cursor=Cursor(offset=new_offset))
+        return TailResult(
+            events=tuple(events),
+            cursor=Cursor(offset=new_offset),
+            malformed_records=malformed_records,
+        )

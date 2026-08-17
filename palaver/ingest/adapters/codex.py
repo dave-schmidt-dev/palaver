@@ -275,10 +275,10 @@ def _parse_record(raw: bytes, path: Path) -> dict | None:
     try:
         record = json.loads(raw)
     except json.JSONDecodeError, UnicodeDecodeError:
-        logger.warning("Unparseable Codex rollout record in %s: %r", path, raw[:200])
+        logger.warning("Unparseable Codex rollout record in %s", path)
         return None
     if not isinstance(record, dict):
-        logger.warning("Non-object Codex rollout record in %s: %r", path, raw[:200])
+        logger.warning("Non-object Codex rollout record in %s", path)
         return None
     return record
 
@@ -898,15 +898,22 @@ class CodexAdapter(Adapter):
         raw_records, new_offset = read_complete_records(path, cursor.offset)
         session_key = self.session_key_for(path)
         records = []
+        malformed_records = 0
         for raw in raw_records:
             record = _parse_record(raw, path)
             if record is not None:
                 records.append(record)
+            else:
+                malformed_records += 1
         events = tuple(
             Event(session_key=session_key, kind=_event_kind(record), payload=record)
             for record in order_records(records)
         )
-        return TailResult(events=events, cursor=Cursor(offset=new_offset))
+        return TailResult(
+            events=events,
+            cursor=Cursor(offset=new_offset),
+            malformed_records=malformed_records,
+        )
 
     def _records(self, path: Path) -> list[dict]:
         """Decode every complete record in `path`, in cursor order."""

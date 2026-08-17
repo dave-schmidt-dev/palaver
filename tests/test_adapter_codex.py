@@ -1280,20 +1280,23 @@ def test_tail_does_not_advance_past_a_torn_write(tmp_path):
     result = CodexAdapter(root=root).tail(path, Cursor())
     assert [event.kind for event in result.events] == [KIND_SESSION_META]
     assert result.cursor.offset == complete_size
+    assert result.malformed_records == 0
 
 
-def test_an_unparseable_record_is_logged_and_skipped(tmp_path, caplog):
+def test_tail_counts_complete_malformed_records_without_logging_source_content(tmp_path, caplog):
     """A corrupt line must not crash the tail, and must not vanish silently."""
     root = tmp_path / "sessions"
     path = _write_rollout(root, "rollout-2026-08-14T10-22-00-fixture.jsonl", [_session_meta()])
     with path.open("ab") as handle:
-        handle.write(b"{not json}\n")
+        handle.write(b"{not json secret-source-content}\n")
         handle.write((json.dumps(_event("task_complete", last_agent_message=None)) + "\n").encode())
 
     with caplog.at_level("WARNING"):
-        events = CodexAdapter(root=root).tail(path, Cursor()).events
-    assert [event.kind for event in events] == [KIND_SESSION_META, KIND_TURN_BOUNDARY]
+        result = CodexAdapter(root=root).tail(path, Cursor())
+    assert [event.kind for event in result.events] == [KIND_SESSION_META, KIND_TURN_BOUNDARY]
+    assert result.malformed_records == 1
     assert any("Unparseable Codex rollout record" in record.message for record in caplog.records)
+    assert "secret-source-content" not in caplog.text
 
 
 def test_a_non_object_record_is_skipped(tmp_path, caplog):
@@ -1303,8 +1306,9 @@ def test_a_non_object_record_is_skipped(tmp_path, caplog):
         handle.write(b"[1, 2, 3]\n")
 
     with caplog.at_level("WARNING"):
-        events = CodexAdapter(root=root).tail(path, Cursor()).events
-    assert [event.kind for event in events] == [KIND_SESSION_META]
+        result = CodexAdapter(root=root).tail(path, Cursor())
+    assert [event.kind for event in result.events] == [KIND_SESSION_META]
+    assert result.malformed_records == 1
     assert any("Non-object Codex rollout record" in record.message for record in caplog.records)
 
 
