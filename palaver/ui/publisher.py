@@ -48,16 +48,26 @@ import asyncio
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from palaver.extract.persist import CURRENT_TASK
-from palaver.observer.signals import Status, apply_liveness, derive_status
-from palaver.observer.turn_boundary import observe_session
+from palaver.ingest.adapters.codex import CodexAdapter
+from palaver.ingest.cursors import Cursor
+from palaver.observer.signals import (
+    SIGNAL_NAMES,
+    Status,
+    Tri,
+    apply_liveness,
+    derive_status,
+    derive_status_for_source,
+)
+from palaver.observer.turn_boundary import derive_signals_from_events, observe_session
 from palaver.ui import component
 from palaver.ui.pane_join import (
+    PIN_VARIABLE,
     PaneVariables,
     ProcessTable,
     join_pane,
@@ -68,14 +78,11 @@ from palaver.ui.pane_join import (
 )
 
 log = logging.getLogger(__name__)
+SESSION_PIN_VARIABLE = PIN_VARIABLE
 
-#: The source `join_pane` reports for a pane the publisher will read a store
-#: for. The join's `sessions_root` is Claude Code's projects directory
-#: whatever agent it finds, so a codex or opencode pane in a project that
-#: also has Claude Code sessions would resolve to one of *those* stores and
-#: be reported under the wrong agent's status. Recorded as a task 5.2 finding
-#: rather than fixed here; until the join takes a per-source root, any other
-#: source is answered `UNKNOWN`.
+#: Compatibility name retained for callers that used the original Claude-only
+#: publisher. Source-aware joins now publish both Claude Code and Codex; an
+#: unsupported source still degrades to `UNKNOWN` in the join layer.
 PUBLISHABLE_SOURCE = "claude-code"
 
 #: How long a `current_task` row stays worth attaching to a fresh status.
@@ -183,11 +190,13 @@ def status_for_pane(
     variables: PaneVariables,
     *,
     sessions_root: Path | None = None,
+    store_roots: Mapping[str, Path] | None = None,
     db_path: Path | None = None,
     now: datetime,
     table: ProcessTable | None = None,
     cwd_reader: Callable[[int], Path | None] = working_directory,
     alive_probe: Callable[[int], bool] = process_is_alive,
+    candidate_cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
 ) -> tuple[Status, str | None]:
     """Derive what one pane should be shown as.
 
@@ -203,6 +212,7 @@ def status_for_pane(
         variables: The pane's iTerm2 variables.
         sessions_root: The session store root; `join_pane`'s default when
             `None`.
+        store_roots: Independent roots keyed by source.
         db_path: The observer database to read task text from. `None` reads
             no task text at all, which is what a caller with no database
             configured wants.
@@ -212,6 +222,7 @@ def status_for_pane(
         alive_probe: Liveness probe for the agent's pid, injected for the
             same reason -- a test that used the real one would assert
             different things depending on which pids happened to exist.
+        candidate_cache: Per-tick Codex candidate cache.
 
     Returns:
         The status and task text to push.
@@ -221,20 +232,29 @@ def status_for_pane(
         table=table,
         cwd_reader=cwd_reader,
         sessions_root=sessions_root,
+        store_roots=store_roots,
         now=now,
+        pin=variables.pin,
+        candidate_cache=candidate_cache,
     )
     if join is None or join.session_key is None:
         return Status.UNKNOWN, None
-    if join.source != PUBLISHABLE_SOURCE:
-        log.debug(
-            "pane %s joined %s; only %s is published", join.pane_id, join.source, PUBLISHABLE_SOURCE
-        )
+    store = join.store_path
+    if store is None:
         return Status.UNKNOWN, None
-
-    root = sessions_root if sessions_root is not None else Path.home() / ".claude" / "projects"
-    store = root / join.project_key / f"{join.session_key}.jsonl"
     try:
-        observation = observe_session(store, now=now)
+        if join.source == "codex":
+            # `tail` reads the validated path directly; it does not infer a
+            # project from the date-partitioned parent directories.
+            tail = CodexAdapter().tail(store, Cursor(0))
+            observation = derive_signals_from_events(tail.events, parsed=Tri.TRUE)
+            derived = derive_status_for_source(
+                observation.signals,
+                {name: 100.0 for name in SIGNAL_NAMES},
+            )
+        else:
+            observation = observe_session(store, now=now)
+            derived = derive_status(observation.signals)
         last_advance = datetime.fromtimestamp(store.stat().st_mtime, tz=timezone.utc)
     except OSError:
         log.warning("could not read %s for pane %s", store, join.pane_id, exc_info=True)
@@ -243,7 +263,7 @@ def status_for_pane(
     liveness = observe_liveness(
         join.pid, last_advance=last_advance, now=now, alive_probe=alive_probe
     )
-    status = apply_liveness(derive_status(observation.signals), liveness)
+    status = apply_liveness(derived, liveness)
     if status is Status.UNKNOWN:
         return Status.UNKNOWN, None
 
@@ -259,6 +279,7 @@ async def publish_once(
     read_variables: Callable[[str], object],
     set_variable: component.SetVariable,
     sessions_root: Path | None = None,
+    store_roots: Mapping[str, Path] | None = None,
     db_path: Path | None = None,
     now: datetime | None = None,
     table: ProcessTable | None = None,
@@ -298,6 +319,10 @@ async def publish_once(
     if table is None and panes:
         table = read_process_table()
 
+    # Candidate metadata is expensive for Codex because identity lives in
+    # the file. Share it across panes in this one process-table tick.
+    candidate_cache: dict[tuple[str, str, str], tuple[Path, ...]] = {}
+
     pushes = []
     for pane_id in panes:
         status, task, payload = Status.UNKNOWN, None, None
@@ -307,11 +332,13 @@ async def publish_once(
                 status, task = status_for_pane(
                     variables,
                     sessions_root=sessions_root,
+                    store_roots=store_roots,
                     db_path=db_path,
                     now=when,
                     table=table,
                     cwd_reader=cwd_reader,
                     alive_probe=alive_probe,
+                    candidate_cache=candidate_cache,
                 )
             payload = await component.push_status(set_variable, pane_id, status, task, now=stamp)
         except Exception:
@@ -327,7 +354,7 @@ async def publish_once(
 #: asks for them. `session.id` is not among them: the reader already knows
 #: which pane it asked about, and iTerm2 answers a variable request for a
 #: closed pane with an error rather than with a corrected id.
-PANE_VARIABLE_NAMES = ("jobPid", "jobName", "path")
+PANE_VARIABLE_NAMES = ("jobPid", "jobName", "path", "user.palaver_session_pin")
 
 
 def make_variables_reader(connection: object) -> Callable[[str], object]:
@@ -359,9 +386,13 @@ def make_variables_reader(connection: object) -> Callable[[str], object]:
     async def read_variables(pane_id: str) -> PaneVariables | None:
         result = await iterm2.rpc.async_variable(connection, pane_id, [], list(PANE_VARIABLE_NAMES))
         response = result.variable_response
-        if response.status != ok or len(response.values) != len(PANE_VARIABLE_NAMES):
+        # Older iTerm2/API test doubles may omit the optional pin variable;
+        # the three process variables remain sufficient for automatic join.
+        if response.status != ok or len(response.values) < 3:
             return None
-        job_pid, job_name, path = (_decode_variable(value) for value in response.values)
+        decoded = [_decode_variable(value) for value in response.values]
+        job_pid, job_name, path = decoded[:3]
+        pin = decoded[3] if len(decoded) > 3 else None
         return PaneVariables(
             pane_id=pane_id,
             job_pid=int(job_pid)
@@ -369,6 +400,7 @@ def make_variables_reader(connection: object) -> Callable[[str], object]:
             else None,
             job_name=job_name if isinstance(job_name, str) else None,
             path=path if isinstance(path, str) else None,
+            pin=pin if isinstance(pin, str) else None,
         )
 
     return read_variables
@@ -400,6 +432,7 @@ async def publish_forever(
     read_variables: Callable[[str], object],
     set_variable: component.SetVariable,
     sessions_root: Path | None = None,
+    store_roots: Mapping[str, Path] | None = None,
     db_path: Path | None = None,
     cadence: float = component.PUSH_CADENCE,
     limit: int | None = None,
@@ -446,6 +479,7 @@ async def publish_forever(
             read_variables=read_variables,
             set_variable=set_variable,
             sessions_root=sessions_root,
+            store_roots=store_roots,
             db_path=db_path,
             on_status=on_status,
         )

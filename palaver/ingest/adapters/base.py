@@ -51,6 +51,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 from palaver.ingest.cursors import Cursor
+from palaver.project_identity import (
+    ProjectIdentity,
+    canonical_project_path,
+    project_identity_for_cwd,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,7 @@ class SessionRef:
     session_key: str
     path: Path
     mtime: float
+    project: ProjectIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +259,21 @@ class Adapter(ABC):
         apply, not a requirement of this interface.
         """
 
+    def project_identity_for(self, path: Path) -> ProjectIdentity:
+        """Return the source-derived project identity for ``path``.
+
+        Sources whose project is encoded in their path can use the default
+        implementation. A source such as Codex returns an absolute cwd from
+        its existing ``project_key_for`` method; that cwd is converted into a
+        shared collision-resistant identity rather than using date folders.
+        """
+        project_key_for = getattr(self, "project_key_for", None)
+        project_key = project_key_for(path) if project_key_for is not None else None
+        if isinstance(project_key, str) and Path(project_key).is_absolute():
+            return project_identity_for_cwd(project_key)
+        name = project_key if isinstance(project_key, str) and project_key else path.parent.name
+        return ProjectIdentity(name=name, path=canonical_project_path(path.parent))
+
     @abstractmethod
     def tail(self, path: Path, cursor: Cursor) -> TailResult:
         """Read every complete record appended after `cursor`, read-only.
@@ -317,4 +338,5 @@ class Adapter(ABC):
             session_key=self.session_key_for(path),
             path=path,
             mtime=mtime,
+            project=self.project_identity_for(path),
         )

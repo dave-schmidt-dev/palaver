@@ -131,7 +131,7 @@ def plan_tick(
         for index, ref in enumerate(refs, start=1):
             if on_status is not None:
                 on_status(f"{adapter.source} {index}/{total}: tailing {ref.session_key}")
-            before = cursors.load(ref.session_key)
+            before = cursors.load(ref.session_key, source=ref.source)
             result = adapter.tail(ref.path, before)
             if result.cursor.offset == before.offset:
                 skipped.append(ref)

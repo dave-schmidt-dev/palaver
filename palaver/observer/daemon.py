@@ -72,6 +72,11 @@ from palaver.ingest.adapters.base import DEFAULT_SINCE, Adapter, SessionRef
 from palaver.ingest.cursors import CursorStore
 from palaver.observer.scheduler import SessionWork, TickPlan, plan_tick
 from palaver.observer.signals import REFINEMENT_PAYLOAD_KEYS, extraction_from_model_payload
+from palaver.project_identity import (
+    ProjectIdentity,
+    canonical_project_path,
+    project_identity_for_cwd,
+)
 from palaver.store.migrate import connect, migrate
 
 #: Recorded in `model_runs.model`. llama-server ignores the field when it
@@ -186,10 +191,20 @@ class TickResult:
 
 
 def _get_or_create_project(conn: sqlite3.Connection, name: str, path: str) -> int:
-    """Return `projects.id` for `name`, inserting a row if none exists yet."""
-    row = conn.execute("SELECT id FROM projects WHERE name = ?", (name,)).fetchone()
+    """Return the project at ``path``, never merging distinct paths by name."""
+    path = str(canonical_project_path(path))
+    row = conn.execute("SELECT id FROM projects WHERE path = ?", (path,)).fetchone()
     if row is not None:
         return row[0]
+    existing = conn.execute("SELECT path FROM projects WHERE name = ?", (name,)).fetchone()
+    if existing is not None and existing[0] != path:
+        # The identity normally already carries a path digest. This fallback
+        # also protects callers supplying a legacy/readable name directly.
+        name = project_identity_for_cwd(path).name
+        suffix = 2
+        while conn.execute("SELECT 1 FROM projects WHERE name = ?", (name,)).fetchone():
+            name = f"{project_identity_for_cwd(path).name}-{suffix}"
+            suffix += 1
     cursor = conn.execute("INSERT INTO projects(name, path) VALUES (?, ?)", (name, path))
     return cursor.lastrowid
 
@@ -229,10 +244,11 @@ def ensure_scope(conn: sqlite3.Connection, ref: SessionRef) -> tuple[int, int]:
     Returns:
         `(project_id, session_id)`, both existing rows after this call.
     """
-    project_name, _, _ = ref.session_key.rpartition("/")
-    if not project_name:
-        project_name = ref.path.parent.name
-    project_id = _get_or_create_project(conn, project_name, str(ref.path.parent))
+    identity = ref.project or ProjectIdentity(
+        name=ref.path.parent.name,
+        path=canonical_project_path(ref.path.parent),
+    )
+    project_id = _get_or_create_project(conn, identity.name, str(identity.path))
     session_id = _get_or_create_session(conn, project_id, ref.source, ref.session_key)
     return project_id, session_id
 
@@ -286,8 +302,10 @@ class ModelExtractor:
         on_status: Callable[[str], None],
     ) -> None:
         """Extract one session and persist its ephemeral state."""
+        if work.ref.source not in {"claude-code", "codex"}:
+            raise ValueError(f"unsupported extraction source: {work.ref.source}")
         project_id, session_id = ensure_scope(conn, work.ref)
-        transcript = normalize_path(work.ref.path)
+        transcript = normalize_path(work.ref.path, source=work.ref.source)
         client = ModelClient(conn, host=self.host, port=self.port, timeout=self.timeout)
         payload = client.complete(
             model=self.model,
@@ -308,6 +326,7 @@ class ModelExtractor:
             project_id=project_id,
             session_id=session_id,
             extraction=extraction,
+            source=work.ref.source,
         )
         conn.commit()
 
@@ -448,7 +467,7 @@ class ObserverDaemon:
                 failed.append((key, f"{type(exc).__name__}: {exc}"))
                 self.on_status(f"tick {tick}: extraction failed for {key}: {exc}")
                 continue
-            self.cursors.save(key, work.cursor_after)
+            self.cursors.save(key, work.cursor_after, source=work.ref.source)
             extracted.append(key)
 
         return TickResult(

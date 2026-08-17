@@ -20,10 +20,10 @@ recoverable and a permanently invisible session is not. A cursor handed back
 after that repair is *behind* the one passed in, which is the only case where
 that happens.
 
-A cursor is written to its own file, one per session, so one session's
-write can never corrupt another's. Each write goes to a temp file in the
-same directory and is atomically renamed into place with `os.replace`, so a
-crash mid-write leaves either the old cursor file or the new one, never a
+A cursor is written to its own file, one per `(source, session)` pair, so
+different adapters can never share an offset. Each write goes to a temp file
+in the same directory and is atomically renamed into place with `os.replace`,
+so a crash mid-write leaves either the old cursor file or the new one, never a
 half-written one that would fail to parse on the next restart.
 """
 
@@ -49,7 +49,7 @@ class Cursor:
 
 
 class CursorStore:
-    """Persists one `Cursor` per session key as a small JSON file on disk."""
+    """Persists one `Cursor` per `(source, session_key)` as JSON on disk."""
 
     def __init__(self, root: str | Path) -> None:
         """Create (if absent) and use `root` as the cursor directory.
@@ -60,42 +60,58 @@ class CursorStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def _path_for(self, session_key: str) -> Path:
+    def _path_for(self, source: str, session_key: str) -> Path:
         # session_key may contain characters that are unsafe in a filename
         # (path separators, etc.), so the on-disk name is a digest of it
         # rather than the key itself. The key is still recorded inside the
         # file for debuggability.
+        digest = hashlib.sha256(f"{source}\0{session_key}".encode("utf-8")).hexdigest()
+        return self.root / f"{digest}.json"
+
+    def _legacy_path_for(self, session_key: str) -> Path:
         digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
         return self.root / f"{digest}.json"
 
-    def load(self, session_key: str) -> Cursor:
+    def load(self, session_key: str, *, source: str = "claude-code") -> Cursor:
         """Return the stored cursor for `session_key`, or offset 0 if none exists.
 
         Args:
             session_key: Durable identity of the session, as produced by an
                 adapter's `session_key_for`.
+            source: Adapter source namespace. Defaults to Claude Code so
+                existing callers retain the legacy behavior.
 
         Returns:
             The persisted `Cursor`, or a fresh `Cursor(offset=0)` the first
             time this session is ever tailed.
         """
-        path = self._path_for(session_key)
+        path = self._path_for(source, session_key)
+        if not path.exists() and source == "claude-code":
+            path = self._legacy_path_for(session_key)
         if not path.exists():
             return Cursor()
         data = json.loads(path.read_text(encoding="utf-8"))
         return Cursor(offset=data["offset"])
 
-    def save(self, session_key: str, cursor: Cursor) -> None:
+    def save(
+        self,
+        session_key: str,
+        cursor: Cursor,
+        *,
+        source: str = "claude-code",
+    ) -> None:
         """Persist `cursor` for `session_key`, atomically.
 
         Args:
             session_key: Durable identity of the session.
             cursor: The new cursor value to persist.
+            source: Adapter source namespace. Defaults to Claude Code for
+                compatibility with existing callers.
         """
-        path = self._path_for(session_key)
+        path = self._path_for(source, session_key)
         tmp_path = path.with_suffix(".json.tmp")
         tmp_path.write_text(
-            json.dumps({"session_key": session_key, "offset": cursor.offset}),
+            json.dumps({"source": source, "session_key": session_key, "offset": cursor.offset}),
             encoding="utf-8",
         )
         os.replace(tmp_path, path)

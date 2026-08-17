@@ -58,6 +58,14 @@ from palaver.ingest.adapters.claude_code import (
     SYSTEM_SUBTYPE_KINDS,
     classify_channel,
 )
+from palaver.ingest.adapters.codex import (
+    CHANNEL_HUMAN as CODEX_CHANNEL_HUMAN,
+)
+from palaver.ingest.adapters.codex import (
+    codex_role_class,
+    message_text,
+    order_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +87,11 @@ BASH_COMMAND_CHAR_CAP = 160
 #: Characters kept from a JSON-rendered tool-input map for tool names with no
 #: dedicated summary (`_TOOL_SUMMARY_HANDLERS` below).
 TOOL_INPUT_JSON_CHAR_CAP = 300
+
+# Codex tool and error records can contain command output or serialized
+# arguments. Keep those structural summaries bounded just like Claude tool
+# summaries; semantic message text has the larger text cap below.
+CODEX_STRUCTURAL_CHAR_CAP = 400
 
 #: Renders a classified channel onto the tag a line actually carries. Built
 #: from `classify_channel`'s own two return values rather than two
@@ -298,18 +311,24 @@ def _parse_record(raw: bytes, path: Path | str) -> dict | None:
     return record
 
 
-def normalize_records(records: Iterable[dict]) -> str:
+def normalize_records(records: Iterable[dict], *, source: str = "claude-code") -> str:
     """Render decoded JSONL records to a semantic turn transcript.
 
     Args:
         records: Decoded JSONL records, in file order. Each is independently
             classified and rendered; a record this module does not recognize
             (an unhandled `type`) contributes nothing rather than raising.
+        source: Source renderer. ``claude-code`` preserves the original
+            renderer; ``codex`` uses the bounded rollout renderer.
 
     Returns:
         The transcript, one rendered line per newline, ending in a single
         trailing newline. `""` if no record rendered any lines.
     """
+    if source == "codex":
+        return normalize_codex_records(records)
+    if source != "claude-code":
+        raise ValueError(f"unsupported normalization source: {source}")
     lines: list[str] = []
     for record in records:
         lines.extend(_render_record(record))
@@ -318,7 +337,97 @@ def normalize_records(records: Iterable[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def normalize_path(path: str | Path) -> str:
+def _codex_payload(record: dict) -> dict:
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _codex_structural_summary(record: dict) -> str | None:
+    """Render one recognized Codex tool/error record without its full payload."""
+    payload = _codex_payload(record)
+    record_type = record.get("type")
+    payload_type = payload.get("type")
+    if record_type == "response_item" and payload_type == "function_call":
+        name = payload.get("name") or "?"
+        arguments = payload.get("arguments")
+        if isinstance(arguments, str):
+            rendered = arguments
+        elif arguments is None:
+            rendered = ""
+        else:
+            rendered = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        return f"tool> {name}: {_clip(rendered, CODEX_STRUCTURAL_CHAR_CAP)}"
+    if record_type == "response_item" and payload_type == "function_call_output":
+        output = payload.get("output")
+        return f"result> {_clip(str(output or ''), CODEX_STRUCTURAL_CHAR_CAP)}"
+    if record_type == "event_msg" and payload.get("type") == "error":
+        detail = payload.get("message") or payload.get("codex_error_info") or "error"
+        return f"error> {_clip(str(detail), CODEX_STRUCTURAL_CHAR_CAP)}"
+    if record_type == "event_msg" and payload.get("type") in {
+        "exec_command_end",
+        "patch_apply_end",
+    }:
+        # Only failed command/patch outcomes are surfaced. Successful tool
+        # completions carry no semantic text and would make the stream noisy.
+        failed = payload.get("status") == "failed" or payload.get("success") is False
+        exit_code = payload.get("exit_code")
+        failed = failed or (
+            isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code != 0
+        )
+        if failed:
+            detail = payload.get("message") or payload.get("status") or "tool failed"
+            return f"error> {_clip(str(detail), CODEX_STRUCTURAL_CHAR_CAP)}"
+    return None
+
+
+def _render_codex_record(record: dict) -> list[str]:
+    """Render a bounded semantic subset of one Codex rollout record."""
+    if (
+        record.get("type") == "response_item"
+        and _codex_payload(record).get("type") == "message"
+    ):
+        text = message_text(record).strip()
+        if not text:
+            return []
+        role = _codex_payload(record).get("role")
+        if role == "assistant":
+            tag = AGENT_TAG
+        elif codex_role_class(record) == CODEX_CHANNEL_HUMAN:
+            tag = "HUMAN"
+        else:
+            tag = "INJECTED"
+        return [f"{tag}: {_clip(text, TEXT_CHAR_CAP)}"]
+    summary = _codex_structural_summary(record)
+    return [] if summary is None else [summary]
+
+
+def normalize_codex_records(records: Iterable[dict]) -> str:
+    """Render Codex rollout records to a bounded semantic transcript.
+
+    Reasoning, bookkeeping, unknown payloads, and successful tool events are
+    intentionally omitted. Channel labels use Codex's measured classifier;
+    they are not inferred from message prose here.
+    """
+    lines: list[str] = []
+    for record in order_records(list(records)):
+        lines.extend(_render_codex_record(record))
+    return "" if not lines else "\n".join(lines) + "\n"
+
+
+def normalize_codex_path(path: str | Path) -> str:
+    """Read and normalize a Codex rollout through the read-only chokepoint."""
+    raw_records, _ = read_complete_records(path, 0)
+    records = []
+    for raw in raw_records:
+        record = _parse_record(raw, path)
+        if record is not None:
+            records.append(record)
+    return normalize_codex_records(records)
+
+
+def normalize_path(path: str | Path, *, source: str = "claude-code") -> str:
     """Read one JSONL session store read-only and normalize it to a transcript.
 
     Reads via `read_complete_records` (in turn, `open_source_readonly`) —
@@ -330,6 +439,10 @@ def normalize_path(path: str | Path) -> str:
     Returns:
         The normalized transcript; see `normalize_records`.
     """
+    if source == "codex":
+        return normalize_codex_path(path)
+    if source != "claude-code":
+        raise ValueError(f"unsupported normalization source: {source}")
     raw_records, _ = read_complete_records(path, 0)
     records = []
     for raw in raw_records:

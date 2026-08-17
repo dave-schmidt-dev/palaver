@@ -40,8 +40,10 @@ from pathlib import Path
 from typing import Callable, TextIO
 
 from palaver.ingest.adapters.claude_code import ClaudeCodeAdapter
-from palaver.observer.signals import Status, derive_status
-from palaver.observer.turn_boundary import observe_session
+from palaver.ingest.adapters.codex import CodexAdapter
+from palaver.ingest.cursors import Cursor
+from palaver.observer.signals import Status, Tri, derive_status
+from palaver.observer.turn_boundary import derive_signals_from_events, observe_session
 
 NAME = "status"
 HELP = "show current status for discovered sessions"
@@ -96,6 +98,8 @@ def _format_age(age: timedelta) -> str:
 def collect_status(
     sample_root: Path | None,
     *,
+    codex_root: Path | None = None,
+    source: str = "claude-code",
     now: datetime | None = None,
     on_status: Callable[[str], None] | None = None,
 ) -> tuple[SessionStatusRow, ...]:
@@ -119,23 +123,47 @@ def collect_status(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    adapter = ClaudeCodeAdapter(root=sample_root)
-    refs = adapter.discover_sessions(now=now)
-
     rows = []
-    total = len(refs)
-    for index, ref in enumerate(refs, start=1):
-        if on_status is not None:
-            on_status(f"observing {index}/{total}: {ref.session_key}")
-        observation = observe_session(ref.path, now=now)
-        rows.append(
-            SessionStatusRow(
-                project=adapter.project_key_for(ref.path),
-                session_id=ref.path.stem,
-                status=derive_status(observation.signals),
-                age=now - datetime.fromtimestamp(ref.mtime, tz=timezone.utc),
+    if source not in {"claude-code", "codex", "all"}:
+        raise ValueError(f"unsupported status source: {source}")
+    adapters = []
+    explicit_roots = sample_root is not None or codex_root is not None
+    if source in {"claude-code", "all"} and (
+        sample_root is not None or not explicit_roots
+    ):
+        adapters.append(ClaudeCodeAdapter(root=sample_root))
+    if source in {"codex", "all"} and (
+        codex_root is not None or not explicit_roots
+    ):
+        adapters.append(CodexAdapter(root=codex_root))
+
+    for adapter in adapters:
+        refs = adapter.discover_sessions(now=now)
+        total = len(refs)
+        for index, ref in enumerate(refs, start=1):
+            if on_status is not None:
+                if source == "claude-code":
+                    on_status(f"observing {index}/{total}: {ref.session_key}")
+                else:
+                    on_status(f"{adapter.source} {index}/{total}: observing {ref.session_key}")
+            if adapter.source == "codex":
+                tail = adapter.tail(ref.path, Cursor())
+                observation = derive_signals_from_events(tail.events, parsed=Tri.TRUE)
+            else:
+                observation = observe_session(ref.path, now=now)
+            project = (
+                ref.project.name
+                if ref.project is not None
+                else adapter.project_identity_for(ref.path).name
             )
-        )
+            rows.append(
+                SessionStatusRow(
+                    project=project,
+                    session_id=ref.path.stem,
+                    status=derive_status(observation.signals),
+                    age=now - datetime.fromtimestamp(ref.mtime, tz=timezone.utc),
+                )
+            )
     return tuple(rows)
 
 
@@ -171,6 +199,7 @@ def add_arguments(parser) -> None:
     )
     parser.add_argument(
         "--sample",
+        "--claude-root",
         type=Path,
         default=None,
         help=(
@@ -178,6 +207,18 @@ def add_arguments(parser) -> None:
             "<root>/<project>/<session>.jsonl (default: Claude Code's own "
             "projects directory)"
         ),
+    )
+    parser.add_argument(
+        "--codex-root",
+        type=Path,
+        default=None,
+        help="directory of Codex rollout stores used by --source codex/all",
+    )
+    parser.add_argument(
+        "--source",
+        choices=("claude-code", "codex", "all"),
+        default="claude-code",
+        help="source to report (default: claude-code; all is explicit)",
     )
 
 
@@ -220,6 +261,12 @@ def run(
         )
         return 2
 
-    rows = collect_status(args.sample, now=now, on_status=on_status)
+    rows = collect_status(
+        getattr(args, "sample", None),
+        codex_root=getattr(args, "codex_root", None),
+        source=getattr(args, "source", "claude-code"),
+        now=now,
+        on_status=on_status,
+    )
     out.write(render_status(rows))
     return 0

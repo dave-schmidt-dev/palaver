@@ -82,6 +82,33 @@ def _session(tmp_path: Path, project: str, name: str, items: list[dict]) -> Path
     return _write(tmp_path / "projects" / project / f"{name}.jsonl", items)
 
 
+def _codex_session(tmp_path: Path, name: str = "codex-session") -> Path:
+    """Write one invented Codex rollout in an explicit fixture root."""
+    path = tmp_path / "codex" / "2026" / "08" / "14" / f"rollout-20260814-{name}.jsonl"
+    return _write(
+        path,
+        [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "cwd": "/tmp/invented-status-project",
+                    "id": name,
+                    "session_id": name,
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "invented status work"}],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        ],
+    )
+
+
 def _set_mtime(path: Path, age: timedelta, now: datetime = NOW) -> None:
     ts = (now - age).timestamp()
     os.utime(path, (ts, ts))
@@ -175,6 +202,51 @@ def test_status_line_reports_project_session_status_and_age(tmp_path):
     assert out.getvalue() == (
         "proj-a session-a-working WORKING 30s\nproj-a session-b-waiting AWAITING_HUMAN 10m\n"
     )
+
+
+def test_status_codex_and_explicit_all_use_only_fixture_roots(tmp_path):
+    """Codex/all are opt-in and never make the default Claude output wider."""
+    claude = _session(tmp_path, "proj-a", "claude-session", [_human(), _assistant()])
+    _set_mtime(claude, timedelta(minutes=5))
+    codex = _codex_session(tmp_path)
+    _set_mtime(codex, timedelta(minutes=5))
+    claude_root = tmp_path / "projects"
+    codex_root = tmp_path / "codex"
+
+    default_out = io.StringIO()
+    status_cli.run(
+        SimpleNamespace(once=True, sample=claude_root), out=default_out, now=NOW
+    )
+    assert default_out.getvalue() == "proj-a claude-session AWAITING_HUMAN 5m\n"
+
+    codex_out = io.StringIO()
+    status_cli.run(
+        SimpleNamespace(
+            once=True,
+            sample=None,
+            codex_root=codex_root,
+            source="codex",
+        ),
+        out=codex_out,
+        now=NOW,
+    )
+    assert len(codex_out.getvalue().splitlines()) == 1
+    assert "codex-session AWAITING_HUMAN 5m" in codex_out.getvalue()
+
+    all_out = io.StringIO()
+    status_cli.run(
+        SimpleNamespace(
+            once=True,
+            sample=claude_root,
+            codex_root=codex_root,
+            source="all",
+        ),
+        out=all_out,
+        now=NOW,
+    )
+    assert len(all_out.getvalue().splitlines()) == 2
+    assert "claude-session" in all_out.getvalue()
+    assert "codex-session" in all_out.getvalue()
 
 
 def test_status_without_once_is_a_usage_error_not_a_silent_default(tmp_path, capsys):

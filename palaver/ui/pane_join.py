@@ -54,13 +54,15 @@ never a byte inside a transcript.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.observer.signals import Liveness, Tri
 
 #: Executable basenames that identify an agent, mapped to the adapter
@@ -101,6 +103,19 @@ DEFAULT_IDLE_WINDOW = timedelta(minutes=10)
 #: could plausibly be the one on screen.
 DEFAULT_ACTIVITY_WINDOW = timedelta(hours=1)
 
+CLAUDE_SOURCE = "claude-code"
+CODEX_SOURCE = "codex"
+PIN_VARIABLE = "user.palaver_session_pin"
+PANE_PIN_VARIABLE = PIN_VARIABLE
+
+
+def default_store_roots() -> dict[str, Path]:
+    """Return the independent on-disk roots used by supported file sources."""
+    return {
+        CLAUDE_SOURCE: Path.home() / ".claude" / "projects",
+        CODEX_SOURCE: Path.home() / ".codex" / "sessions",
+    }
+
 
 @dataclass(frozen=True)
 class PaneVariables:
@@ -122,6 +137,7 @@ class PaneVariables:
     job_pid: int | None
     job_name: str | None
     path: str | None
+    pin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +192,52 @@ class PaneJoin:
     project_key: str
     session_candidates: tuple[str, ...]
     session_key: str | None
+    store_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class PanePin:
+    """A pane-local explicit source/session override."""
+
+    source: str
+    session_key: str
+
+
+def parse_pin(raw: object) -> PanePin | None:
+    """Decode a strict JSON pane pin, returning ``None`` for any invalid value."""
+    if isinstance(raw, Mapping):
+        value = raw
+    else:
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, Mapping):
+        return None
+    if set(value) != {"source", "session_key"}:
+        return None
+    source = value.get("source")
+    session_key = value.get("session_key")
+    if source not in {CLAUDE_SOURCE, CODEX_SOURCE}:
+        return None
+    if not isinstance(session_key, str) or not session_key or "\\" in session_key:
+        return None
+    parts = session_key.split("/")
+    if source == CLAUDE_SOURCE:
+        if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
+            return None
+    elif len(parts) != 1 or parts[0] in {".", ".."}:
+        return None
+    return PanePin(source=source, session_key=session_key)
+
+
+def encode_pin(source: str, session_key: str) -> str:
+    """Encode a pane pin in the same JSON shape the reader accepts."""
+    if source not in {CLAUDE_SOURCE, CODEX_SOURCE} or not session_key:
+        raise ValueError("pin source and session_key must identify a supported source")
+    return json.dumps({"source": source, "session_key": session_key}, separators=(",", ":"))
 
 
 def process_name(command: str) -> str:
@@ -202,7 +264,7 @@ def process_name(command: str) -> str:
     first = command.strip().split(" ", 1)[0]
     if not first:
         return ""
-    return Path(first).name.lstrip("-")
+    return Path(first).name.lstrip("-").lower()
 
 
 def read_process_table() -> ProcessTable:
@@ -344,7 +406,7 @@ def agent_ancestor(job_pid: int, table: ProcessTable) -> ProcessInfo | None:
         info = table.get(pid)
         if info is None:
             return None
-        if info.name in AGENT_SOURCES:
+        if info.name.lstrip("-").lower() in AGENT_SOURCES:
             return info
         if info.name in SHELL_NAMES:
             return None
@@ -422,14 +484,99 @@ def session_candidates(
     return tuple(sorted(found))
 
 
+def _root_for_source(
+    source: str,
+    *,
+    sessions_root: Path | None,
+    store_roots: Mapping[str, Path] | None,
+) -> Path | None:
+    """Resolve one source root without making a missing source disable others."""
+    if store_roots is not None:
+        raw = store_roots.get(source)
+        return None if raw is None else Path(raw).expanduser()
+    if sessions_root is not None:
+        # Backward-compatible single-root injection used by existing callers.
+        return Path(sessions_root)
+    return default_store_roots().get(source)
+
+
+def _readable_file(path: Path) -> bool:
+    """Return whether ``path`` is a regular readable file."""
+    try:
+        return path.is_file() and os.access(path, os.R_OK)
+    except OSError:
+        return False
+
+
+def _codex_store_candidates(
+    root: Path,
+    cwd: Path,
+    *,
+    now: datetime,
+    activity_window: timedelta,
+    cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
+) -> tuple[Path, ...]:
+    """Find recent root Codex rollouts whose metadata names exactly ``cwd``."""
+    cache_key = (CODEX_SOURCE, str(root.resolve(strict=False)), str(cwd.resolve(strict=False)))
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    cutoff = (now - activity_window).timestamp()
+    adapter = CodexAdapter(root)
+    candidates: list[Path] = []
+    for path in adapter.list_store_paths():
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            identity = adapter.read_identity(path)
+        except (OSError, ValueError, TypeError):
+            continue
+        if identity is None or identity.is_subagent or identity.cwd is None:
+            continue
+        if Path(identity.cwd).resolve(strict=False) != cwd.resolve(strict=False):
+            continue
+        if _readable_file(path):
+            candidates.append(path.resolve(strict=False))
+    result = tuple(sorted(candidates))
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _pinned_store_path(root: Path, pin: PanePin) -> Path | None:
+    """Validate a pin's source store, allowing an intentional cwd mismatch."""
+    if pin.source == CLAUDE_SOURCE:
+        project_key, session_id = pin.session_key.split("/")
+        candidate = root / project_key / f"{session_id}.jsonl"
+        matches = [candidate] if _readable_file(candidate) else []
+    else:
+        matches = [
+            path
+            for path in root.rglob(f"{pin.session_key}.jsonl")
+            if _readable_file(path)
+        ] if root.is_dir() else []
+        adapter = CodexAdapter(root)
+        matches = [
+            path
+            for path in matches
+            if (identity := adapter.read_identity(path)) is not None
+            and not identity.is_subagent
+        ]
+    if len(matches) != 1:
+        return None
+    return matches[0].resolve(strict=False)
+
+
 def join_pane(
     variables: PaneVariables,
     *,
     table: ProcessTable | None = None,
     cwd_reader=working_directory,
     sessions_root: Path | None = None,
+    store_roots: Mapping[str, Path] | None = None,
     now: datetime | None = None,
     activity_window: timedelta = DEFAULT_ACTIVITY_WINDOW,
+    pin: PanePin | Mapping[str, object] | str | None = None,
+    candidate_cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
 ) -> PaneJoin | None:
     """Resolve a pane to its agent process and project, or refuse.
 
@@ -452,9 +599,9 @@ def join_pane(
        `jobPid` is a pid that may since have been reused.
     5. An agent is found at or above `job_pid`, below the login shell.
     6. The agent's own working directory is readable **and equal to**
-       `path`. This is the check the join actually rests on, and the only
-       one that corroborates a single fact from two independent sources.
-    7. The encoded project directory exists under `sessions_root`.
+       `path`, unless a validated explicit pin is present. A pin is the
+       deliberate rename/move recovery escape hatch, not an automatic guess.
+    7. The detected source's own store layout supplies exactly one candidate.
 
     Args:
         variables: The pane's iTerm2 variables.
@@ -462,7 +609,9 @@ def join_pane(
             so a test can describe a process tree that is not running.
         cwd_reader: Callable taking a pid and returning its working
             directory or `None`. Injectable for the same reason.
-        sessions_root: The store root; defaults to `~/.claude/projects`.
+        sessions_root: Legacy single-root injection. Prefer `store_roots`.
+        store_roots: Explicit independent roots keyed by source. Omitting a
+            source disables only that source.
         now: Reference time for the candidate window; defaults to now, UTC.
         activity_window: How recently a candidate's store must have been
             written.
@@ -484,33 +633,66 @@ def join_pane(
     if job is None:
         return None
 
-    if variables.job_name and job.name != variables.job_name:
+    pid_is_agent = job.name.lstrip("-").lower() in AGENT_SOURCES
+    if variables.job_name and job.name != variables.job_name and not pid_is_agent:
         return None
 
     agent = agent_ancestor(variables.job_pid, process_table)
     if agent is None:
         return None
 
-    agent_cwd = cwd_reader(agent.pid)
-    if agent_cwd is None or agent_cwd != cwd:
+    source = AGENT_SOURCES[agent.name.lstrip("-").lower()]
+    raw_pin = variables.pin if pin is None else pin
+    parsed_pin = raw_pin if isinstance(raw_pin, PanePin) else parse_pin(raw_pin)
+    if parsed_pin is None and raw_pin not in (None, ""):
+        return None
+    if parsed_pin is not None and parsed_pin.source != source:
         return None
 
-    root = sessions_root if sessions_root is not None else Path.home() / ".claude" / "projects"
-    project_key = project_key_for_cwd(cwd)
-    if not (root / project_key).is_dir():
+    agent_cwd = cwd_reader(agent.pid)
+    if agent_cwd is None or (agent_cwd != cwd and parsed_pin is None):
+        return None
+
+    root = _root_for_source(source, sessions_root=sessions_root, store_roots=store_roots)
+    if root is None:
         return None
 
     if now is None:
         now = datetime.now(timezone.utc)
-    candidates = session_candidates(project_key, root, now=now, activity_window=activity_window)
+    if parsed_pin is not None:
+        store_path = _pinned_store_path(root, parsed_pin)
+        if store_path is None:
+            return None
+        candidates = (parsed_pin.session_key,)
+        project_key = project_key_for_cwd(cwd)
+    elif source == CODEX_SOURCE:
+        codex_paths = _codex_store_candidates(
+            root, cwd, now=now, activity_window=activity_window, cache=candidate_cache
+        )
+        candidates = tuple(path.stem for path in codex_paths)
+        project_key = project_key_for_cwd(cwd)
+        store_path = codex_paths[0] if len(codex_paths) == 1 else None
+    else:
+        project_key = project_key_for_cwd(cwd)
+        if not (root / project_key).is_dir():
+            return None
+        candidates = session_candidates(project_key, root, now=now, activity_window=activity_window)
+        store_path = (
+            (root / project_key / f"{candidates[0]}.jsonl").resolve(strict=False)
+            if len(candidates) == 1
+            else None
+        )
+        if store_path is not None and not _readable_file(store_path):
+            return None
     return PaneJoin(
         pane_id=variables.pane_id,
         pid=agent.pid,
-        source=AGENT_SOURCES[agent.name],
+        source=source,
         cwd=cwd,
         project_key=project_key,
         session_candidates=candidates,
         session_key=candidates[0] if len(candidates) == 1 else None,
+        store_path=store_path,
     )
 
 

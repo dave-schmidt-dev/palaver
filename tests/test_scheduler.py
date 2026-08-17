@@ -61,7 +61,9 @@ from types import SimpleNamespace
 import pytest
 
 from palaver.cli import observe as observe_cli
+from palaver.ingest.adapters.base import SessionRef
 from palaver.ingest.adapters.claude_code import ClaudeCodeAdapter
+from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.ingest.cursors import Cursor, CursorStore
 from palaver.observer.daemon import (
     DaemonNotStartedError,
@@ -110,6 +112,33 @@ def _write_store(root: Path, project: str, session: str, records: list[dict]) ->
     project_dir = root / project
     project_dir.mkdir(parents=True, exist_ok=True)
     path = project_dir / f"{session}.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    _set_mtime(path, timedelta(minutes=5))
+    return path
+
+
+def _write_codex_store(root: Path, session: str = "codex-session") -> Path:
+    """Write one invented Codex rollout in its date-partitioned layout."""
+    path = root / "2026" / "08" / "14" / f"rollout-20260814-{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "cwd": "/tmp/invented-codex-project",
+                "id": session,
+                "session_id": session,
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "invented Codex work"}],
+            },
+        },
+    ]
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
     _set_mtime(path, timedelta(minutes=5))
     return path
@@ -242,6 +271,41 @@ def _cli_args(tmp_path: Path, sample_root: Path, **overrides) -> SimpleNamespace
     }
     args.update(overrides)
     return SimpleNamespace(**args)
+
+
+def test_observe_default_and_explicit_roots_select_only_fixture_sources(monkeypatch, tmp_path):
+    """Default construction names both sources; one fixture root scopes to one."""
+    constructed = []
+
+    class FakeAdapter:
+        def __init__(self, *, root=None):
+            constructed.append((type(self).source, root))
+
+    class FakeClaude(FakeAdapter):
+        source = "claude-code"
+
+    class FakeCodex(FakeAdapter):
+        source = "codex"
+
+    monkeypatch.setattr(observe_cli, "ClaudeCodeAdapter", FakeClaude)
+    monkeypatch.setattr(observe_cli, "CodexAdapter", FakeCodex)
+
+    assert [adapter.source for adapter in observe_cli._configured_adapters(SimpleNamespace())] == [
+        "claude-code",
+        "codex",
+    ]
+    assert constructed == [("claude-code", None), ("codex", None)]
+
+    constructed.clear()
+    claude_root = tmp_path / "claude-fixture"
+    codex_root = tmp_path / "codex-fixture"
+    assert [adapter.source for adapter in observe_cli._configured_adapters(
+        SimpleNamespace(sample=claude_root, codex_root=None)
+    )] == ["claude-code"]
+    assert [adapter.source for adapter in observe_cli._configured_adapters(
+        SimpleNamespace(sample=None, codex_root=codex_root)
+    )] == ["codex"]
+    assert constructed == [("claude-code", claude_root), ("codex", codex_root)]
 
 
 # --- the idle case: zero inference requests ----------------------------------
@@ -690,6 +754,43 @@ def test_model_extractor_writes_current_state_and_no_memories(tmp_path, stub_ser
     assert "please check the deploy" in prompts[0]
 
 
+def test_one_writer_extracts_ephemeral_state_for_claude_and_codex(tmp_path, stub_server):
+    """The supervised daemon handles both supported sources in one writer."""
+    claude_root = tmp_path / "claude-projects"
+    codex_root = tmp_path / "codex-sessions"
+    _write_store(claude_root, "claude-project", "claude-session", [_human(), _assistant()])
+    _write_codex_store(codex_root)
+    prompts: list[str] = []
+    port = stub_server(_prompts_seen(prompts))
+    daemon = ObserverDaemon(
+        db_path=tmp_path / "store" / "palaver.db",
+        adapters=(
+            ClaudeCodeAdapter(root=claude_root),
+            CodexAdapter(root=codex_root),
+        ),
+        cursors=CursorStore(tmp_path / "cursors"),
+        extractor=ModelExtractor(port=port, timeout=10.0),
+        all=True,
+    )
+
+    with daemon:
+        result = daemon.tick(now=NOW)
+        sources = daemon.conn.execute(
+            "SELECT source FROM sessions ORDER BY source"
+        ).fetchall()
+        state_count = daemon.conn.execute("SELECT COUNT(*) FROM current_state").fetchone()[0]
+        runs = daemon.conn.execute(
+            "SELECT COUNT(*) FROM model_runs WHERE purpose = 'observer-extraction'"
+        ).fetchone()[0]
+
+    assert result.failed == ()
+    assert len(result.extracted) == 2
+    assert sources == [("claude-code",), ("codex",)]
+    assert state_count == 6
+    assert runs == 2
+    assert len(prompts) == 2
+
+
 def test_extraction_prompt_never_asks_for_a_status(tmp_path, stub_server):
     """INV-7: status is derived, so the request must not solicit one.
 
@@ -757,3 +858,31 @@ def test_ensure_scope_is_idempotent_across_ticks(tmp_path):
     assert projects == 1
     assert sessions == 1
     assert path.exists()
+
+
+def test_ensure_scope_isolates_equal_external_ids_by_source(tmp_path):
+    """Equal session keys from two adapters create distinct source rows."""
+    sample_root = tmp_path / "projects"
+    path = _write_store(sample_root, "proj", "same-session", [_human()])
+    (claude_ref,) = ClaudeCodeAdapter(root=sample_root).discover_sessions(all=True)
+    codex_ref = SessionRef(
+        source="codex",
+        session_key=claude_ref.session_key,
+        path=path,
+        mtime=claude_ref.mtime,
+        project=claude_ref.project,
+    )
+
+    with _daemon(tmp_path, sample_root, RecordingExtractor()) as daemon:
+        claude_scope = ensure_scope(daemon.conn, claude_ref)
+        codex_scope = ensure_scope(daemon.conn, codex_ref)
+        rows = daemon.conn.execute(
+            "SELECT source, external_id FROM sessions ORDER BY source"
+        ).fetchall()
+
+    assert claude_scope[0] == codex_scope[0]
+    assert claude_scope[1] != codex_scope[1]
+    assert rows == [
+        ("claude-code", claude_ref.session_key),
+        ("codex", claude_ref.session_key),
+    ]

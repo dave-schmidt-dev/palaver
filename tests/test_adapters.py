@@ -24,7 +24,9 @@ from palaver.ingest.adapters.base import (
     TailResult,
     read_complete_records,
 )
+from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.ingest.cursors import Cursor, CursorStore
+from palaver.project_identity import project_identity_for_cwd
 
 NOW = datetime(2026, 8, 14, tzinfo=timezone.utc)
 
@@ -348,6 +350,71 @@ def test_cursor_store_load_before_any_save_starts_at_zero(tmp_path):
     store = CursorStore(tmp_path / "cursors")
 
     assert store.load("never-seen-session") == Cursor(offset=0)
+
+
+def test_cursor_store_namespaces_sources_and_preserves_legacy_claude_cursor(tmp_path):
+    """Equal keys from different adapters never share a durable offset."""
+    store = CursorStore(tmp_path / "cursors")
+    legacy_path = store._legacy_path_for("same-session")
+    legacy_path.write_text(
+        json.dumps({"session_key": "same-session", "offset": 7}), encoding="utf-8"
+    )
+
+    assert store.load("same-session", source="claude-code") == Cursor(offset=7)
+    store.save("same-session", Cursor(offset=11), source="claude-code")
+    store.save("same-session", Cursor(offset=19), source="codex")
+
+    assert store.load("same-session", source="claude-code") == Cursor(offset=11)
+    assert store.load("same-session", source="codex") == Cursor(offset=19)
+    assert legacy_path.exists()
+    assert len(list((tmp_path / "cursors").glob("*.json"))) == 3
+
+
+def test_codex_project_identity_uses_cwd_not_same_day_rollout_directory(tmp_path):
+    """Date folders and punctuation-normalized paths cannot collapse scope."""
+    root = tmp_path / "codex-sessions"
+    day = root / "2026" / "08" / "17"
+    first_cwd = tmp_path / "one" / "repo"
+    second_cwd = tmp_path / "two" / "repo"
+    punctuation_cwd = tmp_path / "one" / "repo-x"
+    # ``repo-x`` and ``repo/x`` are distinct paths that Claude's replacement
+    # encoding would otherwise render identically.
+    punctuation_collision_cwd = tmp_path / "one" / "repo" / "x"
+
+    for index, cwd in enumerate(
+        (first_cwd, second_cwd, punctuation_cwd, punctuation_collision_cwd), start=1
+    ):
+        path = day / f"rollout-2026-08-17T00-00-0{index}-session-{index}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "cwd": str(cwd),
+                        "id": f"session-{index}",
+                        "session_id": f"session-{index}",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    refs = CodexAdapter(root=root).discover_sessions(all=True)
+    identities = [ref.project for ref in refs]
+
+    assert {identity.path for identity in identities} == {
+        first_cwd.resolve(),
+        second_cwd.resolve(),
+        punctuation_cwd.resolve(),
+        punctuation_collision_cwd.resolve(),
+    }
+    assert len({identity.name for identity in identities}) == 4
+    assert all("2026" not in identity.name for identity in identities)
+    assert project_identity_for_cwd(punctuation_cwd).name != project_identity_for_cwd(
+        punctuation_collision_cwd
+    ).name
 
 
 def test_adapters_never_open_source_writable(tmp_path, monkeypatch):

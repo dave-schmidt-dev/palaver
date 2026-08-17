@@ -37,6 +37,7 @@ it writes Palaver's own two `user.` variables and reads profile properties
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from collections.abc import Callable
@@ -53,6 +54,7 @@ from palaver.ui.connection import (
     preflight,
     request_cookie_and_key,
 )
+from palaver.ui.pane_join import CLAUDE_SOURCE, CODEX_SOURCE, PIN_VARIABLE
 
 NAME = "ui"
 HELP = "check the iTerm2 pane surface, or turn its status bar on"
@@ -77,6 +79,24 @@ TICK_BASELINE = -1
 #: How many times the render path is invoked. More than one, so "the tick
 #: advanced" is a claim about counting rather than about a single write.
 RENDERS = 2
+
+
+async def set_session_pin(
+    writer: component.SetVariable,
+    pane_id: str,
+    *,
+    source: str | None = None,
+    session_key: str | None = None,
+) -> str:
+    """Write or clear one pane's pin without selecting or focusing it."""
+    if source is None and session_key is None:
+        value = ""
+    elif source in {CLAUDE_SOURCE, CODEX_SOURCE} and isinstance(session_key, str) and session_key:
+        value = json.dumps({"source": source, "session_key": session_key}, separators=(",", ":"))
+    else:
+        raise ValueError("pin requires a supported source and non-empty session key")
+    await writer(pane_id, PIN_VARIABLE, value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -424,6 +444,17 @@ def add_arguments(parser) -> None:
         help="pane to test against (default: the current pane)",
     )
     parser.add_argument(
+        "--pin",
+        nargs=2,
+        metavar=("SOURCE", "SESSION_KEY"),
+        help="pin a named pane to SOURCE and SESSION_KEY without focusing it",
+    )
+    parser.add_argument(
+        "--clear-pin",
+        action="store_true",
+        help="clear the explicit pin from the named pane",
+    )
+    parser.add_argument(
         "--width",
         type=int,
         default=component.DEFAULT_WIDTH,
@@ -460,6 +491,17 @@ def run(
     out = sys.stdout if out is None else out
     on_status = _stderr_status if on_status is None else on_status
 
+    pin = getattr(args, "pin", None)
+    clear_pin = getattr(args, "clear_pin", False)
+    if pin and clear_pin:
+        print("palaver ui: --pin and --clear-pin contradict each other", file=out)
+        return 2
+    if pin and (len(pin) != 2 or pin[0] not in {CLAUDE_SOURCE, CODEX_SOURCE} or not pin[1]):
+        print("palaver ui: --pin requires SOURCE claude-code/codex and SESSION_KEY", file=out)
+        return 2
+    if (pin or clear_pin) and not getattr(args, "session", None):
+        print("palaver ui: --pin/--clear-pin requires --session PANE_ID", file=out)
+        return 2
     if args.enable_status_bar and args.disable_status_bar:
         print(
             "palaver ui: --enable-status-bar and --disable-status-bar contradict each other",
@@ -467,7 +509,7 @@ def run(
         )
         return 2
 
-    if not (args.selftest or args.enable_status_bar or args.disable_status_bar):
+    if not (args.selftest or args.enable_status_bar or args.disable_status_bar or pin or clear_pin):
         print(
             "palaver ui: nothing to do; pass --selftest to check the pane surface "
             "or --enable-status-bar to turn it on",
@@ -495,6 +537,19 @@ def run(
     collected: list[Check] = []
 
     async def main(connection):
+        if pin or clear_pin:
+            writer = component.make_variable_writer(connection)
+            if clear_pin:
+                await set_session_pin(writer, args.session)
+                collected.append(Check("pin", True, f"cleared for pane {args.session}"))
+            else:
+                await set_session_pin(
+                    writer,
+                    args.session,
+                    source=pin[0],
+                    session_key=pin[1],
+                )
+                collected.append(Check("pin", True, f"set for pane {args.session}"))
         if args.enable_status_bar or args.disable_status_bar:
             collected.extend(
                 await set_status_bar(connection, shown=args.enable_status_bar, on_status=on_status)

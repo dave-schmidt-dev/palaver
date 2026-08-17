@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import subprocess
@@ -31,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from palaver.cli import ui as cli_ui
 from palaver.observer.signals import Status
 from palaver.ui import autolaunch, component, connection
 from palaver.ui.autolaunch import (
@@ -83,6 +85,7 @@ from palaver.ui.connection import (
     resolve_target,
     socket_path,
 )
+from palaver.ui.pane_join import PIN_VARIABLE
 
 live = pytest.mark.skipif(
     sys.platform != "darwin" or not Path("/Applications/iTerm.app").exists(),
@@ -609,6 +612,25 @@ class _Writes:
 
     def named(self, name):
         return [call for call in self.calls if call[1] == name]
+
+
+def test_pin_cli_writes_named_pane_without_focus_or_selection_calls():
+    """Pin operations use only the authenticated variable writer."""
+    writes = _Writes()
+
+    async def writer(session_id, name, value):
+        await writes(session_id, name, value)
+
+    encoded = asyncio.run(
+        cli_ui.set_session_pin(writer, "named-pane", source="codex", session_key="rollout-1")
+    )
+    cleared = asyncio.run(cli_ui.set_session_pin(writer, "named-pane"))
+    assert json.loads(encoded) == {"source": "codex", "session_key": "rollout-1"}
+    assert cleared == ""
+    assert [call[0] for call in writes.calls] == ["named-pane", "named-pane"]
+    assert all(call[1] == PIN_VARIABLE for call in writes.calls)
+    source = inspect.getsource(cli_ui.set_session_pin)
+    assert all(token not in source for token in (".focus(", ".select(", ".activate("))
 
 
 class _StubReference:

@@ -42,6 +42,8 @@ from palaver.observer.signals import Status
 from palaver.store.migrate import migrate
 from palaver.ui import autolaunch, component, publisher
 from palaver.ui.pane_join import (
+    CODEX_SOURCE,
+    PaneJoin,
     PaneVariables,
     ProcessInfo,
     process_name,
@@ -248,6 +250,78 @@ def test_a_working_pane_is_published_with_its_status(pane):
         Status.WORKING,
         None,
     )
+
+
+def test_codex_status_reads_the_validated_store_path_and_events(tmp_path, monkeypatch):
+    """Codex status uses its date-partitioned join path, not Claude layout."""
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    store = tmp_path / "codex" / "2026" / "08" / "15" / "rollout-root.jsonl"
+    store.parent.mkdir(parents=True)
+    records = [
+        {"type": "session_meta", "payload": {"id": "root", "session_id": "root", "cwd": str(cwd)}},
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": []},
+        },
+    ]
+    store.write_text("".join(json.dumps(record) + "\n" for record in records))
+    os.utime(store, (NOW.timestamp(), NOW.timestamp()))
+    joined = PaneJoin(
+        pane_id=PANE,
+        pid=AGENT_PID,
+        source=CODEX_SOURCE,
+        cwd=cwd,
+        project_key="unused",
+        session_candidates=(store.stem,),
+        session_key=store.stem,
+        store_path=store.resolve(),
+    )
+    monkeypatch.setattr(publisher, "join_pane", lambda *args, **kwargs: joined)
+    status, task = status_for_pane(
+        PaneVariables(PANE, AGENT_PID, "codex", str(cwd)),
+        now=NOW,
+        table={},
+        cwd_reader=lambda _pid: cwd,
+        alive_probe=lambda _pid: True,
+    )
+    assert status is Status.WORKING
+    assert task is None
+
+
+def test_codex_turn_boundary_is_derived_without_reconstructing_a_claude_path(tmp_path, monkeypatch):
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    store = tmp_path / "codex" / "2026" / "08" / "15" / "rollout-ended.jsonl"
+    store.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {"id": "ended", "session_id": "ended", "cwd": str(cwd)},
+        },
+        {"type": "event_msg", "payload": {"type": "task_complete"}},
+    ]
+    store.write_text("".join(json.dumps(record) + "\n" for record in records))
+    os.utime(store, (NOW.timestamp(), NOW.timestamp()))
+    joined = PaneJoin(
+        pane_id=PANE,
+        pid=AGENT_PID,
+        source=CODEX_SOURCE,
+        cwd=cwd,
+        project_key="unused",
+        session_candidates=(store.stem,),
+        session_key=store.stem,
+        store_path=store.resolve(),
+    )
+    monkeypatch.setattr(publisher, "join_pane", lambda *args, **kwargs: joined)
+    status, _ = status_for_pane(
+        PaneVariables(PANE, AGENT_PID, "codex", str(cwd)),
+        now=NOW,
+        table={},
+        cwd_reader=lambda _pid: cwd,
+        alive_probe=lambda _pid: True,
+    )
+    assert status is Status.AWAITING_HUMAN
 
 
 def test_the_published_payload_is_what_the_component_would_render(pane):
@@ -691,6 +765,15 @@ def test_two_agents_sharing_a_session_id_do_not_share_a_task(tmp_path):
     assert (
         read_current_task(db_path, source="codex", session_key=SESSION_KEY, now=NOW)
         == "the codex session's work"
+    )
+
+
+def test_task_lookup_is_source_scoped_even_when_only_one_source_has_a_row(tmp_path):
+    db_path = _store_with_task(tmp_path, "claude-only work")
+    assert read_current_task(db_path, source="codex", session_key=SESSION_KEY, now=NOW) is None
+    assert (
+        read_current_task(db_path, source=PUBLISHABLE_SOURCE, session_key=SESSION_KEY, now=NOW)
+        == "claude-only work"
     )
 
 

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TextIO
 
 from palaver.ingest.adapters.claude_code import ClaudeCodeAdapter
+from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.ingest.cursors import CursorStore
 from palaver.observer.daemon import DEFAULT_INTERVAL, ObserverDaemon, TickResult
 from palaver.observer.scheduler import TickPlan, plan_tick
@@ -94,12 +95,22 @@ def add_arguments(parser) -> None:
     )
     parser.add_argument(
         "--sample",
+        "--claude-root",
         type=Path,
         default=None,
         help=(
             "directory of session stores to observe, laid out as "
             "<root>/<project>/<session>.jsonl (default: Claude Code's own "
             "projects directory)"
+        ),
+    )
+    parser.add_argument(
+        "--codex-root",
+        type=Path,
+        default=None,
+        help=(
+            "directory of Codex rollout stores (default: Codex's own sessions "
+            "directory when no fixture root is supplied)"
         ),
     )
     parser.add_argument(
@@ -148,6 +159,26 @@ def render_plan(plan: TickPlan) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _configured_adapters(args) -> tuple:
+    """Build the explicitly requested file-backed adapters.
+
+    Passing one fixture root intentionally scopes observation to that source;
+    with neither root supplied production defaults include both supported
+    sources. This prevents tests and fixture commands from reaching a live
+    store merely because another source has a production default.
+    """
+    sample = getattr(args, "sample", None)
+    codex_root = getattr(args, "codex_root", None)
+    if sample is None and codex_root is None:
+        return ClaudeCodeAdapter(), CodexAdapter()
+    adapters = []
+    if sample is not None:
+        adapters.append(ClaudeCodeAdapter(root=sample))
+    if codex_root is not None:
+        adapters.append(CodexAdapter(root=codex_root))
+    return tuple(adapters)
+
+
 def run(
     args,
     *,
@@ -173,7 +204,7 @@ def run(
     out = sys.stdout if out is None else out
     on_status = _stderr_status if on_status is None else on_status
 
-    adapters = (ClaudeCodeAdapter(root=args.sample),)
+    adapters = _configured_adapters(args)
     cursor_root = DEFAULT_CURSOR_ROOT if args.cursors is None else args.cursors
     cursors = CursorStore(cursor_root)
 

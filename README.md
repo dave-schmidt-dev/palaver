@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** built and running. Ingest, memory, extraction, the observer daemon, the iTerm2 pane surface, the Codex/OpenCode adapters, and the MCP surface — reads, pagination, the single-writer socket, `palaver_correct`, and query events — are all in place. Two of those components run as long-lived processes, and each has its own launchd user agent: the observer daemon and the MCP server.
+**Status:** built and running. The supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled or shown in panes yet. Memory, extraction, the iTerm2 pane surface, and the MCP read/write surface are in place. The observer daemon and MCP server each have their own launchd user agent.
 
 ## Problem
 
@@ -36,7 +36,7 @@ Palaver reads the session state that coding agents already persist to disk, rath
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
 | OpenCode | `~/.local/share/opencode/opencode.db` |
 
-Each source sits behind an adapter that yields canonical events and keeps a durable per-session cursor, so a restart neither re-ingests nor skips. Terminal capture is a planned **fallback** adapter for panes with no structured feed.
+Claude Code and Codex are supervised through adapters that yield canonical events and keep source-namespaced durable cursors, so a restart neither re-ingests nor skips. OpenCode remains excluded from runtime scheduling until its SQLite multi-session contract is designed. Terminal capture is a planned **fallback** adapter for panes with no structured feed.
 
 Status is computed in Python from deterministic signals — turn boundaries, unresolved tool calls, error results, compaction markers. The local model supplies the semantic layer only: current task, decisions, remaining work, rollups. It never sets status. When no signal supports an answer, the status is `UNKNOWN`, which is a first-class value rather than a guess.
 
@@ -61,7 +61,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 - **Deterministic signals first, model second.** Status, session identity, tool results, and compaction come from the adapter. The model handles interpretation only.
 - **Observer cadence:** a 30–60s tick, gated on cursor advance. Idle sessions cost zero inference.
 - **Runtime:** `llama-server` (llama.cpp) with a small local model (Gemma-4 E4B, QAT-Q4_0) on a dedicated localhost port. Multi-session hot memory uses server slots (`-np`) with `--slot-save-path` for persistence; save/restore is measured at 16,732 tokens saved in 33 ms and restored in 21 ms.
-- **Identity:** project name plus timestamp, derived from the session's working directory or workspace name, with a manual pin available as an override. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
+- **Identity:** Codex projects use the canonical working directory plus a stable collision-resistant suffix; Claude Code preserves its existing cwd-key identity. A pane-local session pin is available for deliberate rename/move recovery. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
 - **Memory is append-only.** Correction creates a new superseding row; nothing is deleted or mutated in place. Provenance ordering is enforced by database constraint, not by prompt text — an observer inference cannot supersede an explicit user instruction.
 - **UI:** status should live as close to its pane as possible. The leading candidate is an iTerm2 per-session status bar component rather than a window-level panel.
 - **Self-observation:** Palaver records the *fact* of a query from the server side and does not feed its own output back through the observer.
@@ -154,6 +154,21 @@ on disk, and pushes on a heartbeat. The heartbeat is the point rather than an
 implementation detail — a status carries the time it was pushed, and one that
 stops being refreshed stops being shown, so a publisher that skipped an
 unchanged status would blank the pane of an agent working steadily.
+
+Automatic Codex joining requires one recent root rollout whose recorded cwd
+exactly matches the pane. For an intentional directory rename or move, pin the
+known rollout to the pane without focusing it, and clear the override later:
+
+```sh
+uv run palaver ui --session PANE_ID --pin codex SESSION_KEY
+uv run palaver ui --session PANE_ID --clear-pin
+```
+
+The observer's semantic extraction requires the configured local
+`llama-server` to be running on loopback. Deterministic pane status continues
+to fail closed as `UNKNOWN` when its source, identity, or liveness cannot be
+validated. The Palaver component must still be added once to each iTerm2
+profile's status-bar layout as described above.
 
 ## Serving memory to other agents
 

@@ -27,6 +27,7 @@ shipped a join that never joins anything.
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import subprocess
 import sys
@@ -51,12 +52,15 @@ from palaver.observer.signals import (
 )
 from palaver.ui.pane_join import (
     AGENT_SOURCES,
+    CLAUDE_SOURCE,
+    CODEX_SOURCE,
     DEFAULT_IDLE_WINDOW,
     MAX_ANCESTRY_HOPS,
     SHELL_NAMES,
     PaneVariables,
     ProcessInfo,
     agent_ancestor,
+    encode_pin,
     join_pane,
     observe_liveness,
     parse_process_table,
@@ -174,6 +178,158 @@ def test_a_pane_running_the_agent_directly_joins_at_zero_hops(project):
     assert join is not None
     assert join.pid == 77201
     assert join.source == "codex"
+
+
+def test_direct_codex_pid_can_override_a_foreground_helper_job_name(project):
+    """iTerm may report a helper as jobName while jobPid is Codex itself."""
+    cwd, sessions_root = project
+    table = _table(((77201, 62921, "Codex"), (62921, 1, "-zsh")))
+
+    join = _join(
+        cwd,
+        sessions_root,
+        table=table,
+        job_pid=77201,
+        job_name="SkyComputerUseCl",
+    )
+
+    assert join is not None
+    assert join.source == CODEX_SOURCE
+    assert join.pid == 77201
+
+
+def _codex_rollout(root: Path, cwd: Path, name: str, *, subagent: bool = False) -> Path:
+    """Write metadata-only Codex rollout fixture data for pane identity tests."""
+    path = root / "2026" / "08" / "15" / f"{name}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": f"{name}-child" if subagent else name,
+        "session_id": name if not subagent else f"{name}-root",
+        "cwd": str(cwd),
+    }
+    path.write_text(json.dumps({"type": "session_meta", "payload": payload}) + "\n")
+    os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    return path
+
+
+def test_codex_join_requires_one_exact_recent_root_rollout(tmp_path):
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    store = _codex_rollout(root, cwd, "rollout-root")
+
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+    )
+    assert joined is not None
+    assert joined.source == CODEX_SOURCE
+    assert joined.session_key == store.stem
+    assert joined.store_path == store.resolve()
+
+    _codex_rollout(root, cwd, "rollout-second")
+    ambiguous = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+    )
+    assert ambiguous is not None
+    assert ambiguous.session_key is None
+    assert ambiguous.store_path is None
+
+
+def test_codex_join_excludes_identity_marked_subagents(tmp_path):
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    _codex_rollout(root, cwd, "rollout-child", subagent=True)
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+    )
+    assert joined is not None
+    assert joined.session_key is None
+
+
+def test_codex_pin_recovers_a_rollout_after_the_pane_moves(tmp_path):
+    old_cwd = tmp_path / "old-codex-project"
+    live_cwd = tmp_path / "renamed-codex-project"
+    old_cwd.mkdir()
+    live_cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    store = _codex_rollout(root, old_cwd, "rollout-moved")
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(live_cwd))
+
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: live_cwd,
+        store_roots={CODEX_SOURCE: root},
+        pin=encode_pin(CODEX_SOURCE, store.stem),
+        now=NOW,
+    )
+    assert joined is not None
+    assert joined.session_key == store.stem
+    assert joined.store_path == store.resolve()
+
+
+def test_pin_validates_source_and_supports_a_renamed_claude_cwd(tmp_path):
+    old_cwd = tmp_path / "old-name"
+    new_cwd = tmp_path / "renamed"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    root = tmp_path / "claude-projects"
+    project = root / project_key_for_cwd(old_cwd)
+    project.mkdir(parents=True)
+    store = project / "session-1.jsonl"
+    store.write_text("")
+    os.utime(store, (NOW.timestamp(), NOW.timestamp()))
+    variables = PaneVariables("pane-1", JOB_PID, "node", str(new_cwd))
+
+    refused = join_pane(
+        variables,
+        table=_table(),
+        cwd_reader=lambda _pid: new_cwd,
+        store_roots={CLAUDE_SOURCE: root},
+        pin=encode_pin(CODEX_SOURCE, "rollout-missing"),
+        now=NOW,
+    )
+    assert refused is None
+
+    missing = join_pane(
+        variables,
+        table=_table(),
+        cwd_reader=lambda _pid: new_cwd,
+        store_roots={CLAUDE_SOURCE: root},
+        pin=encode_pin(CLAUDE_SOURCE, f"{project.name}/missing"),
+        now=NOW,
+    )
+    assert missing is None
+
+    joined = join_pane(
+        variables,
+        table=_table(),
+        cwd_reader=lambda _pid: new_cwd,
+        store_roots={CLAUDE_SOURCE: root},
+        pin=encode_pin(CLAUDE_SOURCE, f"{project.name}/session-1"),
+        now=NOW,
+    )
+    assert joined is not None
+    assert joined.store_path == store.resolve()
+    assert joined.session_key == f"{project.name}/session-1"
 
 
 # --- the join: no agent process ----------------------------------------------

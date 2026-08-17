@@ -24,7 +24,13 @@ import json
 import logging
 from pathlib import Path
 
-from palaver.extract.normalize import normalize_path, normalize_records
+import pytest
+
+from palaver.extract.normalize import (
+    normalize_codex_records,
+    normalize_path,
+    normalize_records,
+)
 from palaver.ingest.adapters.claude_code import SYSTEM_SUBTYPE_KINDS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +101,17 @@ def _write_jsonl(path: Path, items: list) -> None:
 
 def _lines_containing(output: str, needle: str) -> list[str]:
     return [line for line in output.splitlines() if needle in line]
+
+
+def _codex_message(role: str, text: str) -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": role,
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
 
 
 # =============================================================================
@@ -285,6 +302,44 @@ def test_injected_prefix_without_ismeta_is_tagged_as_injected():
     human_lines = _lines_containing(output, "invented deploy")
     assert len(human_lines) == 1
     assert "HUMAN:" in human_lines[0]
+
+
+def test_codex_normalizer_tags_channels_and_omits_reasoning_and_unknowns():
+    """Codex messages use structural roles and bounded tool summaries."""
+    records = [
+        _codex_message("user", "invented human request"),
+        _codex_message("user", "<environment_context>invented harness context"),
+        _codex_message("assistant", "invented agent reply"),
+        {"type": "response_item", "payload": {"type": "reasoning", "text": "private"}},
+        {"type": "response_item", "payload": {"type": "future_unknown", "text": "omit"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "invented_tool",
+                "arguments": "x" * 5000,
+            },
+        },
+    ]
+
+    output = normalize_codex_records(records)
+
+    assert "HUMAN: invented human request" in output
+    assert "INJECTED: <environment_context>invented harness context" in output
+    assert "AGENT: invented agent reply" in output
+    assert "private" not in output
+    assert "omit" not in output
+    tool_line = _lines_containing(output, "invented_tool")[0]
+    assert len(tool_line) < 500
+
+
+def test_normalize_path_dispatches_codex_and_rejects_unknown_source(tmp_path):
+    path = tmp_path / "rollout-fixture.jsonl"
+    _write_jsonl(path, [_codex_message("assistant", "invented codex fixture")])
+
+    assert normalize_path(path, source="codex") == "AGENT: invented codex fixture\n"
+    with pytest.raises(ValueError, match="unsupported normalization source"):
+        normalize_path(path, source="opencode")
 
 
 # =============================================================================
