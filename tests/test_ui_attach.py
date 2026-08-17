@@ -20,21 +20,18 @@ need one, so they ask iTerm2 for it and hand it straight to the connection.
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
 import json
 import os
 import subprocess
 import sys
-import time
 import types
 from pathlib import Path
 
 import pytest
 
 from palaver.cli import ui as cli_ui
-from palaver.observer.signals import Status
-from palaver.ui import autolaunch, component, connection
+from palaver.ui import autolaunch, connection
 from palaver.ui.autolaunch import (
     ADVISORY_NAME,
     AUTOLAUNCH_DIR,
@@ -45,30 +42,6 @@ from palaver.ui.autolaunch import (
     render_shim,
     watch_new_sessions,
     watch_terminations,
-)
-from palaver.ui.component import (
-    GUID_KEY,
-    IDENTIFIER,
-    LAYOUT_KEY,
-    ORIGINAL_GUID_KEY,
-    PUSHED_AT_KEY,
-    SHOW_BAR_KEY,
-    STATUS_REFERENCE,
-    STATUS_VARIABLE,
-    TICK_VARIABLE,
-    UPDATE_CADENCE,
-    LayoutCheck,
-    RenderTicker,
-    build_component,
-    check_layout,
-    decode_status,
-    encode_status,
-    layout_contains,
-    line_for,
-    profile_identity,
-    push_status,
-    render_for_session,
-    show_status_bar,
 )
 from palaver.ui.connection import (
     COOKIE_ENV,
@@ -300,7 +273,7 @@ def test_startup_attaches_to_panes_that_are_already_open():
 
 
 def test_startup_does_not_re_run_the_hook_for_an_already_attached_pane():
-    """Task 5.3 registers a status bar component in this hook."""
+    """Companion-pane setup may perform asynchronous work in this hook."""
     registry = SessionRegistry(["a"])
     hooked: list[str] = []
     count = asyncio.run(attach_existing(_fake_app(["a", "b"]), registry, on_attach=hooked.append))
@@ -423,6 +396,33 @@ def test_the_two_monitors_run_concurrently_rather_than_in_turn(monkeypatch):
     assert registry.attached == frozenset({"new"})
 
 
+def test_autolaunch_main_attaches_existing_and_runs_both_lifecycle_monitors(monkeypatch):
+    """The retained AutoLaunch path discovers panes without publishing UI state."""
+    app = types.SimpleNamespace(
+        terminal_windows=(
+            types.SimpleNamespace(
+                tabs=(types.SimpleNamespace(sessions=(types.SimpleNamespace(session_id="old"),)),)
+            ),
+        )
+    )
+
+    async def async_get_app(_connection):
+        return app
+
+    monkeypatch.setattr(
+        autolaunch,
+        "import_iterm2",
+        lambda: types.SimpleNamespace(
+            async_get_app=async_get_app,
+            NewSessionMonitor=lambda _conn: _StubMonitor(["new"]),
+            SessionTerminationMonitor=lambda _conn: _StubMonitor(["old"]),
+        ),
+    )
+
+    registry = asyncio.run(autolaunch.main(object(), limit=1))
+    assert registry.attached == frozenset({"new"})
+
+
 # --- the shim --------------------------------------------------------------
 
 
@@ -540,64 +540,6 @@ def test_the_readme_tells_the_user_to_turn_the_python_api_on():
     assert "AutoLaunch" in readme
 
 
-# --- task 5.3: the status bar component, its variables, and the layout gate ---
-
-#: The shared profile every pane on this machine is running under, measured
-#: 2026-08-15. A literal rather than a lookup: these tests are about what the
-#: check does with a guid, not about which guid is live today.
-SHARED_GUID = "F25B986F-AEEA-4438-A22D-B79D193A0FB0"
-
-#: A real, shared, *unused* profile — the Scarecrow dynamic profile. This is
-#: the plan's "unused profile" case, and it is only expressible as a guid:
-#: three live sessions report the name `Default` with three different guids,
-#: so a name cannot say which profile is meant.
-UNUSED_GUID = "scarecrow-tui-profile-001"
-
-#: A pane id shaped like iTerm2's.
-PANE = "w0t0p0:CF60A48E-0000-4000-8000-000000000001"
-
-
-def _plain_entry(identifier):
-    """A layout entry that names the component in the clear."""
-    return {"class": "iTermStatusBarRPCProvidedTextComponent", "identifier": identifier}
-
-
-def _serialized_entry(identifier):
-    """A layout entry that carries the identifier inside a serialized request.
-
-    iTerm2 keeps a `_savedRegistrationRequest` per component, so the real
-    entry embeds an encoded `ITMRPCRegistrationRequest` rather than a bare
-    string. The exact encoding is not public and is not what is under test:
-    what is under test is that the check still finds the identifier when the
-    entry is opaque, rather than reading a key that may not exist.
-    """
-    blob = b"\x12\x2f" + identifier.encode() + b"\x1a\x04knob"
-    return {
-        "class": "iTermStatusBarRPCProvidedTextComponent",
-        "configuration": {"registration request": base64.b64encode(blob).decode()},
-    }
-
-
-def _props(*, entries=(), bar_shown=1, original=SHARED_GUID, guid=None):
-    """Build profile properties the way a live session reports them.
-
-    `guid` defaults to something *other* than `original`, because that is the
-    live case: every session's profile here is divorced, so its own guid is
-    session-local and matches no shared profile.
-    """
-    props = {
-        GUID_KEY: guid if guid is not None else "0D0027BC-1EF1-422A-8CE2-55FBA6703F6E",
-        SHOW_BAR_KEY: bar_shown,
-        LAYOUT_KEY: {
-            "components": list(entries),
-            "advanced configuration": {"remove empty components": False},
-        },
-    }
-    if original is not None:
-        props[ORIGINAL_GUID_KEY] = original
-    return props
-
-
 class _Writes:
     """Record every variable write, and optionally refuse them."""
 
@@ -631,368 +573,6 @@ def test_pin_cli_writes_named_pane_without_focus_or_selection_calls():
     assert all(call[1] == PIN_VARIABLE for call in writes.calls)
     source = inspect.getsource(cli_ui.set_session_pin)
     assert all(token not in source for token in (".focus(", ".select(", ".activate("))
-
-
-class _StubReference:
-    def __init__(self, name):
-        self.name = name
-
-    def __repr__(self):
-        return self.name
-
-
-class _StubStatusBarComponent:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.registrations = []
-
-    async def async_register(self, connection, coro, timeout=None):
-        self.registrations.append((connection, coro, timeout))
-
-
-class _StubSubscriptionException(Exception):
-    """The exact iTerm2 exception type the probe is permitted to reuse."""
-
-
-def _stub_status_bar_api(monkeypatch):
-    """Stand in for the `iterm2` module inside `build_component`.
-
-    Only the three names `build_component` touches. The real library is
-    exercised by the live tests at the bottom of this file; this is here so
-    the wiring — which reference names, which cadence, which identifier — is
-    assertable on a machine with no terminal.
-    """
-    module = types.SimpleNamespace(
-        Reference=_StubReference,
-        StatusBarRPC=lambda func: func,
-        StatusBarComponent=lambda **kwargs: _StubStatusBarComponent(**kwargs),
-        notifications=types.SimpleNamespace(SubscriptionException=_StubSubscriptionException),
-    )
-    monkeypatch.setattr(component, "import_iterm2", lambda: module)
-    return module
-
-
-def _stamped(payload: str, *, age: float = 0.0) -> str:
-    """Add task 5.5's freshness stamp to a hand-written payload.
-
-    Hand-written JSON is how these tests say things `encode_status` cannot
-    say — an unknown status name, a wrong type — and an unstamped payload now
-    decodes to `UNKNOWN` before any of that is looked at. The stamp keeps the
-    test about the thing it is about.
-    """
-    decoded = json.loads(payload)
-    decoded[PUSHED_AT_KEY] = time.time() - age
-    return json.dumps(decoded)
-
-
-def test_a_configured_profile_passes_the_layout_check():
-    check = check_layout(_props(entries=[_plain_entry(IDENTIFIER)]), expected_guid=SHARED_GUID)
-    assert check.ok
-    assert check.remedy is None
-
-
-def test_a_component_in_an_unused_profiles_layout_fails_the_layout_check():
-    """The plan's own negative case: configured, but not where anything runs.
-
-    Everything else about this profile is right — the identifier is in the
-    layout and the bar is on — so a check that looked only at the layout
-    would pass it while no pane on the machine showed anything.
-    """
-    props = _props(entries=[_plain_entry(IDENTIFIER)], original=UNUSED_GUID)
-    check = check_layout(props, expected_guid=SHARED_GUID)
-    assert not check.ok
-    assert check.in_layout and check.bar_shown, "only the profile should be wrong"
-    assert UNUSED_GUID in check.remedy and SHARED_GUID in check.remedy
-
-
-def test_a_layout_without_the_component_fails_and_the_remedy_names_the_fix():
-    check = check_layout(_props(), expected_guid=SHARED_GUID)
-    assert not check.ok
-    assert not check.in_layout
-    assert "Configure Status Bar" in check.remedy
-
-
-def test_a_layout_containing_the_component_still_fails_with_the_bar_switched_off():
-    """The fourth state the plan does not name.
-
-    `Show Status Bar` is 0 on every live session on this machine, so a gate
-    asserting only registration, membership and layout inclusion reports
-    success while the user sees nothing.
-    """
-    props = _props(entries=[_plain_entry(IDENTIFIER)], bar_shown=0)
-    check = check_layout(props, expected_guid=SHARED_GUID)
-    assert not check.ok
-    assert check.in_layout, "the layout half is fine; the bar is off"
-    assert "Status bar enabled" in check.remedy
-
-
-def test_the_layout_check_reads_the_shared_guid_not_the_divorced_one():
-    props = _props(entries=[_plain_entry(IDENTIFIER)])
-    assert props[GUID_KEY] != SHARED_GUID, "the fixture must be divorced for this to mean anything"
-    assert profile_identity(props) == SHARED_GUID
-    assert check_layout(props, expected_guid=SHARED_GUID).profile_matches
-
-
-def test_an_undivorced_profile_falls_back_to_its_own_guid():
-    props = _props(entries=[_plain_entry(IDENTIFIER)], original=None, guid=SHARED_GUID)
-    assert ORIGINAL_GUID_KEY not in props
-    assert profile_identity(props) == SHARED_GUID
-
-
-def test_the_identifier_is_found_inside_an_opaque_layout_entry():
-    """The entry schema is not public, so the check must not depend on it."""
-    assert layout_contains({"components": [_serialized_entry(IDENTIFIER)]})
-    assert check_layout(_props(entries=[_serialized_entry(IDENTIFIER)])).in_layout
-
-
-def test_another_scripts_component_is_not_mistaken_for_this_one():
-    other = [_plain_entry("com.example.other"), _serialized_entry("com.example.other")]
-    assert not layout_contains({"components": other})
-    assert layout_contains({"components": [*other, _plain_entry(IDENTIFIER)]})
-
-
-def test_a_profile_with_no_layout_at_all_fails_rather_than_raising():
-    check = check_layout({GUID_KEY: SHARED_GUID})
-    assert not check.ok
-    assert not check.in_layout and not check.bar_shown
-    assert layout_contains(None) is False
-
-
-def test_the_check_without_an_expected_profile_does_not_invent_a_mismatch():
-    """`expected_guid` is opt-in, so a caller that has no opinion is not failed."""
-    check = check_layout(_props(entries=[_plain_entry(IDENTIFIER)], original=UNUSED_GUID))
-    assert check.profile_matches and check.ok
-
-
-def test_a_state_change_emits_exactly_one_variable_write():
-    """One write per change, and it is the status — never the tick.
-
-    The tick belongs to the render that iTerm2 dispatches in response. A push
-    that wrote both would report a render that had not happened, which is the
-    one thing the tick exists to make impossible.
-    """
-    writes = _Writes()
-    payload = asyncio.run(push_status(writes, PANE, Status.WORKING, "reading a file"))
-    assert len(writes.calls) == 1
-    assert writes.calls[0][:2] == (PANE, STATUS_VARIABLE)
-    assert writes.named(TICK_VARIABLE) == []
-
-    decoded = json.loads(payload)
-    # Still exact about the shape — task 5.5 added the stamp and nothing else,
-    # and a fourth key appearing unnoticed is what this pins.
-    assert set(decoded) == {"status", "task", PUSHED_AT_KEY}
-    assert (decoded["status"], decoded["task"]) == ("WORKING", "reading a file")
-    assert abs(decoded[PUSHED_AT_KEY] - time.time()) < 60, "the stamp is epoch seconds, now-ish"
-
-
-def test_the_render_tick_rises_with_each_render_of_the_same_pane():
-    ticker = RenderTicker()
-    writes = _Writes()
-
-    def one_render(status, task):
-        payload = asyncio.run(push_status(writes, PANE, status, task))
-        return asyncio.run(render_for_session(PANE, payload, ticker=ticker, set_variable=writes))
-
-    assert ticker.value(PANE) == 0
-    first = one_render(Status.WORKING, "one")
-    second = one_render(Status.AWAITING_HUMAN, "two")
-
-    ticks = [value for _, _, value in writes.named(TICK_VARIABLE)]
-    assert ticks == [1, 2], "each pushed change must render once and count once"
-    assert ticker.value(PANE) == 2
-    assert first != second, "the two renders must actually differ"
-
-
-def test_each_pane_counts_its_own_renders():
-    ticker = RenderTicker()
-    writes = _Writes()
-    asyncio.run(render_for_session(PANE, None, ticker=ticker, set_variable=writes))
-    asyncio.run(render_for_session(PANE, None, ticker=ticker, set_variable=writes))
-    asyncio.run(render_for_session("other", None, ticker=ticker, set_variable=writes))
-    assert ticker.value(PANE) == 2
-    assert ticker.value("other") == 1
-
-
-def test_the_update_cadence_is_a_backstop_and_not_the_path_a_change_takes():
-    """A change reaches the bar as a push, well inside one cadence period.
-
-    Asserted as a number rather than as prose because `update_cadence=None`
-    is legal in the library and would make "one write before the next tick"
-    true of a component with no timer at all.
-    """
-    assert isinstance(UPDATE_CADENCE, float) and UPDATE_CADENCE > 0
-
-    writes = _Writes()
-    elapsed = 0.0  # no cadence tick has been allowed to fire
-    asyncio.run(push_status(writes, PANE, Status.QUESTION, "which branch?"))
-    assert elapsed < UPDATE_CADENCE
-    assert len(writes.calls) == 1
-
-
-def test_a_cold_pane_renders_before_anything_has_ever_been_pushed():
-    """No pane has a status at first launch; the bar must still say something."""
-    assert STATUS_REFERENCE == f"{STATUS_VARIABLE}?"
-    assert not STATUS_VARIABLE.endswith("?"), "the variable itself is not optional-suffixed"
-    assert line_for(None) == "unknown"
-    assert decode_status(None) == (Status.UNKNOWN, None)
-
-
-def test_an_unreadable_status_variable_renders_rather_than_raising():
-    for raw in ("not json at all", "[1, 2, 3]", "{}", 17, ""):
-        status, task = decode_status(raw)
-        assert status is Status.UNKNOWN and task is None
-        assert line_for(raw) == "unknown"
-
-
-def test_a_status_name_this_build_does_not_have_reads_as_unknown():
-    """A renamed enum member must not blank every bar mid-upgrade.
-
-    The task text survives the unrecognised status. A daemon one version
-    ahead of the component still knows what the pane is doing, and that half
-    is worth more to someone scanning a wall of panes than the status word
-    it could not spell.
-    """
-    unknown_name = _stamped('{"status": "TRANSCENDENT", "task": "x"}')
-    assert decode_status(unknown_name) == (Status.UNKNOWN, "x")
-    assert decode_status(_stamped('{"status": "WORKING", "task": "x"}')) == (Status.WORKING, "x")
-    assert line_for(unknown_name) == "unknown: x"
-
-
-def test_a_task_containing_the_separator_survives_the_round_trip():
-    task = "fix: the thing\nthat broke"
-    status, decoded = decode_status(encode_status(Status.ERROR, task))
-    assert (status, decoded) == (Status.ERROR, task)
-    assert "\n" not in line_for(encode_status(Status.ERROR, task), width=80)
-
-
-def test_a_render_with_no_session_id_writes_nothing():
-    writes = _Writes()
-    line = asyncio.run(render_for_session(None, None, ticker=RenderTicker(), set_variable=writes))
-    assert line == "unknown"
-    assert writes.calls == []
-
-
-def test_a_nonsense_width_is_clamped_rather_than_raised_on():
-    """`render` refuses a width below 1, and a raise here stops the bar dead."""
-    assert line_for(None, width=0) == "…"
-    assert line_for(encode_status(Status.WORKING), width=-5) == "…"
-
-
-def test_the_tick_is_not_written_when_no_line_was_produced(monkeypatch):
-    """The tick asserts a render happened, so it is written only after one does.
-
-    Ordering inside the coroutine is otherwise unobservable — `line_for` is
-    total by construction — so this reaches in and breaks it to prove the two
-    steps are in the order the module claims.
-    """
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("render fell over")
-
-    monkeypatch.setattr(component, "line_for", _boom)
-    writes = _Writes()
-    with pytest.raises(RuntimeError):
-        asyncio.run(render_for_session(PANE, None, ticker=RenderTicker(), set_variable=writes))
-    assert writes.calls == []
-
-
-def test_a_refused_tick_write_costs_the_tick_and_not_the_line():
-    writes = _Writes(fail=True)
-    payload = encode_status(Status.BLOCKED, "waiting on a lock")
-    line = asyncio.run(
-        render_for_session(PANE, payload, ticker=RenderTicker(), set_variable=writes)
-    )
-    assert line.startswith("blocked")
-    assert len(writes.calls) == 1
-
-
-def test_the_component_never_takes_its_own_tick_as_an_input(monkeypatch):
-    """A coroutine that read the tick it writes would re-trigger itself forever."""
-    _stub_status_bar_api(monkeypatch)
-    _, coro = build_component(object(), set_variable=_Writes())
-    import inspect
-
-    references = [
-        repr(parameter.default)
-        for parameter in inspect.signature(coro).parameters.values()
-        if isinstance(parameter.default, _StubReference)
-    ]
-    assert references == [STATUS_REFERENCE, "id"]
-    assert TICK_VARIABLE not in references
-
-
-def test_the_component_is_built_with_the_identifier_and_cadence_it_documents(monkeypatch):
-    _stub_status_bar_api(monkeypatch)
-    built, _ = build_component(object(), set_variable=_Writes())
-    assert built.kwargs["identifier"] == IDENTIFIER
-    assert built.kwargs["update_cadence"] == UPDATE_CADENCE
-    assert built.kwargs["knobs"] == []
-    assert built.kwargs["exemplar"]
-
-
-def test_registering_puts_the_component_nowhere_and_switches_nothing_on(monkeypatch):
-    """Registration is only one of the four states, and the only one Palaver takes.
-
-    Nothing here touches a profile: no layout is written, and the status bar
-    is not switched on behind the user's back.
-    """
-    _stub_status_bar_api(monkeypatch)
-    writes = _Writes()
-    registered = asyncio.run(component.register(object(), set_variable=writes))
-    assert len(registered.registrations) == 1
-    assert writes.calls == []
-
-
-def test_probe_registration_reuses_only_iterms_exact_duplicate_status_rpc(monkeypatch):
-    """A selftest may share the running component, but AutoLaunch may not."""
-    module = _stub_status_bar_api(monkeypatch)
-
-    class _DuplicateComponent(_StubStatusBarComponent):
-        async def async_register(self, connection, coro, timeout=None):
-            raise _StubSubscriptionException("DUPLICATE_SERVER_ORIGINATED_RPC")
-
-    module.StatusBarComponent = lambda **kwargs: _DuplicateComponent(**kwargs)
-
-    with pytest.raises(_StubSubscriptionException):
-        asyncio.run(component.register(object(), set_variable=_Writes()))
-
-    reused = asyncio.run(component.register_for_probe(object(), set_variable=_Writes()))
-    assert reused.reused_existing is True
-    assert reused.component.registrations == []
-
-    for error in (
-        _StubSubscriptionException("ANOTHER_STATUS"),
-        RuntimeError("DUPLICATE_SERVER_ORIGINATED_RPC"),
-    ):
-        class _RefusingComponent(_StubStatusBarComponent):
-            async def async_register(self, connection, coro, timeout=None):
-                raise error
-
-        module.StatusBarComponent = lambda **kwargs: _RefusingComponent(**kwargs)
-        with pytest.raises(type(error)):
-            asyncio.run(component.register_for_probe(object(), set_variable=_Writes()))
-
-
-def test_switching_the_status_bar_on_is_its_own_named_step():
-    """It changes what every pane using the profile looks like, so it is opt-in."""
-    written = []
-
-    class _Profile:
-        async def _async_simple_set(self, key, value):
-            written.append((key, value))
-
-    asyncio.run(show_status_bar(_Profile()))
-    asyncio.run(show_status_bar(_Profile(), shown=False))
-    assert written == [(SHOW_BAR_KEY, True), (SHOW_BAR_KEY, False)]
-
-
-def test_the_check_reports_three_facts_rather_than_one_boolean():
-    """`ok` alone cannot be acted on; each half has a different remedy."""
-    check = LayoutCheck(
-        profile_guid=SHARED_GUID, expected_guid=SHARED_GUID, in_layout=False, bar_shown=False
-    )
-    assert not check.ok
-    assert "Configure Status Bar" in check.remedy and "Status bar enabled" in check.remedy
 
 
 # --- live iTerm2 -----------------------------------------------------------
@@ -1168,93 +748,3 @@ def test_a_pane_closed_through_the_api_is_seen_by_the_termination_monitor():
 
     opened, gone = _run_live(body, timeout=40.0)
     assert gone, f"the termination monitor never reported {opened}"
-
-
-@live
-def test_the_profile_keys_the_layout_check_reads_are_the_names_iterm_uses():
-    """The gate reads two undocumented profile keys by literal name.
-
-    Nothing in the `iterm2` library mentions either — there is no status bar
-    API at all — so the only thing standing between a typo and a check that
-    silently reports "not configured" forever is this.
-    """
-
-    async def body(conn):
-        iterm2 = connection.import_iterm2()
-        app = await iterm2.async_get_app(conn)
-        seen = []
-        for window in app.terminal_windows:
-            for tab in window.tabs:
-                for session in tab.sessions:
-                    props = (await session.async_get_profile()).all_properties
-                    seen.append((LAYOUT_KEY in props, SHOW_BAR_KEY in props, props.get(LAYOUT_KEY)))
-        return seen
-
-    seen = _run_live(body)
-    assert seen, "the test itself is running in an iTerm2 pane"
-    for has_layout, has_switch, layout in seen:
-        assert has_layout, f"iTerm2 does not call it {LAYOUT_KEY!r}"
-        assert has_switch, f"iTerm2 does not call it {SHOW_BAR_KEY!r}"
-        assert "components" in layout, f"the layout is not shaped as expected: {sorted(layout)}"
-
-
-@live
-def test_a_live_panes_profile_identity_names_a_profile_that_actually_exists():
-    """`Original Guid`, not `Guid`: every live session's profile is divorced.
-
-    Measured 2026-08-15 — the guid a session reports for its own profile is
-    session-local and appears in no shared profile list, so a check keyed on
-    it would never match anything the user can configure.
-    """
-
-    async def body(conn):
-        iterm2 = connection.import_iterm2()
-        app = await iterm2.async_get_app(conn)
-        shared = {profile.guid for profile in await iterm2.PartialProfile.async_query(conn)}
-        found = []
-        for window in app.terminal_windows:
-            for tab in window.tabs:
-                for session in tab.sessions:
-                    props = (await session.async_get_profile()).all_properties
-                    found.append((profile_identity(props), props.get(GUID_KEY)))
-        return shared, found
-
-    shared, found = _run_live(body)
-    assert shared, "iTerm2 reported no shared profiles at all"
-    assert found, "the test itself is running in an iTerm2 pane"
-    for identity, own in found:
-        assert identity in shared, f"{identity!r} is not a profile the user can configure"
-        if own != identity:
-            assert own not in shared, "a divorced guid should not also be a shared one"
-
-
-@live
-def test_the_component_registers_and_its_variables_round_trip_through_iterm():
-    """Registration and the push path, against the real API rather than a stub.
-
-    Both halves are things a stub cannot prove: that iTerm2 accepts the
-    component's shape, and that `user.palaver_status` is a namespace it will
-    take. Done in a tab this test opens and closes, so nothing is written
-    into a pane that is actually running an agent.
-    """
-
-    async def body(conn):
-        iterm2 = connection.import_iterm2()
-        app = await iterm2.async_get_app(conn)
-        registered = await component.register_for_probe(conn)
-
-        window = app.current_terminal_window
-        tab = await window.async_create_tab()
-        session = tab.sessions[0]
-        try:
-            writer = component.make_variable_writer(conn)
-            await push_status(writer, session.session_id, Status.WORKING, "a live round trip")
-            raw = await session.async_get_variable(STATUS_VARIABLE)
-        finally:
-            await tab.async_close(force=True)
-        return registered.component is not None, raw
-
-    ok, raw = _run_live(body, timeout=40.0)
-    assert ok
-    assert decode_status(raw) == (Status.WORKING, "a live round trip")
-    assert line_for(raw) == "working: a live round trip"

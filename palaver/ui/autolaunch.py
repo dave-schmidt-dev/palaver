@@ -38,7 +38,6 @@ import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from palaver.ui import component, publisher
 from palaver.ui.connection import (
     COOKIE_ENV,
     KEY_ENV,
@@ -148,8 +147,8 @@ async def attach_existing(
         app: The `iterm2.App`.
         registry: Registry to record attachments in.
         on_attach: Optional per-session hook, awaited if it returns an
-            awaitable. Task 5.3 supplies the one that registers the status
-            bar component.
+            awaitable. Companion-pane attachment can use this hook without
+            coupling registry bookkeeping to rendering.
         on_status: Progress channel (INV-1).
 
     Returns:
@@ -255,68 +254,32 @@ async def main(
     on_attach: Callable[[str], object] | None = None,
     on_status: Callable[[str], None] = _no_status,
     limit: int | None = None,
-    publish: bool = True,
-    db_path: Path | None = None,
 ) -> SessionRegistry:
-    """Attach to every pane, keep the registry current, and publish statuses.
-
-    The publisher runs here rather than in the observer daemon because this
-    is the process holding the iTerm2 connection; see
-    `palaver.ui.publisher`'s module docstring. It is gathered alongside the
-    monitors so that a dropped connection fails all three together and the
-    shim restarts the process, which is the only thing that can reconnect.
+    """Attach to every pane and keep the registry current.
 
     Args:
         connection: The `iterm2.Connection`.
         registry: Registry to use, defaulting to an empty one.
         on_attach: Optional per-session hook; see `attach_existing`.
         on_status: Progress channel (INV-1).
-        limit: Events per monitor, and ticks for the publisher, before
-            returning. None runs forever.
-        publish: Whether to run the publisher. False is for a test that wants
-            the monitors alone, and for a caller driving `publish_once`
-            itself.
-        db_path: The observer database the publisher reads task text from,
-            defaulting to `palaver observe`'s own.
+        limit: Events per monitor before returning. None runs forever.
 
     Returns:
         The registry, so a bounded run can be asserted against.
     """
     iterm2 = import_iterm2()
     registry = SessionRegistry() if registry is None else registry
-    on_status("registering Palaver status component")
-    await component.register(connection)
     app = await iterm2.async_get_app(connection)
     await attach_existing(app, registry, on_attach=on_attach, on_status=on_status)
     # Gathered rather than sequenced: a pane can close while another opens,
     # and awaiting one monitor at a time would hold the other's events until
     # the first happened to fire.
-    running = [
+    await asyncio.gather(
         watch_new_sessions(
             connection, registry, on_attach=on_attach, on_status=on_status, limit=limit
         ),
         watch_terminations(connection, registry, on_status=on_status, limit=limit),
-    ]
-    if publish:
-        if db_path is None:
-            # Imported here rather than at module scope: `palaver.cli`'s
-            # package init imports every subcommand, and one of them imports
-            # this module's siblings. A lazy import keeps the UI package
-            # importable on its own.
-            from palaver.cli.observe import DEFAULT_DB_PATH  # noqa: PLC0415
-
-            db_path = DEFAULT_DB_PATH
-        running.append(
-            publisher.publish_forever(
-                registry,
-                read_variables=publisher.make_variables_reader(connection),
-                set_variable=component.make_variable_writer(connection),
-                db_path=db_path,
-                limit=limit,
-                on_status=on_status,
-            )
-        )
-    await asyncio.gather(*running)
+    )
     return registry
 
 

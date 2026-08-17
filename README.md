@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** built and running. The supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled or shown in panes yet. Memory, extraction, the iTerm2 pane surface, and the MCP read/write surface are in place. The observer daemon and MCP server each have their own launchd user agent.
+**Status:** the supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled yet. Memory, extraction, and the MCP read/write surface are running. The rejected iTerm2 status-bar experiment has been removed; a small companion pane above each agent pane is the next UI.
 
 ## Problem
 
@@ -16,7 +16,7 @@ The mental model:
 Raw transcript    = evidence
 Structured memory = knowledge
 Local LLM         = interpretation
-Status bar / API  = interfaces
+Companion panes / API = interfaces
 ```
 
 ## Priorities (in order)
@@ -63,7 +63,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 - **Runtime:** `llama-server` (llama.cpp) with a small local model (Gemma-4 E4B, QAT-Q4_0) on a dedicated localhost port. Multi-session hot memory uses server slots (`-np`) with `--slot-save-path` for persistence; save/restore is measured at 16,732 tokens saved in 33 ms and restored in 21 ms.
 - **Identity:** Codex projects use the canonical working directory plus a stable collision-resistant suffix; Claude Code preserves its existing cwd-key identity. A pane-local session pin is available for deliberate rename/move recovery. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
 - **Memory is append-only.** Correction creates a new superseding row; nothing is deleted or mutated in place. Provenance ordering is enforced by database constraint, not by prompt text — an observer inference cannot supersede an explicit user instruction.
-- **UI:** status should live as close to its pane as possible. The leading candidate is an iTerm2 per-session status bar component rather than a window-level panel.
+- **UI:** each agent pane gets its own shallow companion pane above it, showing that session's deterministic activity summary, goal, tasks, and open questions. A local LLM is optional compression, not the source of status.
 - **Self-observation:** Palaver records the *fact* of a query from the server side and does not feed its own output back through the observer.
 
 ## Sensitivity
@@ -76,8 +76,7 @@ It checks *every* file under `tests/fixtures/`, not every `.jsonl`. Discovery wa
 
 ## Open questions
 
-- The iTerm2 status bar rendering budget — iTerm2 documents no character limit, only a user-configurable width in points.
-- Whether the iTerm2 API can prove a status bar component is *registered and attached*, as opposed to merely round-tripping a variable.
+- How to keep companion panes paired with their agents across layout changes and restarts.
 - Whether a 30–60s observer tick feels live in actual use.
 - Whether the structural turn boundary is *correct*, not merely computable on 100% of transcripts.
 
@@ -101,9 +100,9 @@ carrying real session prose fails the suite and the push stops. That gate is
 still skippable with `git push --no-verify`, which is a deliberate escape hatch
 and not a check.
 
-## Setup: the iTerm2 pane surface
+## Setup: iTerm2 pane discovery
 
-The status Palaver shows inside each pane needs iTerm2's Python API, and **that
+Palaver's pane discovery needs iTerm2's Python API, and **that
 preference is off by default**. Until it is on, iTerm2 creates no API socket, no
 script can connect, and nothing anywhere reports why — the surface is simply
 absent. Turn it on first:
@@ -117,7 +116,7 @@ absent. Turn it on first:
    ```
 
    That writes a small shim to `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/palaver.py`.
-   iTerm2 runs everything in `AutoLaunch` at launch, so the surface comes back
+   iTerm2 runs everything in `AutoLaunch` at launch, so discovery comes back
    on its own after a restart; the shim also restarts the attachment with a
    backoff if it exits.
 
@@ -132,28 +131,9 @@ socket is absent, rather than falling back to the library's loopback TCP
 listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
 credential and is passed only through the environment, never on a command line.
 
-To check whether the pane surface actually works on this machine:
-
-```sh
-uv run palaver ui --selftest             # registers, round-trips a variable, renders, publishes
-uv run palaver ui --enable-status-bar    # turns the bar on; changes how every pane looks
-uv run palaver ui --disable-status-bar   # and turns it back off
-```
-
-The selftest reports rather than judges. A profile with the component not yet
-added to its status bar layout is normal on a fresh machine, so that exits 0
-with the remedy printed; it fails only for things Palaver owns — registration
-refused, a variable that will not round-trip, a render tick that does not
-advance. Adding the component to the layout is a one-time manual step in
-iTerm2 > Settings > Profiles > Session > Configure Status Bar, and turning the
-bar on is a separate flag because it changes what every pane looks like.
-
-What actually writes each pane's status is the AutoLaunch process, not the
-observer daemon: it holds the iTerm2 connection, joins each pane to a session
-on disk, and pushes on a heartbeat. The heartbeat is the point rather than an
-implementation detail — a status carries the time it was pushed, and one that
-stops being refreshed stops being shown, so a publisher that skipped an
-unchanged status would blank the pane of an agent working steadily.
+The AutoLaunch process currently keeps pane discovery and lifecycle state only.
+It does not render a UI. The status-bar approach was rejected because it gives
+the user one visible bar rather than one persistent summary surface per agent.
 
 Automatic Codex joining requires one recent root rollout whose recorded cwd
 exactly matches the pane. For an intentional directory rename or move, pin the
@@ -165,10 +145,8 @@ uv run palaver ui --session PANE_ID --clear-pin
 ```
 
 The observer's semantic extraction requires the configured local
-`llama-server` to be running on loopback. Deterministic pane status continues
-to fail closed as `UNKNOWN` when its source, identity, or liveness cannot be
-validated. The Palaver component must still be added once to each iTerm2
-profile's status-bar layout as described above.
+`llama-server` to be running on loopback. The future companion renderer will
+prefer deterministic event filtering and use local inference only when useful.
 
 ## Serving memory to other agents
 
