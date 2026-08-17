@@ -33,6 +33,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -845,10 +846,14 @@ def test_the_autolaunch_daemon_runs_the_publisher(pane, monkeypatch):
     cwd, sessions_root = pane
     ran: list[object] = []
 
+    async def fake_register(_connection):
+        return None
+
     async def fake_publish_forever(registry, **kwargs):
         ran.append(registry)
         return 0
 
+    monkeypatch.setattr(component, "register", fake_register)
     monkeypatch.setattr(publisher, "publish_forever", fake_publish_forever)
     monkeypatch.setattr(publisher, "make_variables_reader", lambda _connection: _reader({}))
     monkeypatch.setattr(component, "make_variable_writer", lambda _connection: _Writer())
@@ -856,19 +861,61 @@ def test_the_autolaunch_daemon_runs_the_publisher(pane, monkeypatch):
     assert len(ran) == 1
 
 
+def test_autolaunch_registers_once_before_attaching_or_publishing(monkeypatch):
+    """The visible component must exist before its variables can be rendered."""
+    events: list[str] = []
+    statuses: list[str] = []
+
+    async def fake_register(_connection):
+        events.append("register")
+
+    async def fake_attach(app, _registry, **_kwargs):
+        sessions = app.terminal_windows[0].tabs[0].sessions
+        assert len(sessions) == 2, "the count must not depend on how many panes attach"
+        events.append("attach")
+        return len(sessions)
+
+    async def fake_publish_forever(_registry, **_kwargs):
+        events.append("publish")
+        return 0
+
+    monkeypatch.setattr(component, "register", fake_register)
+    monkeypatch.setattr(autolaunch, "attach_existing", fake_attach)
+    monkeypatch.setattr(publisher, "publish_forever", fake_publish_forever)
+    _run_main(
+        monkeypatch,
+        publish=True,
+        session_ids=("one", "two"),
+        on_status=statuses.append,
+    )
+
+    assert events == ["register", "attach", "publish"]
+    assert statuses[0] == "registering Palaver status component"
+
+
 def test_the_publisher_can_be_left_out(pane, monkeypatch):
     ran: list[object] = []
+
+    async def fake_register(_connection):
+        return None
 
     async def fake_publish_forever(registry, **kwargs):
         ran.append(registry)
         return 0
 
+    monkeypatch.setattr(component, "register", fake_register)
     monkeypatch.setattr(publisher, "publish_forever", fake_publish_forever)
     _run_main(monkeypatch, publish=False)
     assert ran == []
 
 
-def _run_main(monkeypatch, *, publish: bool):
+def _run_main(
+    monkeypatch,
+    *,
+    publish: bool,
+    session_ids=(),
+    on_status=lambda _message: None,
+):
     """Drive `autolaunch.main` over a stub library, one event per monitor."""
 
     class _Monitor:
@@ -884,11 +931,15 @@ def _run_main(monkeypatch, *, publish: bool):
         async def async_get(self):
             return None
 
-    class _App:
-        terminal_windows = ()
+    sessions = tuple(types.SimpleNamespace(session_id=session_id) for session_id in session_ids)
+    app = types.SimpleNamespace(
+        terminal_windows=(types.SimpleNamespace(tabs=(types.SimpleNamespace(sessions=sessions),)),)
+        if sessions
+        else ()
+    )
 
     async def async_get_app(_connection):
-        return _App()
+        return app
 
     stub = type(
         "StubIterm2",
@@ -900,4 +951,6 @@ def _run_main(monkeypatch, *, publish: bool):
         },
     )()
     monkeypatch.setattr(autolaunch, "import_iterm2", lambda: stub)
-    return asyncio.run(autolaunch.main(object(), limit=1, publish=publish))
+    return asyncio.run(
+        autolaunch.main(object(), limit=1, publish=publish, on_status=on_status)
+    )

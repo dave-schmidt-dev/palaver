@@ -248,13 +248,22 @@ async def run_checks(
     ticker = component.RenderTicker()
     writer = component.make_variable_writer(connection)
     try:
-        await component.register(
+        registration = await component.register_for_probe(
             connection, ticker=ticker, set_variable=writer, width=width, timeout=REGISTER_TIMEOUT
         )
     except Exception as exc:
         checks.append(Check("register", False, f"iTerm2 refused the component: {exc!r}"))
         return checks
-    checks.append(Check("register", True, f"iTerm2 accepted {component.IDENTIFIER}"))
+    if registration.reused_existing:
+        checks.append(
+            Check(
+                "register",
+                True,
+                f"iTerm2 already has {component.IDENTIFIER}; reused its existing registrar",
+            )
+        )
+    else:
+        checks.append(Check("register", True, f"iTerm2 accepted {component.IDENTIFIER}"))
 
     app = await iterm2.async_get_app(connection)
     session = await _probe_session(app, session_id)

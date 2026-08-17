@@ -284,6 +284,8 @@ async def main(
     """
     iterm2 = import_iterm2()
     registry = SessionRegistry() if registry is None else registry
+    on_status("registering Palaver status component")
+    await component.register(connection)
     app = await iterm2.async_get_app(connection)
     await attach_existing(app, registry, on_attach=on_attach, on_status=on_status)
     # Gathered rather than sequenced: a pane can close while another opens,

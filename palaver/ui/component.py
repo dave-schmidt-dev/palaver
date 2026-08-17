@@ -182,6 +182,22 @@ PUSHED_AT_KEY = "pushed_at"
 #: for, so every path through this module is testable without iTerm2 running.
 SetVariable = Callable[[str, str, Any], Awaitable[None]]
 
+#: The function name iTerm2 registers for this component.  A duplicate
+#: subscription has no component identifier in its exception, so accepting
+#: one is safe only while registering this exact status-bar RPC.
+STATUS_RPC_NAME = "palaver_status_line"
+
+#: iTerm2's precise response when this server-originated RPC already exists.
+_DUPLICATE_STATUS_RPC = "DUPLICATE_SERVER_ORIGINATED_RPC"
+
+
+@dataclass(frozen=True)
+class Registration:
+    """The status-bar component plus whether iTerm2 already registered it."""
+
+    component: Any
+    reused_existing: bool = False
+
 
 def encode_status(status: Status, task: str | None = None, *, now: float | None = None) -> str:
     """Serialize what a pane should show into the value of one variable.
@@ -570,6 +586,38 @@ async def register(
     )
     await component.async_register(connection, coro, timeout=timeout)
     return component
+
+
+async def register_for_probe(
+    connection: Any,
+    *,
+    ticker: RenderTicker | None = None,
+    set_variable: SetVariable | None = None,
+    width: int = DEFAULT_WIDTH,
+    timeout: float | None = None,
+) -> Registration:
+    """Register for a one-shot probe, reusing only this exact known RPC.
+
+    A selftest can safely run beside the AutoLaunch publisher that owns the
+    component. The publisher itself must remain strict: treating a duplicate
+    as success there would leave it without a callback after a reconnect.
+    """
+    iterm2 = import_iterm2()
+    built, coro = build_component(
+        connection, ticker=ticker, set_variable=set_variable, width=width
+    )
+    try:
+        await built.async_register(connection, coro, timeout=timeout)
+    except iterm2.notifications.SubscriptionException as exc:
+        duplicate = (
+            type(exc) is iterm2.notifications.SubscriptionException
+            and exc.args == (_DUPLICATE_STATUS_RPC,)
+            and coro.__name__ == STATUS_RPC_NAME
+        )
+        if duplicate:
+            return Registration(component=built, reused_existing=True)
+        raise
+    return Registration(component=built)
 
 
 def _decoded_base64(text: str) -> bytes:

@@ -568,7 +568,15 @@ class _FakeSession:
         return types.SimpleNamespace(all_properties=self.props)
 
 
-def _fake_iterm2(monkeypatch, session, *, dropped=False, drop_tick=False, stall_tick_after=False):
+def _fake_iterm2(
+    monkeypatch,
+    session,
+    *,
+    dropped=False,
+    drop_tick=False,
+    stall_tick_after=False,
+    duplicate_registration=False,
+):
     """Stub every iTerm2 entry point `run_checks` and `register` reach for."""
 
     async def async_get_app(connection):
@@ -584,13 +592,19 @@ def _fake_iterm2(monkeypatch, session, *, dropped=False, drop_tick=False, stall_
             self.kwargs = kwargs
 
         async def async_register(self, connection, coro, timeout=None):
+            if duplicate_registration:
+                raise _SubscriptionException("DUPLICATE_SERVER_ORIGINATED_RPC")
             self.registered = (coro, timeout)
+
+    class _SubscriptionException(Exception):
+        """Match iTerm2's duplicate-registration error type exactly."""
 
     module = types.SimpleNamespace(
         async_get_app=async_get_app,
         Reference=lambda name: None,
         StatusBarRPC=lambda func: func,
         StatusBarComponent=lambda **kwargs: _Component(**kwargs),
+        notifications=types.SimpleNamespace(SubscriptionException=_SubscriptionException),
     )
 
     async def writer(session_id, name, value):
@@ -628,6 +642,7 @@ def _checks(
     dropped=False,
     drop_tick=False,
     stall_tick_after=False,
+    duplicate_registration=False,
 ):
     session = _FakeSession(PANE, {} if store is None else store, props)
     _fake_iterm2(
@@ -636,6 +651,7 @@ def _checks(
         dropped=dropped,
         drop_tick=drop_tick,
         stall_tick_after=stall_tick_after,
+        duplicate_registration=duplicate_registration,
     )
     return asyncio.run(ui.run_checks(object())), session
 
@@ -681,6 +697,16 @@ def test_the_selftest_proves_the_variables_round_trip(monkeypatch):
     assert _named(checks, "variables").passed is True
     assert _named(checks, "render tick").passed is True
     assert _named(checks, "render").passed is True
+
+
+def test_the_selftest_reuses_its_existing_component_and_keeps_checking(monkeypatch):
+    checks, _ = _checks(monkeypatch, duplicate_registration=True)
+    register = _named(checks, "register")
+    assert register.passed is True
+    assert "reused its existing registrar" in register.detail
+    assert _named(checks, "variables").passed is True
+    assert _named(checks, "render tick").passed is True
+    assert _named(checks, "publish").passed is True
 
 
 def test_a_variable_that_does_not_round_trip_fails_the_selftest(monkeypatch):

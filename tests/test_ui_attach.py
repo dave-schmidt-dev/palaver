@@ -650,6 +650,10 @@ class _StubStatusBarComponent:
         self.registrations.append((connection, coro, timeout))
 
 
+class _StubSubscriptionException(Exception):
+    """The exact iTerm2 exception type the probe is permitted to reuse."""
+
+
 def _stub_status_bar_api(monkeypatch):
     """Stand in for the `iterm2` module inside `build_component`.
 
@@ -662,6 +666,7 @@ def _stub_status_bar_api(monkeypatch):
         Reference=_StubReference,
         StatusBarRPC=lambda func: func,
         StatusBarComponent=lambda **kwargs: _StubStatusBarComponent(**kwargs),
+        notifications=types.SimpleNamespace(SubscriptionException=_StubSubscriptionException),
     )
     monkeypatch.setattr(component, "import_iterm2", lambda: module)
     return module
@@ -938,6 +943,36 @@ def test_registering_puts_the_component_nowhere_and_switches_nothing_on(monkeypa
     assert writes.calls == []
 
 
+def test_probe_registration_reuses_only_iterms_exact_duplicate_status_rpc(monkeypatch):
+    """A selftest may share the running component, but AutoLaunch may not."""
+    module = _stub_status_bar_api(monkeypatch)
+
+    class _DuplicateComponent(_StubStatusBarComponent):
+        async def async_register(self, connection, coro, timeout=None):
+            raise _StubSubscriptionException("DUPLICATE_SERVER_ORIGINATED_RPC")
+
+    module.StatusBarComponent = lambda **kwargs: _DuplicateComponent(**kwargs)
+
+    with pytest.raises(_StubSubscriptionException):
+        asyncio.run(component.register(object(), set_variable=_Writes()))
+
+    reused = asyncio.run(component.register_for_probe(object(), set_variable=_Writes()))
+    assert reused.reused_existing is True
+    assert reused.component.registrations == []
+
+    for error in (
+        _StubSubscriptionException("ANOTHER_STATUS"),
+        RuntimeError("DUPLICATE_SERVER_ORIGINATED_RPC"),
+    ):
+        class _RefusingComponent(_StubStatusBarComponent):
+            async def async_register(self, connection, coro, timeout=None):
+                raise error
+
+        module.StatusBarComponent = lambda **kwargs: _RefusingComponent(**kwargs)
+        with pytest.raises(type(error)):
+            asyncio.run(component.register_for_probe(object(), set_variable=_Writes()))
+
+
 def test_switching_the_status_bar_on_is_its_own_named_step():
     """It changes what every pane using the profile looks like, so it is opt-in."""
     written = []
@@ -1206,7 +1241,7 @@ def test_the_component_registers_and_its_variables_round_trip_through_iterm():
     async def body(conn):
         iterm2 = connection.import_iterm2()
         app = await iterm2.async_get_app(conn)
-        registered = await component.register(conn)
+        registered = await component.register_for_probe(conn)
 
         window = app.current_terminal_window
         tab = await window.async_create_tab()
@@ -1217,7 +1252,7 @@ def test_the_component_registers_and_its_variables_round_trip_through_iterm():
             raw = await session.async_get_variable(STATUS_VARIABLE)
         finally:
             await tab.async_close(force=True)
-        return registered is not None, raw
+        return registered.component is not None, raw
 
     ok, raw = _run_live(body, timeout=40.0)
     assert ok
