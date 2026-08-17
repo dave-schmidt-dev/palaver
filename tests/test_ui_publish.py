@@ -472,6 +472,7 @@ def test_a_pane_running_another_agent_is_pushed_unknown(pane):
         now=NOW,
         table=_table(tree),
         cwd_reader=_cwd_reader(cwd),
+        alive_probe=_alive(True),
     )
     assert (status, task) == (Status.UNKNOWN, None)
     # Positive control: the same tree with `claude` in it does resolve.
@@ -481,6 +482,7 @@ def test_a_pane_running_another_agent_is_pushed_unknown(pane):
         now=NOW,
         table=_table(),
         cwd_reader=_cwd_reader(cwd),
+        alive_probe=_alive(True),
     )
     assert status is Status.WORKING
 
