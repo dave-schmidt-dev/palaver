@@ -22,6 +22,11 @@ ENTER_SCREEN = b"\x1b[?1049h\x1b[?25l"
 LEAVE_SCREEN = b"\x1b[0m\x1b[?25h\x1b[?1049l"
 HOME = "\x1b[H"
 RESET = "\x1b[0m"
+CYAN = "\x1b[36m"
+GREEN = "\x1b[32m"
+AMBER = "\x1b[33m"
+MUTED = "\x1b[2m"
+RED = "\x1b[31m"
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])")
 
 
@@ -44,6 +49,7 @@ def sanitize(value: str) -> str:
 def cell_width(value: str) -> int:
     """Return terminal-cell width without external dependencies."""
 
+    value = _ANSI_ESCAPE.sub("", value)
     width = 0
     for character in value:
         if unicodedata.combining(character):
@@ -74,6 +80,80 @@ def clip_cells(value: str, width: int) -> str:
     return "".join(output) + "…"
 
 
+def _layout_text(value: str) -> str:
+    """Remove terminal controls while retaining intentional layout spaces."""
+
+    value = _ANSI_ESCAPE.sub("", value)
+    return "".join(
+        " " if character.isspace() or unicodedata.category(character).startswith("C") else character
+        for character in value
+    )
+
+
+def _clip_layout_cells(value: str, width: int) -> str:
+    """Sanitize and clip a frame row without collapsing indentation."""
+
+    if width <= 0:
+        return ""
+    text = _layout_text(value)
+    if cell_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    prefix, _ = _take_cells(text, width - 1)
+    return prefix + "…"
+
+
+def _take_cells(value: str, width: int) -> tuple[str, str]:
+    """Take a cell-bounded prefix, keeping the unconsumed text."""
+
+    if width <= 0:
+        return "", value
+    used = 0
+    for index, character in enumerate(value):
+        character_width = cell_width(character)
+        if used == 0 and character_width > width:
+            return "…", value[index + 1 :]
+        if used + character_width > width:
+            return value[:index], value[index:]
+        used += character_width
+    return value, ""
+
+
+def _wrap_words(value: str, width: int) -> list[str]:
+    """Wrap normalized text to terminal cells, splitting overlong words."""
+
+    if width <= 0:
+        return []
+    words = value.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        chunks: list[str] = []
+        remainder = word
+        while remainder:
+            chunk, remainder = _take_cells(remainder, width)
+            if not chunk:
+                chunk, remainder = remainder[:1], remainder[1:]
+            chunks.append(chunk)
+        if len(chunks) > 1:
+            if current:
+                lines.append(current)
+                current = ""
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
+            continue
+        candidate = word if not current else f"{current} {word}"
+        if not current or cell_width(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _line(label: str, value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
@@ -84,22 +164,76 @@ def _joined(values: Sequence[str]) -> str | None:
     return " · ".join(values) if values else None
 
 
-def _content_lines(state: CompanionState) -> list[str]:
+def _content_lines(state: CompanionState, width: int | None = None) -> list[str]:
     latest = state.recent[-1] if state.recent else None
-    question_or_command = (
-        _line("ASK", _joined(state.questions))
-        if state.questions
-        else _line("COMMAND", state.command_result)
-    )
     connection = state.detail or f"{state.source} · {state.join_state.value.lower()}"
     candidates = [
-        _line("REQUEST", state.request),
-        _line("NOW", latest),
-        question_or_command,
-        _line("TASKS", _joined(state.tasks)),
-        _line("DETAIL", connection),
+        ("REQUEST", state.request),
+        ("NOW", latest),
+        ("ASK", _joined(state.questions)) if state.questions else ("COMMAND", state.command_result),
+        ("TASKS", _joined(state.tasks)),
+        ("DETAIL", connection),
     ]
-    return [line for line in candidates if line is not None]
+    if width is None:
+        return [line for label, value in candidates if (line := _line(label, value)) is not None]
+    wrapped: list[str] = []
+    width = max(1, width)
+    for label, value in candidates:
+        if value is None or not value.strip():
+            continue
+        clean_value = sanitize(value)
+        prefix = f"{label} "
+        prefix_width = cell_width(prefix)
+        first_width = width - prefix_width
+        if first_width > 0:
+            value_lines = _wrap_words(clean_value, first_width)
+            first_value = value_lines.pop(0) if value_lines else ""
+            wrapped.append(_take_cells(prefix, width)[0] + first_value)
+            continuation_width = max(1, width - prefix_width)
+            for continuation in value_lines:
+                continuation, _ = _take_cells(continuation, continuation_width)
+                wrapped.append(" " * prefix_width + continuation)
+        else:
+            wrapped.append(_take_cells(prefix, width)[0])
+            wrapped.extend(_wrap_words(clean_value, width))
+    return wrapped
+
+
+_STATUS_COLORS = {
+    "WORKING": GREEN,
+    "DONE": GREEN,
+    "AWAITING_HUMAN": AMBER,
+    "WAITING_FOR_USER": AMBER,
+    "QUESTION": AMBER,
+    "IDLE": AMBER,
+    "BLOCKED": RED,
+    "STALE": MUTED,
+    "STARTING": CYAN,
+    "UNJOINED": AMBER,
+    "ERROR": RED,
+    "UNKNOWN": RED,
+}
+_CONTENT_LABELS = {"REQUEST", "NOW", "ASK", "COMMAND", "TASKS", "DETAIL"}
+
+
+def _style_line(line: str) -> str:
+    """Color only Palaver-owned header and semantic labels."""
+
+    if line.startswith("PALAVER"):
+        styled = f"{CYAN}PALAVER{RESET}"
+        remainder = line[len("PALAVER") :]
+        status_match = re.match(r"\s+(\S+)", remainder)
+        status = status_match.group(1) if status_match else ""
+        if status in _STATUS_COLORS:
+            offset = status_match.start(1) if status_match else 0
+            styled += remainder[:offset] + f"{_STATUS_COLORS[status]}{status}{RESET}"
+            styled += remainder[offset + len(status) :]
+            return styled
+        return styled + remainder
+    label, separator, value = line.partition(" ")
+    if separator and label in _CONTENT_LABELS:
+        return f"{CYAN}{label}{RESET}{separator}{value}"
+    return line
 
 
 def render_frame(
@@ -122,15 +256,15 @@ def render_frame(
         label = state.join_state.value
     else:
         label = state.status.upper()
-    header = f"PALAVER  {label}  {state.project}"
-    lines = [header, *_content_lines(state)]
+    header = f"PALAVER {label} {sanitize(state.project)}"
+    lines = [header, *_content_lines(state, width)]
     return _encode_frame(lines, width, height)
 
 
 def render_error_frame(detail: str, width: int, height: int) -> bytes:
     """Render a recoverable transport error without exposing its path."""
 
-    return _encode_frame(["PALAVER  ERROR", f"DETAIL {detail}"], width, height)
+    return _encode_frame(["PALAVER ERROR", f"DETAIL {sanitize(detail)}"], width, height)
 
 
 def _encode_frame(lines: Sequence[str], width: int, height: int) -> bytes:
@@ -141,8 +275,8 @@ def _encode_frame(lines: Sequence[str], width: int, height: int) -> bytes:
         visible.append("")
     padded = []
     for line in visible:
-        clipped = clip_cells(line, width)
-        padded.append(clipped + " " * max(0, width - cell_width(clipped)))
+        clipped = _clip_layout_cells(line, width)
+        padded.append(_style_line(clipped) + " " * max(0, width - cell_width(clipped)))
     body = "\r\n".join(padded)
     return f"{HOME}{body}{RESET}".encode("utf-8")
 

@@ -212,7 +212,7 @@ def test_supported_process_gets_unjoined_companion_above_it(tmp_path, monkeypatc
     assert summary.vars[ROLE_VARIABLE] == COMPANION_ROLE
     assert summary.vars[AGENT_SESSION_VARIABLE] == "agent"
     assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
-    assert summary.preferred_size == (100, 6)
+    assert summary.preferred_size == (100, 10)
     assert "palaver.ui.companion_render" in agent.split_calls[0]["profile_customizations"]
 
 
@@ -242,7 +242,8 @@ def test_marked_companion_is_never_probed_or_split(tmp_path):
     assert not agent.split_calls and not summary.split_calls
 
 
-def test_valid_pair_is_reused_without_resize_or_focus(tmp_path):
+def test_valid_pair_is_resized_without_focus(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
     app, agent, summary = paired_app(focus_companion=False)
     app.tab.sessions.append(summary)
     summary.tab = app.tab
@@ -254,7 +255,59 @@ def test_valid_pair_is_reused_without_resize_or_focus(tmp_path):
 
     assert result.created == ()
     assert result.pairs[0].companion_id == "summary"
+    assert summary.preferred_size == (100, 10)
+    assert app.tab.layout_updates == 1
+    assert agent.activate_calls == []
+
+
+def test_resize_failure_retains_pair_and_reports_status(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app(focus_companion=False)
+    app.tab.sessions.append(summary)
+    summary.tab = app.tab
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    statuses = []
+
+    async def fail_layout_update():
+        raise RuntimeError("layout refused")
+
+    app.tab.async_update_layout = fail_layout_update
+    ctl = CompanionController(
+        tmp_path,
+        read_metadata=metadata_reader,
+        process_detector=detected,
+        transcript_joiner=lambda *_args, **_kwargs: None,
+        process_table_reader=lambda: {},
+        profile_builder=lambda command: command,
+        on_status=statuses.append,
+    )
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ()
+    assert result.pairs[0].companion_id == "summary"
+    assert summary.preferred_size == (100, 10)
+    assert agent.activate_calls == []
+    assert any("resizing companion for agent" in status for status in statuses)
+    assert any("could not resize companion for agent" in status for status in statuses)
+
+
+def test_valid_pair_at_target_height_skips_layout_update(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app(focus_companion=False)
+    summary.grid_size.height = 10
+    app.tab.sessions.append(summary)
+    summary.tab = app.tab
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ()
     assert summary.preferred_size is None
+    assert app.tab.layout_updates == 0
     assert agent.activate_calls == []
 
 
@@ -294,7 +347,7 @@ def test_one_sided_pair_cleanup_leaves_no_orphan_state(tmp_path):
 
 
 def test_small_agent_is_refused_without_split(tmp_path):
-    app, agent, _summary = paired_app(height=6)
+    app, agent, _summary = paired_app(height=10)
     ctl, writes = controller(tmp_path)
     result = asyncio.run(ctl.reconcile(app))
     assert result.refused == ("agent",)

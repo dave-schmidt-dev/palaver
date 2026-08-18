@@ -2,7 +2,7 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** the supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled yet. Memory, extraction, and the MCP read/write surface are running. The rejected iTerm2 status-bar experiment has been removed; a small companion pane above each agent pane is the next UI.
+**Status:** the supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled yet. Memory, extraction, and the MCP read/write surface are running. iTerm2 shows a deterministic, session-owned companion pane above each supported agent pane.
 
 ## Problem
 
@@ -76,7 +76,6 @@ It checks *every* file under `tests/fixtures/`, not every `.jsonl`. Discovery wa
 
 ## Open questions
 
-- How to keep companion panes paired with their agents across layout changes and restarts.
 - Whether a 30–60s observer tick feels live in actual use.
 - Whether the structural turn boundary is *correct*, not merely computable on 100% of transcripts.
 
@@ -120,20 +119,21 @@ absent. Turn it on first:
    on its own after a restart; the shim also restarts the attachment with a
    backoff if it exits.
 
-3. Restart iTerm2, or run the attachment by hand for a session:
-
-   ```sh
-   uv run python -m palaver.ui.autolaunch
-   ```
+3. Restart iTerm2, or launch `AutoLaunch/palaver.py` from iTerm2's **Scripts** menu.
 
 Palaver connects over iTerm2's Unix domain socket and **refuses to run** if that
 socket is absent, rather than falling back to the library's loopback TCP
 listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
 credential and is passed only through the environment, never on a command line.
 
-The AutoLaunch process currently keeps pane discovery and lifecycle state only.
-It does not render a UI. The status-bar approach was rejected because it gives
-the user one visible bar rather than one persistent summary surface per agent.
+The AutoLaunch process creates and maintains one ten-row companion above each
+supported agent pane. It pairs panes with reciprocal iTerm variables, restores
+them after renderer restarts, resizes existing companions to ten rows, and
+writes private atomic state files that the terminal renderer displays. Long
+values wrap at terminal-cell boundaries, including wide characters and
+overlong words; only Palaver-owned headers, labels, and statuses receive ANSI
+color. User-provided values are rendered as plain text. Input typed into a
+companion is discarded and never forwarded.
 
 Automatic Codex joining requires one recent root rollout whose recorded cwd
 exactly matches the pane. For an intentional directory rename or move, pin the
@@ -142,11 +142,13 @@ known rollout to the pane without focusing it, and clear the override later:
 ```sh
 uv run palaver ui --session PANE_ID --pin codex SESSION_KEY
 uv run palaver ui --session PANE_ID --clear-pin
+uv run palaver ui --session PANE_ID --enable-companion
+uv run palaver ui --session PANE_ID --disable-companion
 ```
 
 The observer's semantic extraction requires the configured local
-`llama-server` to be running on loopback. The future companion renderer will
-prefer deterministic event filtering and use local inference only when useful.
+`llama-server` to be running on loopback. Companion panes remain deterministic;
+local inference is optional compression rather than the source of status.
 
 ## Serving memory to other agents
 

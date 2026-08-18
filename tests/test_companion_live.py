@@ -392,7 +392,7 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             await _eventually(lambda: _screen_contains(first_companion, "UPDATED-ONLY-ONE"))
             assert "UPDATED-ONLY-ONE" not in await _screen_text(second_companion)
 
-            # The renderer must adapt to actual dimensions, not assume six rows.
+            # The renderer must adapt to actual dimensions, not assume ten rows.
             long_request = "NARROW-" + "x" * 200
             atomic_write_state(ordered[0].state_path, _snapshot(1, request=long_request))
             first_agent = agents[0]

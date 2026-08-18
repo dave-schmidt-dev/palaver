@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import signal
 import stat
@@ -58,32 +59,37 @@ def _state(*, updated: float = 100.0, **changes) -> CompanionState:
 
 
 def _frame_text(state: CompanionState, width: int, height: int) -> str:
-    return render_frame(state, width, height, now=101.0).decode()
+    return _strip_ansi(render_frame(state, width, height, now=101.0).decode())
+
+
+def _strip_ansi(value: str | bytes) -> str | bytes:
+    pattern = r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])"
+    if isinstance(value, bytes):
+        return re.sub(pattern.encode(), b"", value)
+    return re.sub(pattern, "", value)
 
 
 def test_golden_frame_20_by_2_prioritizes_request():
-    assert _frame_text(_state(), 20, 2) == (
-        "\x1b[HPALAVER WORKING Alp…\r\nREQUEST ship compan…\x1b[0m"
-    )
+    assert _frame_text(_state(), 20, 2) == ("PALAVER WORKING Alp…\r\nREQUEST ship        ")
 
 
 def test_golden_frame_40_by_4_uses_latest_activity_and_question():
     assert _frame_text(_state(), 40, 4) == (
-        "\x1b[HPALAVER WORKING Alpha Project           \r\n"
+        "PALAVER WORKING Alpha Project           \r\n"
         "REQUEST ship companion panes            \r\n"
         "NOW updated plan                        \r\n"
-        "ASK deploy now?                         \x1b[0m"
+        "ASK deploy now?                         "
     )
 
 
 def test_golden_frame_80_by_6_shows_full_priority_order():
     assert _frame_text(_state(), 80, 6) == (
-        "\x1b[HPALAVER WORKING Alpha Project                                                   \r\n"
+        "PALAVER WORKING Alpha Project                                                   \r\n"
         "REQUEST ship companion panes                                                    \r\n"
         "NOW updated plan                                                                \r\n"
         "ASK deploy now?                                                                 \r\n"
         "TASKS render · verify                                                           \r\n"
-        "DETAIL exact pane joined                                                        \x1b[0m"
+        "DETAIL exact pane joined                                                        "
     )
 
 
@@ -96,18 +102,64 @@ def test_command_occupies_question_row_only_when_no_question_exists():
 def test_join_and_stale_states_override_model_status():
     unjoined = _state(join_state=JoinState.UNJOINED, status="done")
     assert "PALAVER UNJOINED" in _frame_text(unjoined, 40, 2)
-    assert "PALAVER STALE" in render_frame(unjoined, 40, 2, now=200).decode()
-    assert "PALAVER STALE" in render_frame(unjoined, 40, 2, now=0).decode()
+    assert "PALAVER STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=200).decode())
+    assert "PALAVER STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=0).decode())
     failed = _state(join_state=JoinState.ERROR, status="working")
     assert "PALAVER ERROR" in _frame_text(failed, 40, 2)
+
+
+@pytest.mark.parametrize(
+    ("status", "color"),
+    [
+        ("WORKING", companion_render.GREEN),
+        ("DONE", companion_render.GREEN),
+        ("AWAITING_HUMAN", companion_render.AMBER),
+        ("WAITING_FOR_USER", companion_render.AMBER),
+        ("QUESTION", companion_render.AMBER),
+        ("IDLE", companion_render.AMBER),
+        ("BLOCKED", companion_render.RED),
+        ("UNKNOWN", companion_render.RED),
+    ],
+)
+def test_every_live_status_has_a_semantic_color(status, color):
+    frame = render_frame(_state(status=status), 40, 2, now=101).decode()
+    assert f"{color}{status}{companion_render.RESET}" in frame
+
+
+@pytest.mark.parametrize(
+    ("join_state", "color"),
+    [
+        (JoinState.STARTING, companion_render.CYAN),
+        (JoinState.UNJOINED, companion_render.AMBER),
+        (JoinState.ERROR, companion_render.RED),
+    ],
+)
+def test_every_nonjoined_state_has_a_semantic_color(join_state, color):
+    frame = render_frame(_state(join_state=join_state), 40, 2, now=101).decode()
+    assert f"{color}{join_state.value}{companion_render.RESET}" in frame
 
 
 def test_control_and_ansi_sequences_are_removed_not_rendered():
     hostile = "safe\x1b[31m red\x1b[0m\nnext\x00end"
     assert sanitize(hostile) == "safe red next end"
     frame = render_frame(_state(request=hostile), 80, 2, now=101)
-    assert frame.count(b"\x1b") == 2  # HOME and final RESET, both Palaver-owned.
+    assert b"\x1b[31m" not in frame
+    assert b"\x1b[36m" in frame
     assert b"[31m" not in frame
+
+
+def test_payload_wraps_to_cells_and_only_owned_tokens_are_colored():
+    state = _state(request="first 界 second third", status="done", project="user text")
+    frame = render_frame(state, 16, 5, now=101).decode()
+    plain = _strip_ansi(frame)
+    rows = plain.split("\r\n")
+    assert rows[1] == "REQUEST first 界"
+    assert rows[2].startswith("        second")
+    assert all(cell_width(row) == 16 for row in rows)
+    assert b"\x1b[36mPALAVER" in frame.encode()
+    assert b"\x1b[32mDONE" in frame.encode()
+    assert b"\x1b[36mREQUEST" in frame.encode()
+    assert b"\x1b[36mfirst" not in frame.encode()
 
 
 def test_cell_clipping_accounts_for_wide_and_combining_characters():
@@ -198,13 +250,17 @@ def _read_available(fd: int, timeout: float = 0.2) -> bytes:
 def _read_until(fd: int, needle: bytes, timeout: float = 3.0) -> bytes:
     deadline = time.monotonic() + timeout
     output = bytearray()
-    while needle not in output and time.monotonic() < deadline:
+    while (
+        needle not in output
+        and needle not in _strip_ansi(bytes(output))
+        and time.monotonic() < deadline
+    ):
         output.extend(_read_available(fd, 0.08))
-    assert needle in output, output
+    assert needle in output or needle in _strip_ansi(bytes(output)), output
     return bytes(output)
 
 
-def _start_renderer(path: Path, *, width: int = 80, height: int = 6):
+def _start_renderer(path: Path, *, width: int = 80, height: int = 10):
     master, slave = pty.openpty()
     _set_size(slave, width, height)
     process = subprocess.Popen(
@@ -263,7 +319,7 @@ def test_pty_marks_a_quiet_producer_stale_without_another_write(tmp_path):
     assert b"STALE" not in initial
     written_stamp = path.stat().st_mtime_ns
     transitioned = _read_until(master, b"PALAVER STALE", timeout=3)
-    assert b"PALAVER STALE" in transitioned
+    assert b"PALAVER STALE" in _strip_ansi(transitioned)
     assert path.stat().st_mtime_ns == written_stamp
     _stop_renderer(process, master, slave)
 
@@ -277,7 +333,7 @@ def test_pty_recovers_from_missing_then_malformed_then_valid_state(tmp_path):
     assert process.poll() is None
     atomic_write_state(path, _state(updated=time.time(), status="done"))
     recovered = _read_until(master, b"PALAVER DONE")
-    assert b"PALAVER DONE" in recovered
+    assert b"PALAVER DONE" in _strip_ansi(recovered)
     _stop_renderer(process, master, slave)
 
 
