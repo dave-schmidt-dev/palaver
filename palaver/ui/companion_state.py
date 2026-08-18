@@ -16,7 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_STATE_BYTES = 64 * 1024
 MAX_ITEMS = 8
 MAX_TEXT = 512
@@ -32,6 +32,7 @@ _REQUIRED_KEYS = frozenset(
         "command_result",
         "detail",
         "recent",
+        "recent_kinds",
         "tasks",
         "questions",
     }
@@ -53,7 +54,7 @@ class JoinState(StrEnum):
 
 @dataclass(frozen=True)
 class CompanionState:
-    """One complete, immutable renderer snapshot (schema version 1)."""
+    """One complete, immutable renderer snapshot (schema version 2)."""
 
     producer_updated_at: float
     project: str
@@ -64,6 +65,7 @@ class CompanionState:
     command_result: str | None = None
     detail: str | None = None
     recent: tuple[str, ...] = ()
+    recent_kinds: tuple[str, ...] = ()
     tasks: tuple[str, ...] = ()
     questions: tuple[str, ...] = ()
     schema_version: int = SCHEMA_VERSION
@@ -83,7 +85,7 @@ class CompanionState:
             raise CompanionStateError("join_state must be a JoinState")
         for name in ("request", "command_result", "detail"):
             _validate_text(name, getattr(self, name), optional=True)
-        for name in ("recent", "tasks", "questions"):
+        for name in ("recent", "recent_kinds", "tasks", "questions"):
             value = getattr(self, name)
             if not isinstance(value, tuple):
                 raise CompanionStateError(f"{name} must be a tuple")
@@ -91,6 +93,10 @@ class CompanionState:
                 raise CompanionStateError(f"{name} has more than {MAX_ITEMS} entries")
             for item in value:
                 _validate_text(f"{name} item", item, optional=False)
+        # The renderer indexes one into the other, so a snapshot that pairs
+        # them unevenly is rejected here rather than silently mis-colored.
+        if len(self.recent_kinds) != len(self.recent):
+            raise CompanionStateError("recent_kinds must be one kind per recent item")
 
 
 def _validate_text(name: str, value: object, *, optional: bool) -> None:
@@ -116,6 +122,7 @@ def _as_payload(state: CompanionState) -> dict[str, Any]:
         "command_result": state.command_result,
         "detail": state.detail,
         "recent": list(state.recent),
+        "recent_kinds": list(state.recent_kinds),
         "tasks": list(state.tasks),
         "questions": list(state.questions),
     }
@@ -160,7 +167,7 @@ def atomic_write_state(path: Path, state: CompanionState) -> None:
 
 
 def read_state(path: Path) -> CompanionState:
-    """Read and strictly validate one schema-v1 state snapshot."""
+    """Read and strictly validate one schema-v2 state snapshot."""
 
     source = Path(path)
     try:
@@ -177,7 +184,7 @@ def read_state(path: Path) -> CompanionState:
         raise CompanionStateError("state file must contain one object")
     keys = frozenset(payload)
     if keys != _REQUIRED_KEYS:
-        raise CompanionStateError("state file fields do not match schema version 1")
+        raise CompanionStateError(f"state file fields do not match schema version {SCHEMA_VERSION}")
     try:
         join_state = JoinState(payload["join_state"])
         return CompanionState(
@@ -191,13 +198,16 @@ def read_state(path: Path) -> CompanionState:
             command_result=payload["command_result"],
             detail=payload["detail"],
             recent=_read_items("recent", payload["recent"]),
+            recent_kinds=_read_items("recent_kinds", payload["recent_kinds"]),
             tasks=_read_items("tasks", payload["tasks"]),
             questions=_read_items("questions", payload["questions"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, CompanionStateError):
             raise
-        raise CompanionStateError("state file values do not match schema version 1") from exc
+        raise CompanionStateError(
+            f"state file values do not match schema version {SCHEMA_VERSION}"
+        ) from exc
 
 
 def _read_items(name: str, value: object) -> tuple[str, ...]:

@@ -70,6 +70,7 @@ def _state(snapshot: SummarySnapshot, *, project: str, status: str, now: float) 
         command_result=snapshot.command_result.text,
         detail=detail,
         recent=tuple(item.text for item in snapshot.recent),
+        recent_kinds=tuple(item.evidence_kind for item in snapshot.recent),
         tasks=tuple(f"{item.status}: {item.text}" for item in snapshot.tasks.items)[-MAX_ITEMS:],
         questions=tuple(item.text for item in snapshot.questions.items if item.text)[-MAX_ITEMS:],
     )

@@ -56,6 +56,10 @@ def _state(*, updated: float = 100.0, **changes) -> CompanionState:
         "questions": ("deploy now?",),
     }
     values.update(changes)
+    # Every test that overrides `recent` gets a matching, deliberately
+    # uncolored kind per item unless it asks for specific kinds.
+    if "recent_kinds" not in changes:
+        values["recent_kinds"] = ("agent_message",) * len(values["recent"])
     return CompanionState(**values)
 
 
@@ -132,6 +136,48 @@ def test_the_detail_row_appears_only_when_the_producer_supplied_one():
     assert "DETAIL" not in joined
     unjoined = _state(detail="Waiting for an exact session join", join_state=JoinState.UNJOINED)
     assert "DETAIL   Waiting for an exact session join" in _frame_text(unjoined, 80, 10)
+
+
+def test_activity_rows_are_colored_by_the_producers_evidence_kind():
+    """The renderer never reads an item's display text to decide its color:
+    a failure is red, tool and harness traffic is dimmed, and the agent's own
+    prose keeps the default weight so it reads as the foreground."""
+    state = _state(
+        recent=("Tool Bash: ruff check .", "Tool error: E501", "Agent: pushed"),
+        recent_kinds=("tool_use", "tool_error", "agent_message"),
+        tasks=(),
+        questions=(),
+        command_result=None,
+        detail=None,
+    )
+    rows = render_frame(state, 60, 5, now=101).decode().split("\r\n")
+    uncolored = (companion_render.RED, companion_render.MUTED, companion_render.AMBER)
+    assert "Agent: pushed" in rows[2]
+    assert not any(escape in rows[2] for escape in uncolored)
+    assert f"{companion_render.RED}Tool error: E501{companion_render.RESET}" in rows[3]
+    assert f"{companion_render.MUTED}Tool Bash: ruff check .{companion_render.RESET}" in rows[4]
+
+
+def test_a_color_never_bleeds_into_the_label_column():
+    state = _state(recent=("Tool result: ok",), recent_kinds=("tool_result",))
+    rows = render_frame(state, 60, 4, now=101).decode().split("\r\n")
+    activity = next(row for row in rows if "Tool result: ok" in row)
+    label, _, rest = activity.partition("Tool result")
+    assert label.endswith(f"{companion_render.MUTED}")
+    assert companion_render.MUTED not in label[: label.index(companion_render.MUTED)]
+    assert rest.startswith(f": ok{companion_render.RESET}")
+
+
+def test_an_unknown_evidence_kind_is_left_uncolored_rather_than_guessed():
+    state = _state(recent=("Something new",), recent_kinds=("kind_from_a_future_release",))
+    frame = render_frame(state, 60, 4, now=101).decode()
+    activity = next(row for row in frame.split("\r\n") if "Something new" in row)
+    assert activity.endswith("Something new" + " " * (60 - _LABEL_WIDTH - len("Something new")))
+
+
+def test_the_command_row_is_red_because_it_only_ever_holds_a_failure():
+    frame = render_frame(_state(), 80, 10, now=101).decode()
+    assert f"{companion_render.RED}tests are passing{companion_render.RESET}" in frame
 
 
 def test_join_and_stale_states_override_model_status():
@@ -243,7 +289,7 @@ def test_reader_refuses_unknown_fields_versions_and_oversized_files(tmp_path):
     with pytest.raises(CompanionStateError, match="fields"):
         read_state(path)
     payload.pop("unknown")
-    payload["schema_version"] = 2
+    payload["schema_version"] = 99
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(CompanionStateError, match="unsupported"):
         read_state(path)

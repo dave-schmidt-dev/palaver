@@ -146,7 +146,8 @@ def reduce_claude_events(
                     if isinstance(tool_id, str):
                         pending.pop(tool_id, None)
                     text = _result_text(block)
-                    prefix = "Tool error" if block.get("is_error") else "Tool result"
+                    failed = bool(block.get("is_error"))
+                    prefix = "Tool error" if failed else "Tool result"
                     snapshot = replace(
                         snapshot,
                         command_result=(
@@ -158,7 +159,7 @@ def reduce_claude_events(
                             snapshot.recent,
                             f"{prefix}: {text}",
                             Provenance.EXACT,
-                            "tool_result",
+                            "tool_error" if failed else "tool_result",
                             tool_id if isinstance(tool_id, str) else None,
                         ),
                         turn=Claim.structural("Agent turn open", "tool_result"),

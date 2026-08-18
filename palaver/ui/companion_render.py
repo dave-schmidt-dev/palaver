@@ -126,13 +126,41 @@ def _take_cells(value: str, width: int) -> tuple[str, str]:
     return value, ""
 
 
-def _nonempty(*values: str | None) -> tuple[str, ...]:
+def _nonempty(*values: str | None, color: str = "") -> tuple[tuple[str, str], ...]:
     """Keep only the values that would put something on screen."""
 
-    return tuple(value for value in values if value and value.strip())
+    return tuple((value, color) for value in values if value and value.strip())
 
 
-def _section_items(state: CompanionState) -> dict[str, tuple[str, ...]]:
+# Activity items are colored by the producer's own evidence kind rather than
+# by reading their display text: a failure is red, harness and tool traffic is
+# dimmed so it recedes, and the agent's own prose keeps the default weight and
+# reads as the foreground. An unlisted kind is left uncolored on purpose.
+_ACTIVITY_COLORS = {
+    "tool_error": RED,
+    "error": RED,
+    "compaction": AMBER,
+    "request_user_input": AMBER,
+    "tool_use": MUTED,
+    "tool_result": MUTED,
+    "function_call": MUTED,
+    "function_call_output": MUTED,
+    "human_message": MUTED,
+}
+
+
+def _activity_items(state: CompanionState) -> tuple[tuple[str, str], ...]:
+    """Pair each activity item with its color, newest first."""
+
+    paired = zip(state.recent, state.recent_kinds, strict=True)
+    return tuple(
+        (text, _ACTIVITY_COLORS.get(kind, ""))
+        for text, kind in reversed(list(paired))
+        if text and text.strip()
+    )
+
+
+def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ...]]:
     """Return each labeled section's items, in the order they should be read.
 
     ``recent`` is stored oldest-first and is reversed here so NOW's first row
@@ -143,11 +171,13 @@ def _section_items(state: CompanionState) -> dict[str, tuple[str, ...]]:
 
     return {
         "REQUEST": _nonempty(state.request),
-        "NOW": _nonempty(*reversed(state.recent)),
+        "NOW": _activity_items(state),
         "TASKS": _nonempty(*state.tasks),
-        "ASK": _nonempty(*state.questions),
-        "COMMAND": _nonempty(state.command_result),
-        "DETAIL": _nonempty(state.detail),
+        "ASK": _nonempty(*state.questions, color=AMBER),
+        # Both reducers populate `command_result` only from a failure, so this
+        # row is never a neutral outcome.
+        "COMMAND": _nonempty(state.command_result, color=RED),
+        "DETAIL": _nonempty(state.detail, color=MUTED),
     }
 
 
@@ -164,7 +194,7 @@ _DISPLAY_ORDER = ("REQUEST", "NOW", "TASKS", "ASK", "COMMAND", "DETAIL")
 _LABEL_WIDTH = 9
 
 
-def _allocate_rows(items: Mapping[str, Sequence[str]], rows: int) -> dict[str, int]:
+def _allocate_rows(items: Mapping[str, Sequence[object]], rows: int) -> dict[str, int]:
     """Divide the available content rows among the sections that have any."""
 
     counts = dict.fromkeys(items, 0)
@@ -186,21 +216,21 @@ def _allocate_rows(items: Mapping[str, Sequence[str]], rows: int) -> dict[str, i
     return counts
 
 
-def _content_lines(state: CompanionState, width: int, rows: int) -> list[str]:
+def _content_lines(state: CompanionState, width: int, rows: int) -> list[tuple[str, str]]:
     """Lay the sections out as one clipped row per item under a single label."""
 
     items = _section_items(state)
     counts = _allocate_rows(items, rows)
     gutter = min(_LABEL_WIDTH, max(1, width))
     value_width = width - gutter
-    lines: list[str] = []
+    lines: list[tuple[str, str]] = []
     for label in _DISPLAY_ORDER:
-        for index, value in enumerate(items[label][: counts[label]]):
+        for index, (value, color) in enumerate(items[label][: counts[label]]):
             prefix = label.ljust(gutter) if index == 0 else " " * gutter
             if value_width <= 0:
-                lines.append(prefix)
+                lines.append((prefix, ""))
             else:
-                lines.append(prefix + clip_cells(value, value_width))
+                lines.append((prefix + clip_cells(value, value_width), color))
     return lines
 
 
@@ -221,8 +251,12 @@ _STATUS_COLORS = {
 _CONTENT_LABELS = {"REQUEST", "NOW", "ASK", "COMMAND", "TASKS", "DETAIL"}
 
 
-def _style_line(line: str) -> str:
-    """Color only Palaver-owned header and semantic labels."""
+def _style_line(line: str, color: str = "") -> str:
+    """Color only Palaver-owned header and semantic labels.
+
+    ``color`` applies to the value, never to the label or the gutter, so the
+    label column stays one uniform column no matter what a row carries.
+    """
 
     if line.startswith("PALAVER"):
         styled = f"{CYAN}PALAVER{RESET}"
@@ -235,10 +269,19 @@ def _style_line(line: str) -> str:
             styled += remainder[offset + len(status) :]
             return styled
         return styled + remainder
-    label, separator, value = line.partition(" ")
-    if separator and label in _CONTENT_LABELS:
-        return f"{CYAN}{label}{RESET}{separator}{value}"
-    return line
+    gutter = min(_LABEL_WIDTH, len(line))
+    head, tail = line[:gutter], line[gutter:]
+    label = head.strip()
+    if label in _CONTENT_LABELS:
+        head = f"{CYAN}{label}{RESET}" + head[len(label) :]
+    elif label:
+        # A row clipped so narrow that its label no longer survives whole.
+        return _paint(line, color)
+    return head + _paint(tail, color)
+
+
+def _paint(value: str, color: str) -> str:
+    return f"{color}{value}{RESET}" if color and value.strip() else value
 
 
 def render_frame(
@@ -262,7 +305,7 @@ def render_frame(
     else:
         label = state.status.upper()
     header = f"PALAVER  {label}  {sanitize(state.project)} · {sanitize(state.source)}"
-    lines = [header, *_content_lines(state, width, height - 1)]
+    lines = [(header, ""), *_content_lines(state, width, height - 1)]
     return _encode_frame(lines, width, height)
 
 
@@ -270,19 +313,19 @@ def render_error_frame(detail: str, width: int, height: int) -> bytes:
     """Render a recoverable transport error without exposing its path."""
 
     body = "DETAIL".ljust(_LABEL_WIDTH) + clip_cells(detail, max(0, width - _LABEL_WIDTH))
-    return _encode_frame(["PALAVER  ERROR", body], width, height)
+    return _encode_frame([("PALAVER  ERROR", ""), (body, MUTED)], width, height)
 
 
-def _encode_frame(lines: Sequence[str], width: int, height: int) -> bytes:
+def _encode_frame(lines: Sequence[tuple[str, str]], width: int, height: int) -> bytes:
     width = max(1, width)
     height = max(1, height)
     visible = list(lines[:height])
     while len(visible) < height:
-        visible.append("")
+        visible.append(("", ""))
     padded = []
-    for line in visible:
+    for line, color in visible:
         clipped = _clip_layout_cells(line, width)
-        padded.append(_style_line(clipped) + " " * max(0, width - cell_width(clipped)))
+        padded.append(_style_line(clipped, color) + " " * max(0, width - cell_width(clipped)))
     body = "\r\n".join(padded)
     return f"{HOME}{body}{RESET}".encode("utf-8")
 
