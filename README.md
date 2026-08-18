@@ -2,7 +2,16 @@
 
 A local-first observer, memory, and situational-awareness system for people running several AI coding agents in terminal sessions at once.
 
-**Status:** the supervised observer watches Claude Code and Codex; OpenCode has an adapter but is not scheduled yet. Memory, extraction, and the MCP read/write surface are running. iTerm2 shows a deterministic, session-owned companion pane above each supported agent pane.
+**Status:** iTerm2 shows a deterministic, session-owned companion pane above each supported agent pane. That surface is fully deterministic and depends on no model.
+
+The observer -- and with it extraction and memory -- is **dormant as of 2026-08-18**. It requires a local llama-server on `127.0.0.1:8090`; with that server down it retried without backoff, spending ~0.5 core and ~3 GB of RSS to record 56,452 consecutive failed model runs and zero events, memories, or transcript chunks. Its launch agent is stopped and disabled rather than removed:
+
+```sh
+launchctl enable gui/$(id -u)/com.zerodelta.palaver.observe    # revisit later
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zerodelta.palaver.observe.plist
+```
+
+Codex and Claude Code have supervised adapters; OpenCode has an adapter but is not scheduled yet.
 
 ## Problem
 
