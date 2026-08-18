@@ -132,8 +132,15 @@ is never changed afterwards: an existing pane is reused as-is. **Palaver never
 resizes your window.** iTerm2's only pane-sizing call rewrites the whole tab
 from the library's cached per-pane sizes, which are captured once and never
 refreshed, so that one write resyncs every cached size from live geometry
-first — leaving the agent and its companion to redivide only the rows they
-already occupy — and restores the window frame if iTerm moves it regardless. It pairs panes
+first, leaving the agent and its companion to redivide only the rows they
+already occupy. The call still shrinks the window on its own — it does so even
+when it asks for the sizes already on screen, because the layout it sends does
+not describe the pane title bars and dividers iTerm draws — so the window frame
+is captured beforehand and put back afterwards every time, which also returns
+the rows the shrink took. If the frame cannot be read, the sizing write is
+skipped and iTerm's own even split stands. Verifying this needs a real
+terminal: `PALAVER_RUN_LIVE_COMPANION_TEST=1 pytest tests/test_companion_live.py`
+creates a disposable window and asserts the frame never moves. It pairs panes
 with reciprocal iTerm variables, restores them after renderer restarts, and
 writes private atomic state files that the terminal renderer displays. Long
 values wrap at terminal-cell boundaries, including wide characters and

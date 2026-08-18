@@ -91,6 +91,18 @@ async def _screen_contains(session, text: str) -> bool:
     return text in await _screen_text(session)
 
 
+async def _frame_tuple(window) -> tuple[float, float, float, float]:
+    """Reduce the window frame to a value that survives an iTerm refresh."""
+
+    frame = await window.async_get_frame()
+    return (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
+
+
+async def _has_at_least_rows(session, rows: int) -> bool:
+    await asyncio.sleep(0)
+    return session.grid_size.height >= rows
+
+
 async def _grid_is_narrower(session, width: int) -> bool:
     await asyncio.sleep(0)
     return session.grid_size.width < width
@@ -305,6 +317,7 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
         window_id = None
         state_dir = tmp_path / ".state" / "companions"
         owned_ids: set[str] = set()
+        status: list[str] = []
         agent_ids: set[str] = set()
         terminated_owned: list[str] = []
         termination_monitor = None
@@ -330,6 +343,7 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
                 process_detector=lambda pane, **kwargs: _detector(agent_ids, pane, **kwargs),
                 transcript_joiner=lambda pane, **kwargs: _joiner(agent_ids, pane, **kwargs),
                 process_table_reader=lambda: {},
+                on_status=status.append,
             )
             termination_monitor = iterm2.SessionTerminationMonitor(connection_value)
             await termination_monitor.__aenter__()
@@ -338,6 +352,15 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             )
 
             selected_tab = window.current_tab.tab_id
+            # A window tall enough that a SUMMARY_ROWS companion fits beside a
+            # working agent. In a cramped window iTerm clamps the request, which
+            # is safe but would not exercise the sizing write.
+            created_frame = await window.async_get_frame()
+            await window.async_set_frame(iterm2.Frame(created_frame.origin, iterm2.Size(900, 760)))
+            await _eventually(lambda: _has_at_least_rows(agents[0], SUMMARY_ROWS * 3))
+            # INV-2: the one sizing write must not move or resize the window.
+            frame_before = await _frame_tuple(window)
+            rows_before = {agent.session_id: agent.grid_size.height for agent in agents}
 
             async def create_companions():
                 result = await controller.reconcile(owned_app)
@@ -348,6 +371,26 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             assert window.current_tab.tab_id == selected_tab
             assert not any(event.selected_tab_changed for event in creation_focus)
             assert not any(event.window_changed for event in creation_focus)
+
+            async def _companions_are_summary_height() -> bool:
+                await owned_app.async_refresh()
+                return all(
+                    (pane := owned_app.get_session_by_id(pair.companion_id)) is not None
+                    and pane.grid_size.height == SUMMARY_ROWS
+                    for pair in controller.pairs.values()
+                )
+
+            # Sizing a companion writes the whole tab, which shrinks the window
+            # and every tab in it unless the frame is put back. INV-2.
+            await _eventually(_companions_are_summary_height)
+            assert await _frame_tuple(window) == frame_before
+            assert not [note for note in status if "window frame" in note]
+            for agent_id in controller.pairs:
+                resized = owned_app.get_session_by_id(agent_id)
+                # The agent keeps every row the companion did not take, less the
+                # few iTerm spends on the pane title bars a split introduces.
+                assert resized.grid_size.height <= rows_before[agent_id] - SUMMARY_ROWS
+                assert resized.grid_size.height >= rows_before[agent_id] - SUMMARY_ROWS - 6
 
             pairs = controller.pairs
             assert set(pairs) == agent_ids

@@ -31,6 +31,7 @@ area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/compani
 gate_test: tests/test_adapters.py::test_adapters_never_open_source_writable
 gate_test: tests/test_ui_companion.py::test_operation_trace_never_closes_or_sends_text_to_agent
 gate_test: tests/test_ui_companion.py::test_created_companion_is_sized_without_changing_tab_geometry
+gate_test: tests/test_companion_live.py::test_three_test_owned_agents_have_isolated_resilient_companions
 threshold: 3
 rationale: The brief's first non-goal is autonomous control of coding agents, and the second is
   automatic injection of warnings into agent prompts. An observer that can write to the thing it
@@ -43,9 +44,15 @@ rationale: The brief's first non-goal is autonomous control of coding agents, an
   pane: `Tab.async_update_layout` rewrites the whole tab from every session's cached
   `preferred_size`, a value the library captures at construction and never refreshes. A per-pane
   request there becomes a window-wide mutation against sizes that may be hours dead. Palaver's one
-  sizing write therefore resyncs every cached size from live geometry, changes only how the agent
-  and its own companion divide the rows they already occupy, and restores the window frame if iTerm
-  moves it anyway.
+  sizing write therefore resyncs every cached size from live geometry and changes only how the agent
+  and its own companion divide the rows they already occupy. That alone does not hold the window:
+  measured against a live iTerm, the write shrinks the window even when it requests exactly the
+  sizes already on screen, because the layout protobuf does not describe the pane title bars and
+  dividers iTerm draws around them, and the shrink reaches every tab in the window. The window frame
+  is therefore captured and put back unconditionally — not conditionally on a move this process can
+  observe, since iTerm applies the shrink after answering the call. If the frame cannot be read, the
+  write is not issued at all: iTerm's own even split is a cosmetic loss, resizing the user's window
+  is an invariant breach. Only a live iTerm can witness this, so the gate test above is opt-in.
   This holds until Palaver has demonstrated reliability the user explicitly signs off on; it is not a
   temporary scaffold.
 

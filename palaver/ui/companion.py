@@ -48,6 +48,8 @@ COMPANION_ROLE = "companion-v1"
 
 SUMMARY_ROWS = 10
 MIN_AGENT_ROWS = 1
+LAYOUT_SETTLE_ATTEMPTS = 3
+LAYOUT_SETTLE_DELAY = 0.05
 SCROLLBACK_LINES = 100
 INITIAL_RESTART_BACKOFF = 2.0
 MAX_RESTART_BACKOFF = 60.0
@@ -497,12 +499,20 @@ class CompanionController:
         return new_id
 
     @staticmethod
-    def _frame_key(frame: Any) -> tuple[float, float, float, float] | None:
-        """Reduce an iTerm frame to a comparable tuple, or None if unreadable."""
-        try:
-            return (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
-        except AttributeError:
-            return None
+    def _window_for(app: Any, tab: Any, session: Any) -> Any | None:
+        """Locate the window owning `tab`, preferring the session's own link."""
+        window = getattr(session, "window", None)
+        if window is not None:
+            return window
+        # The session delegate resolves by object identity, so a session read
+        # from a tab the app has since rebuilt reports no window. Match on the
+        # tab id instead, which survives the rebuild.
+        tab_id = getattr(tab, "tab_id", None)
+        for candidate in getattr(app, "terminal_windows", None) or ():
+            for item in getattr(candidate, "tabs", None) or ():
+                if tab_id is not None and getattr(item, "tab_id", None) == tab_id:
+                    return candidate
+        return None
 
     async def _read_frame(self, window: Any) -> Any | None:
         """Return the window's current frame, or None if it cannot be read."""
@@ -518,56 +528,82 @@ class CompanionController:
 
         `Tab.async_update_layout` is the only pane-sizing call iTerm2's Python
         API offers, and it is a whole-tab write: it serializes every session in
-        the tab and sends each one's `preferred_size`.  The library caches that
-        value once, when it constructs the `Session`, and never refreshes it --
-        `Session.update_from` copies `grid_size` and leaves `preferred_size`
-        alone -- so a tab Palaver has watched across a window resize pushes
-        long-dead sizes back at iTerm, which resizes the window to match them.
-        That is a window-wide mutation from a per-pane request, and it is what
-        INV-2 forbids: only the marked companion is Palaver's to resize.
+        the tab and sends each one's `preferred_size`. Two things measured
+        against a live iTerm shape this method.
 
-        Every preferred size is therefore resynced from live geometry first, so
+        First, the library caches `preferred_size` once, when it constructs the
+        `Session`, and never refreshes it -- `Session.update_from` copies
+        `grid_size` and leaves `preferred_size` alone -- so a tab Palaver has
+        watched across a window resize pushes long-dead sizes back at iTerm.
+        Every cached size is therefore resynced from live geometry first, and
         the only change requested is how the agent and its companion divide the
-        rows they already occupy between them.  Both tab totals are unchanged.
-        iTerm still owns the outcome, so the window frame is captured and put
-        back if it moved regardless.
+        rows they already occupy.
+
+        Second, that is not enough on its own: the write shrinks the window
+        regardless, even when it requests exactly the sizes already on screen,
+        because the layout protobuf does not describe the pane title bars and
+        dividers iTerm draws around them. The shrink lands on every tab in the
+        window, not just this one, and repeats per companion. So the frame is
+        captured beforehand and put back afterwards, unconditionally -- which
+        also returns the rows the shrink took, leaving the companion on exactly
+        `SUMMARY_ROWS`. INV-2 forbids the alternative: only the marked companion
+        is Palaver's to resize, never the user's window.
 
         Args:
-            app: The `iterm2.App`, refreshed so the split is in the tab tree.
+            app: The `iterm2.App`, used to locate the window and to refresh.
             agent: The observed pane the companion was split from.
             companion: The session `async_split_pane` returned.
         """
         iterm2 = import_iterm2()
         tab = agent.tab
-        try:
-            await app.async_refresh()
-        except Exception:
-            self._on_status(f"could not refresh layout before sizing {agent.session_id}")
-        panes = {item.session_id: item for item in getattr(tab, "sessions", None) or ()}
-        summary = panes.get(companion.session_id)
-        observed = panes.get(agent.session_id)
-        if summary is None or observed is None:
-            # The split has not reached the tab tree. iTerm's own even division
+        panes: dict[str, Any] = {}
+        summary = observed = None
+        for attempt in range(LAYOUT_SETTLE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(LAYOUT_SETTLE_DELAY)
+            try:
+                await app.async_refresh()
+            except Exception:
+                self._on_status(f"could not refresh layout before sizing {agent.session_id}")
+            panes = {item.session_id: item for item in getattr(tab, "sessions", None) or ()}
+            summary = panes.get(companion.session_id)
+            observed = panes.get(agent.session_id)
+            if summary is not None and observed is not None:
+                break
+        else:
+            # The split never reached the tab tree. iTerm's own even division
             # stands: a layout write from here would describe a tab that does
-            # not exist, which is precisely how a window gets resized.
-            self._on_status(f"companion for {agent.session_id} is not in the layout yet")
+            # not exist, which is precisely how a window gets resized. The
+            # companion stays at half the pane rather than SUMMARY_ROWS.
+            self._on_status(f"companion for {agent.session_id} never joined the layout")
             return
         rows = observed.grid_size.height + summary.grid_size.height - SUMMARY_ROWS
         if rows < MIN_AGENT_ROWS:
             return
+
+        window = self._window_for(app, tab, observed)
+        before = await self._read_frame(window)
+        if before is None:
+            # Measured: every whole-tab write shrinks the window, including one
+            # requesting exactly the sizes already on screen, because the layout
+            # protobuf does not describe the pane title bars and dividers iTerm
+            # draws around them. With no frame to put back, the only choice that
+            # honours INV-2 is to leave iTerm's own even split alone.
+            self._on_status(f"no window frame to restore for {agent.session_id}; left unsized")
+            return
+
         for item in panes.values():
             item.preferred_size = iterm2.Size(item.grid_size.width, item.grid_size.height)
         summary.preferred_size = iterm2.Size(summary.grid_size.width, SUMMARY_ROWS)
         observed.preferred_size = iterm2.Size(observed.grid_size.width, rows)
-
-        window = getattr(observed, "window", None)
-        before = await self._read_frame(window)
         await tab.async_update_layout()
-        after = await self._read_frame(window)
-        first, second = self._frame_key(before), self._frame_key(after)
-        if first is None or second is None or first == second:
-            return
-        self._on_status(f"iTerm moved the window sizing {agent.session_id}; restoring the frame")
+
+        # Unconditionally, never on a detected move: iTerm applies the shrink
+        # after it answers the layout call, so reading the frame back races it
+        # and usually reports the old one. Putting the captured frame back also
+        # returns the rows the shrink took, from this tab and from every other
+        # tab in the window, while iTerm keeps the division just requested --
+        # which is how the companion ends up on SUMMARY_ROWS exactly.
         try:
             await window.async_set_frame(before)
         except Exception:

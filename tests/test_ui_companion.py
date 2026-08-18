@@ -83,6 +83,7 @@ class FakeTab:
         for session in self.sessions:
             session.tab = self
         self.current_session = self.sessions[0] if self.sessions else None
+        self.tab_id = "tab-1"
         self.layout_updates = 0
         self.on_update_layout = None
 
@@ -99,16 +100,20 @@ class FakeFrame:
 
 
 class FakeWindow:
-    def __init__(self, frame):
+    def __init__(self, frame, tabs=()):
         self.frame = frame
+        self.tabs = list(tabs)
         self.set_frames = []
         self.set_error = None
+        self.get_error = None
 
     def move_to(self, frame):
         """Stand in for iTerm resizing the window behind Palaver's back."""
         self.frame = frame
 
     async def async_get_frame(self):
+        if self.get_error is not None:
+            raise self.get_error
         return self.frame
 
     async def async_set_frame(self, frame):
@@ -121,7 +126,12 @@ class FakeWindow:
 class FakeApp:
     def __init__(self, tab):
         self.tab = tab
-        self.terminal_windows = [types.SimpleNamespace(tabs=[tab])]
+        # Sizing a companion is refused outright without a window frame to put
+        # back, so the default fake models one, as iTerm always does.
+        self.window = FakeWindow(FakeFrame(0, 0, 1400, 900), [tab])
+        self.terminal_windows = [self.window]
+        for session in tab.sessions:
+            session.window = self.window
         self.refresh_calls = 0
         self.refresh_hook = None
 
@@ -293,9 +303,8 @@ def test_a_layout_write_that_moves_the_window_puts_the_frame_back(tmp_path, monk
     """iTerm owns the outcome of a layout write, so the frame is a hard guard."""
     stub_iterm(monkeypatch)
     app, agent, summary = paired_app()
-    original = FakeFrame(0, 0, 1400, 900)
-    window = FakeWindow(original)
-    agent.window = window
+    window = app.window
+    original = window.frame
     app.tab.on_update_layout = lambda: window.move_to(FakeFrame(0, 0, 2560, 900))
     ctl, _ = controller(tmp_path)
 
@@ -305,13 +314,61 @@ def test_a_layout_write_that_moves_the_window_puts_the_frame_back(tmp_path, monk
     assert window.frame is original
 
 
+def test_the_frame_is_restored_even_when_the_move_is_not_visible_yet(tmp_path, monkeypatch):
+    """iTerm shrinks the window after answering, so a read-back races it.
+
+    Measured against a live iTerm: `Tab.async_update_layout` shrinks the window
+    by the pane title bars and dividers its protobuf does not describe -- every
+    tab in the window, not just this one -- and it does so after replying, so
+    reading the frame straight back usually still reports the old one. The
+    restore is therefore unconditional rather than conditional on a move this
+    process can see.
+    """
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    original = app.window.frame
+    ctl, _ = controller(tmp_path)
+
+    asyncio.run(ctl.reconcile(app))
+
+    assert app.tab.layout_updates == 1
+    assert app.window.set_frames == [original]
+
+
+def test_an_unreadable_window_frame_leaves_iterms_own_size_alone(tmp_path, monkeypatch):
+    """A write that cannot be undone is the bug; iTerm's even split is not."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    app.window.get_error = RuntimeError("no frame")
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert app.tab.layout_updates == 0
+    assert summary.preferred_size is None
+
+
+def test_a_session_the_app_rebuilt_is_matched_to_its_window_by_tab(tmp_path, monkeypatch):
+    """The session delegate resolves by identity, which a refresh can break."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    agent.window = None
+    original = app.window.frame
+    ctl, _ = controller(tmp_path)
+
+    asyncio.run(ctl.reconcile(app))
+
+    assert app.tab.layout_updates == 1
+    assert app.window.set_frames == [original]
+
+
 def test_a_window_that_refuses_a_frame_set_still_yields_a_companion(tmp_path, monkeypatch):
     """A fullscreen window rejects `async_set_frame`; the pair still stands."""
     stub_iterm(monkeypatch)
     app, agent, summary = paired_app()
-    window = FakeWindow(FakeFrame(0, 0, 1400, 900))
+    window = app.window
     window.set_error = RuntimeError("fullscreen")
-    agent.window = window
     app.tab.on_update_layout = lambda: window.move_to(FakeFrame(0, 0, 2560, 900))
     ctl, _ = controller(tmp_path)
 
@@ -334,6 +391,33 @@ def test_a_split_missing_from_the_tab_tree_is_left_at_iterms_own_size(tmp_path, 
     assert app.tab.layout_updates == 0
     assert summary.preferred_size is None
     assert agent.preferred_size is None
+
+
+def test_a_split_that_lands_late_is_sized_on_a_later_refresh(tmp_path, monkeypatch):
+    """Giving up on the first refresh leaves the companion at half the pane."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    agent.split_joins_tab = False
+    ctl, _ = controller(tmp_path)
+    skipped = []
+
+    def land_the_split():
+        if not agent.split_calls or summary in app.tab.sessions:
+            return
+        if not skipped:
+            skipped.append(True)
+            return
+        app.tab.sessions.append(summary)
+        summary.tab = app.tab
+
+    app.refresh_hook = land_the_split
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert app.tab.layout_updates == 1
+    assert summary.preferred_size == (100, companion.SUMMARY_ROWS)
+    assert agent.preferred_size == (100, 20)
 
 
 def test_default_state_transport_marks_an_unresolved_join_unjoined(tmp_path):
