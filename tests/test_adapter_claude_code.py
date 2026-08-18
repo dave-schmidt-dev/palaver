@@ -288,6 +288,9 @@ def test_classify_channel_injected_by_prefix_without_isMeta():
             is_meta=False,
         ),
         _user_record("[Request interrupted by user]", is_meta=False),
+        _user_record("<bash-input>pkill -f palaver</bash-input>"),
+        _user_record("<bash-stdout>(Bash completed with no output)</bash-stdout>"),
+        _user_record("<bash-stderr>command not found</bash-stderr>"),
     ]
 
     for record in prefixed_records:

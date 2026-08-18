@@ -85,6 +85,25 @@ def _codex_output(call_id: str, output: str = "ok") -> Event:
     )
 
 
+def test_claude_shell_escape_records_never_become_the_request():
+    """Claude Code's `!` bash mode writes `<bash-input>` and its output pair
+    into the user channel with no `isMeta` flag. Observed live: the companion
+    pane showed `<bash-stdout>(Bash completed with no output)</bash-stdout>`
+    as REQUEST, which is a tier-1 attribution of harness output to the human."""
+    snapshot = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (
+            _claude_user("restart the producer"),
+            _claude_user("<bash-input>pkill -f palaver</bash-input>"),
+            _claude_user("<bash-stdout>(Bash completed with no output)</bash-stdout>"),
+            _claude_user("<bash-stderr>no such process</bash-stderr>"),
+        ),
+    )
+    assert snapshot.request.text == "restart the producer"
+    assert not any("bash-" in item.text for item in snapshot.recent)
+
+
 def test_claude_latest_genuine_request_excludes_injection_and_agent_prose():
     snapshot = reduce_events(
         "claude-code",
