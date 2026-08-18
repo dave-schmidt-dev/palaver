@@ -372,17 +372,31 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             assert not any(event.selected_tab_changed for event in creation_focus)
             assert not any(event.window_changed for event in creation_focus)
 
-            async def _companions_are_summary_height() -> bool:
+            last_seen: dict[str, object] = {}
+
+            async def _companions_are_summary_height():
                 await owned_app.async_refresh()
-                return all(
-                    (pane := owned_app.get_session_by_id(pair.companion_id)) is not None
-                    and pane.grid_size.height == SUMMARY_ROWS
+                heights = {
+                    pair.companion_id: (
+                        None
+                        if (pane := owned_app.get_session_by_id(pair.companion_id)) is None
+                        else pane.grid_size.height
+                    )
                     for pair in controller.pairs.values()
-                )
+                }
+                last_seen["heights"] = heights
+                last_seen["frame"] = await _frame_tuple(window)
+                return heights if all(row == SUMMARY_ROWS for row in heights.values()) else False
 
             # Sizing a companion writes the whole tab, which shrinks the window
             # and every tab in it unless the frame is put back. INV-2.
-            await _eventually(_companions_are_summary_height)
+            try:
+                await _eventually(_companions_are_summary_height)
+            except AssertionError as error:
+                raise AssertionError(
+                    f"companions never reached {SUMMARY_ROWS} rows. "
+                    f"seen={last_seen} wanted frame={frame_before} notes={status}"
+                ) from error
             assert await _frame_tuple(window) == frame_before
             assert not [note for note in status if "window frame" in note]
             for agent_id in controller.pairs:

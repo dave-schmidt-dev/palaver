@@ -93,6 +93,25 @@ class FakeTab:
             self.on_update_layout()
 
 
+class RebuiltTab:
+    """What an app refresh leaves behind: a new object with the same tab id."""
+
+    def __init__(self, tab):
+        self._tab = tab
+        self.tab_id = tab.tab_id
+
+    @property
+    def sessions(self):
+        return self._tab.sessions
+
+    @property
+    def current_session(self):
+        return self._tab.current_session
+
+    async def async_update_layout(self):
+        await self._tab.async_update_layout()
+
+
 class FakeFrame:
     def __init__(self, x, y, width, height):
         self.origin = types.SimpleNamespace(x=x, y=y)
@@ -354,6 +373,14 @@ def test_a_session_the_app_rebuilt_is_matched_to_its_window_by_tab(tmp_path, mon
     stub_iterm(monkeypatch)
     app, agent, summary = paired_app()
     agent.window = None
+
+    # The refresh inside the sizing call rebuilds the tab, so the window ends up
+    # holding a different object from the one the metadata read captured.
+    def rebuild_the_tab():
+        if agent.split_calls:
+            app.window.tabs = [RebuiltTab(app.tab)]
+
+    app.refresh_hook = rebuild_the_tab
     original = app.window.frame
     ctl, _ = controller(tmp_path)
 
