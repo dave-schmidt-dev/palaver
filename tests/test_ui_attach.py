@@ -7,8 +7,9 @@ flow is testable anywhere, and once against the real iTerm2 API, because a
 stub cannot prove that `NewSessionMonitor` is the name of a thing that exists
 or that iTerm2 will ever deliver to it.
 
-The live tests create one iTerm2 tab and close it again. That is visible on
-screen for a moment, and it is the only way to make a session monitor fire —
+The live tests are inert unless ``PALAVER_RUN_LIVE_ITERM_TESTS=1``. They create
+one iTerm2 tab and close it again. That is visible on screen for a moment, and
+it is the only way to make a session monitor fire —
 the phase's own acceptance requires the pane check run "through the iTerm2
 Python API itself rather than by eye". Every one of them closes what it opened
 in a `finally`.
@@ -61,9 +62,15 @@ from palaver.ui.connection import (
 )
 from palaver.ui.pane_join import PIN_VARIABLE
 
+LIVE_ENV = "PALAVER_RUN_LIVE_ITERM_TESTS"
+LIVE_ENABLED = (
+    os.environ.get(LIVE_ENV) == "1"
+    and sys.platform == "darwin"
+    and Path("/Applications/iTerm.app").exists()
+)
 live = pytest.mark.skipif(
-    sys.platform != "darwin" or not Path("/Applications/iTerm.app").exists(),
-    reason="needs a real iTerm2 on a real macOS session",
+    not LIVE_ENABLED,
+    reason=f"set {LIVE_ENV}=1 to create disposable live iTerm tabs",
 )
 
 
