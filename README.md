@@ -127,8 +127,9 @@ listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
 credential and is passed only through the environment, never on a command line.
 
 The AutoLaunch process creates and maintains one ten-row companion above each
-supported agent pane. It pairs panes with reciprocal iTerm variables, restores
-them after renderer restarts, resizes existing companions to ten rows, and
+supported agent pane. The height is set once, when the companion is split, and
+is never changed afterwards: an existing pane is reused as-is. It pairs panes
+with reciprocal iTerm variables, restores them after renderer restarts, and
 writes private atomic state files that the terminal renderer displays. Long
 values wrap at terminal-cell boundaries, including wide characters and
 overlong words; only Palaver-owned headers, labels, and statuses receive ANSI

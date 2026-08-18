@@ -299,9 +299,12 @@ class CompanionController:
         restarting: set[str] = set()
         rollover_protected: set[str] = set()
 
-        # A reciprocal pair is reused without changing focus. Keep its
-        # companion at the current target height, but avoid an iTerm layout
-        # mutation when reconciliation already observes that height.
+        # A reciprocal pair is reused without changing its size or focus.
+        # `SUMMARY_ROWS` is applied once, at creation. Resizing here would
+        # mutate layout from inside the handler for the layout-change event
+        # that mutation raises, and iTerm treats `preferred_size` as advisory,
+        # so a height that never lands exactly on the target would resize the
+        # window without end.
         candidates: dict[str, list[SessionMetadata]] = {}
         for companion in companions.values():
             if companion.agent_session:
@@ -377,19 +380,6 @@ class CompanionController:
             keeper = sorted(reciprocal, key=lambda item: item.session_id)[:1]
             if keeper:
                 item = keeper[0]
-                if item.session.grid_size.height != SUMMARY_ROWS:
-                    iterm2 = import_iterm2()
-                    item.session.preferred_size = iterm2.Size(
-                        item.session.grid_size.width, SUMMARY_ROWS
-                    )
-                    self._on_status(f"resizing companion for {agent_id} to {SUMMARY_ROWS} rows")
-                    try:
-                        await item.tab.async_update_layout()
-                    except Exception:
-                        # A transient iTerm layout refusal must not drop the
-                        # valid pair or stop every monitor in AutoLaunch. The
-                        # unchanged grid height makes the next reconcile retry.
-                        self._on_status(f"could not resize companion for {agent_id}")
                 pairs[agent_id] = CompanionPair(
                     agent_id, item.session_id, opaque_state_path(self.state_dir, agent_id)
                 )

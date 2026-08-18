@@ -7,6 +7,8 @@ import threading
 import types
 from pathlib import Path
 
+import pytest
+
 from palaver.ui import companion
 from palaver.ui.companion import (
     AGENT_SESSION_VARIABLE,
@@ -242,9 +244,18 @@ def test_marked_companion_is_never_probed_or_split(tmp_path):
     assert not agent.split_calls and not summary.split_calls
 
 
-def test_valid_pair_is_resized_without_focus(tmp_path, monkeypatch):
+@pytest.mark.parametrize("height", [6, 10])
+def test_valid_pair_is_reused_without_resize_or_focus(tmp_path, monkeypatch, height):
+    """Reuse never mutates layout, whatever height the companion is at.
+
+    Regression guard. Resizing here ran inside the handler for the very
+    layout-change event a resize raises, and `preferred_size` is advisory, so
+    a companion that never landed exactly on `SUMMARY_ROWS` resized the window
+    without end. `SUMMARY_ROWS` is applied once, at creation, and nowhere else.
+    """
     stub_iterm(monkeypatch)
     app, agent, summary = paired_app(focus_companion=False)
+    summary.grid_size.height = height
     app.tab.sessions.append(summary)
     summary.tab = app.tab
     agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
@@ -255,60 +266,28 @@ def test_valid_pair_is_resized_without_focus(tmp_path, monkeypatch):
 
     assert result.created == ()
     assert result.pairs[0].companion_id == "summary"
-    assert summary.preferred_size == (100, 10)
-    assert app.tab.layout_updates == 1
-    assert agent.activate_calls == []
-
-
-def test_resize_failure_retains_pair_and_reports_status(tmp_path, monkeypatch):
-    stub_iterm(monkeypatch)
-    app, agent, summary = paired_app(focus_companion=False)
-    app.tab.sessions.append(summary)
-    summary.tab = app.tab
-    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
-    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
-    statuses = []
-
-    async def fail_layout_update():
-        raise RuntimeError("layout refused")
-
-    app.tab.async_update_layout = fail_layout_update
-    ctl = CompanionController(
-        tmp_path,
-        read_metadata=metadata_reader,
-        process_detector=detected,
-        transcript_joiner=lambda *_args, **_kwargs: None,
-        process_table_reader=lambda: {},
-        profile_builder=lambda command: command,
-        on_status=statuses.append,
-    )
-
-    result = asyncio.run(ctl.reconcile(app))
-
-    assert result.created == ()
-    assert result.pairs[0].companion_id == "summary"
-    assert summary.preferred_size == (100, 10)
-    assert agent.activate_calls == []
-    assert any("resizing companion for agent" in status for status in statuses)
-    assert any("could not resize companion for agent" in status for status in statuses)
-
-
-def test_valid_pair_at_target_height_skips_layout_update(tmp_path, monkeypatch):
-    stub_iterm(monkeypatch)
-    app, agent, summary = paired_app(focus_companion=False)
-    summary.grid_size.height = 10
-    app.tab.sessions.append(summary)
-    summary.tab = app.tab
-    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
-    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
-    ctl, _ = controller(tmp_path)
-
-    result = asyncio.run(ctl.reconcile(app))
-
-    assert result.created == ()
     assert summary.preferred_size is None
     assert app.tab.layout_updates == 0
     assert agent.activate_calls == []
+
+
+def test_repeated_reconciles_never_mutate_layout(tmp_path, monkeypatch):
+    """The layout monitor reconciles on every layout change; reuse must be a
+    fixed point, or the two feed each other forever."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app(focus_companion=False)
+    summary.grid_size.height = 6
+    app.tab.sessions.append(summary)
+    summary.tab = app.tab
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    ctl, _ = controller(tmp_path)
+
+    for _ in range(5):
+        asyncio.run(ctl.reconcile(app))
+
+    assert app.tab.layout_updates == 0
+    assert summary.preferred_size is None
 
 
 def test_only_exact_marker_orphan_and_duplicate_are_closed(tmp_path):
