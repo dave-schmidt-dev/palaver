@@ -38,6 +38,8 @@ class FakeSession:
         self.split_error = None
         self.tab = None
         self.make_split_active = True
+        self.split_joins_tab = True
+        self.window = None
 
     async def async_set_variable(self, name, value):
         self.vars[name] = value
@@ -47,6 +49,13 @@ class FakeSession:
         if self.split_error:
             raise self.split_error
         assert self.split_result is not None
+        # iTerm divides the split pane's rows evenly between it and the new one.
+        half = self.grid_size.height // 2
+        self.split_result.grid_size.width = self.grid_size.width
+        self.split_result.grid_size.height = half
+        self.grid_size.height -= half
+        if not self.split_joins_tab:
+            return self.split_result
         if self.tab is not None and self.split_result not in self.tab.sessions:
             self.tab.sessions.append(self.split_result)
             self.split_result.tab = self.tab
@@ -75,9 +84,38 @@ class FakeTab:
             session.tab = self
         self.current_session = self.sessions[0] if self.sessions else None
         self.layout_updates = 0
+        self.on_update_layout = None
 
     async def async_update_layout(self):
         self.layout_updates += 1
+        if self.on_update_layout is not None:
+            self.on_update_layout()
+
+
+class FakeFrame:
+    def __init__(self, x, y, width, height):
+        self.origin = types.SimpleNamespace(x=x, y=y)
+        self.size = types.SimpleNamespace(width=width, height=height)
+
+
+class FakeWindow:
+    def __init__(self, frame):
+        self.frame = frame
+        self.set_frames = []
+        self.set_error = None
+
+    def move_to(self, frame):
+        """Stand in for iTerm resizing the window behind Palaver's back."""
+        self.frame = frame
+
+    async def async_get_frame(self):
+        return self.frame
+
+    async def async_set_frame(self, frame):
+        if self.set_error is not None:
+            raise self.set_error
+        self.set_frames.append(frame)
+        self.frame = frame
 
 
 class FakeApp:
@@ -216,6 +254,86 @@ def test_supported_process_gets_unjoined_companion_above_it(tmp_path, monkeypatc
     assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
     assert summary.preferred_size == (100, 10)
     assert "palaver.ui.companion_render" in agent.split_calls[0]["profile_customizations"]
+
+
+def test_created_companion_is_sized_without_changing_tab_geometry(tmp_path, monkeypatch):
+    """The one layout write redistributes rows; it never resizes the window.
+
+    Regression guard for the horizontal resize. `Tab.async_update_layout` is a
+    whole-tab write, and iterm2 caches `preferred_size` when it builds a
+    `Session` and never refreshes it, so a pane Palaver first saw at a
+    different window width pushed that dead width back at iTerm, which resized
+    the window to match. Every preferred size is resynced from live geometry
+    first, leaving the agent and its companion dividing the rows they already
+    occupy and both tab totals unchanged.
+    """
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    neighbour = FakeSession("neighbour", height=30)
+    neighbour.vars[ROLE_VARIABLE] = "shell"
+    neighbour.preferred_size = (40, 12)
+    app.tab.sessions.append(neighbour)
+    neighbour.tab = app.tab
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert summary.preferred_size == (100, 10)
+    assert agent.preferred_size == (100, 20)
+    assert neighbour.preferred_size == (100, 30)
+    assert app.tab.layout_updates == 1
+    requested = [agent.preferred_size, summary.preferred_size, neighbour.preferred_size]
+    live = [(item.grid_size.width, item.grid_size.height) for item in (agent, summary, neighbour)]
+    assert [size[0] for size in requested] == [size[0] for size in live]
+    assert sum(size[1] for size in requested) == sum(size[1] for size in live)
+
+
+def test_a_layout_write_that_moves_the_window_puts_the_frame_back(tmp_path, monkeypatch):
+    """iTerm owns the outcome of a layout write, so the frame is a hard guard."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    original = FakeFrame(0, 0, 1400, 900)
+    window = FakeWindow(original)
+    agent.window = window
+    app.tab.on_update_layout = lambda: window.move_to(FakeFrame(0, 0, 2560, 900))
+    ctl, _ = controller(tmp_path)
+
+    asyncio.run(ctl.reconcile(app))
+
+    assert window.set_frames == [original]
+    assert window.frame is original
+
+
+def test_a_window_that_refuses_a_frame_set_still_yields_a_companion(tmp_path, monkeypatch):
+    """A fullscreen window rejects `async_set_frame`; the pair still stands."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    window = FakeWindow(FakeFrame(0, 0, 1400, 900))
+    window.set_error = RuntimeError("fullscreen")
+    agent.window = window
+    app.tab.on_update_layout = lambda: window.move_to(FakeFrame(0, 0, 2560, 900))
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert window.set_frames == []
+
+
+def test_a_split_missing_from_the_tab_tree_is_left_at_iterms_own_size(tmp_path, monkeypatch):
+    """Describing a tab that does not exist yet is how a window gets resized."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    agent.split_joins_tab = False
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert app.tab.layout_updates == 0
+    assert summary.preferred_size is None
+    assert agent.preferred_size is None
 
 
 def test_default_state_transport_marks_an_unresolved_join_unjoined(tmp_path):

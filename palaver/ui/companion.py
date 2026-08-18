@@ -1,9 +1,13 @@
 """Lifecycle ownership for Palaver's per-agent iTerm2 companion panes.
 
 The controller owns only panes carrying Palaver's exact marker.  Agent panes
-are observed and may be split once; they are never sent input, closed, or
-resized.  All mutating operations are serialized so the new-session and
-layout monitors cannot turn one split into a recursive chain of companions.
+are observed and may be split once; they are never sent input or closed.  The
+only layout write Palaver makes is that split and the row division between the
+observed pane and its own companion, and it is written so both of the tab's
+totals are unchanged: iTerm2's one pane-sizing call rewrites the entire tab, so
+anything less careful resizes the user's window.  All mutating operations are
+serialized so the new-session and layout monitors cannot turn one split into a
+recursive chain of companions.
 """
 
 from __future__ import annotations
@@ -492,6 +496,84 @@ class CompanionController:
         self._on_status(f"companion identity changed for {agent_id}: {old_id} -> {new_id}")
         return new_id
 
+    @staticmethod
+    def _frame_key(frame: Any) -> tuple[float, float, float, float] | None:
+        """Reduce an iTerm frame to a comparable tuple, or None if unreadable."""
+        try:
+            return (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
+        except AttributeError:
+            return None
+
+    async def _read_frame(self, window: Any) -> Any | None:
+        """Return the window's current frame, or None if it cannot be read."""
+        if window is None:
+            return None
+        try:
+            return await window.async_get_frame()
+        except Exception:
+            return None
+
+    async def _size_companion(self, app: Any, agent: SessionMetadata, companion: Any) -> None:
+        """Give a freshly split companion `SUMMARY_ROWS` without moving the window.
+
+        `Tab.async_update_layout` is the only pane-sizing call iTerm2's Python
+        API offers, and it is a whole-tab write: it serializes every session in
+        the tab and sends each one's `preferred_size`.  The library caches that
+        value once, when it constructs the `Session`, and never refreshes it --
+        `Session.update_from` copies `grid_size` and leaves `preferred_size`
+        alone -- so a tab Palaver has watched across a window resize pushes
+        long-dead sizes back at iTerm, which resizes the window to match them.
+        That is a window-wide mutation from a per-pane request, and it is what
+        INV-2 forbids: only the marked companion is Palaver's to resize.
+
+        Every preferred size is therefore resynced from live geometry first, so
+        the only change requested is how the agent and its companion divide the
+        rows they already occupy between them.  Both tab totals are unchanged.
+        iTerm still owns the outcome, so the window frame is captured and put
+        back if it moved regardless.
+
+        Args:
+            app: The `iterm2.App`, refreshed so the split is in the tab tree.
+            agent: The observed pane the companion was split from.
+            companion: The session `async_split_pane` returned.
+        """
+        iterm2 = import_iterm2()
+        tab = agent.tab
+        try:
+            await app.async_refresh()
+        except Exception:
+            self._on_status(f"could not refresh layout before sizing {agent.session_id}")
+        panes = {item.session_id: item for item in getattr(tab, "sessions", None) or ()}
+        summary = panes.get(companion.session_id)
+        observed = panes.get(agent.session_id)
+        if summary is None or observed is None:
+            # The split has not reached the tab tree. iTerm's own even division
+            # stands: a layout write from here would describe a tab that does
+            # not exist, which is precisely how a window gets resized.
+            self._on_status(f"companion for {agent.session_id} is not in the layout yet")
+            return
+        rows = observed.grid_size.height + summary.grid_size.height - SUMMARY_ROWS
+        if rows < MIN_AGENT_ROWS:
+            return
+        for item in panes.values():
+            item.preferred_size = iterm2.Size(item.grid_size.width, item.grid_size.height)
+        summary.preferred_size = iterm2.Size(summary.grid_size.width, SUMMARY_ROWS)
+        observed.preferred_size = iterm2.Size(observed.grid_size.width, rows)
+
+        window = getattr(observed, "window", None)
+        before = await self._read_frame(window)
+        await tab.async_update_layout()
+        after = await self._read_frame(window)
+        first, second = self._frame_key(before), self._frame_key(after)
+        if first is None or second is None or first == second:
+            return
+        self._on_status(f"iTerm moved the window sizing {agent.session_id}; restoring the frame")
+        try:
+            await window.async_set_frame(before)
+        except Exception:
+            # Fullscreen windows refuse a frame set. Nothing further is safe.
+            self._on_status(f"could not restore the window frame for {agent.session_id}")
+
     async def _create(
         self,
         app: Any,
@@ -519,9 +601,7 @@ class CompanionController:
             await companion.async_set_variable(AGENT_SESSION_VARIABLE, agent.session_id)
             await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, companion.session_id)
             await agent.session.async_set_variable(DISABLED_VARIABLE, False)
-            iterm2 = import_iterm2()
-            companion.preferred_size = iterm2.Size(agent.session.grid_size.width, SUMMARY_ROWS)
-            await agent.tab.async_update_layout()
+            await self._size_companion(app, agent, companion)
 
             # Splitting activates the new pane. Restore only when it is still
             # active in this same tab; never steal focus after the user moved.

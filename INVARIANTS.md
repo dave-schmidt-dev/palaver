@@ -30,6 +30,7 @@ rationale: Palaver is a
 area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/companion.py"]
 gate_test: tests/test_adapters.py::test_adapters_never_open_source_writable
 gate_test: tests/test_ui_companion.py::test_operation_trace_never_closes_or_sends_text_to_agent
+gate_test: tests/test_ui_companion.py::test_created_companion_is_sized_without_changing_tab_geometry
 threshold: 3
 rationale: The brief's first non-goal is autonomous control of coding agents, and the second is
   automatic injection of warnings into agent prompts. An observer that can write to the thing it
@@ -38,6 +39,13 @@ rationale: The brief's first non-goal is autonomous control of coding agents, an
   close only a pane carrying its exact companion marker; the one permitted observed-pane focus call
   is a conditional post-split restore with no tab selection or window activation. Warnings surface
   in Palaver's UI only.
+  The pane-sizing case needs stating separately, because iTerm2's API offers no way to resize one
+  pane: `Tab.async_update_layout` rewrites the whole tab from every session's cached
+  `preferred_size`, a value the library captures at construction and never refreshes. A per-pane
+  request there becomes a window-wide mutation against sizes that may be hours dead. Palaver's one
+  sizing write therefore resyncs every cached size from live geometry, changes only how the agent
+  and its own companion divide the rows they already occupy, and restores the window frame if iTerm
+  moves it anyway.
   This holds until Palaver has demonstrated reliability the user explicitly signs off on; it is not a
   temporary scaffold.
 

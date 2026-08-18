@@ -128,7 +128,12 @@ credential and is passed only through the environment, never on a command line.
 
 The AutoLaunch process creates and maintains one ten-row companion above each
 supported agent pane. The height is set once, when the companion is split, and
-is never changed afterwards: an existing pane is reused as-is. It pairs panes
+is never changed afterwards: an existing pane is reused as-is. **Palaver never
+resizes your window.** iTerm2's only pane-sizing call rewrites the whole tab
+from the library's cached per-pane sizes, which are captured once and never
+refreshed, so that one write resyncs every cached size from live geometry
+first — leaving the agent and its companion to redivide only the rows they
+already occupy — and restores the window frame if iTerm moves it regardless. It pairs panes
 with reciprocal iTerm variables, restores them after renderer restarts, and
 writes private atomic state files that the terminal renderer displays. Long
 values wrap at terminal-cell boundaries, including wide characters and
