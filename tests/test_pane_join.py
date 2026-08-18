@@ -125,7 +125,9 @@ def _variables(cwd, *, pane_id="pane-1", job_pid=JOB_PID, job_name="node", path=
     )
 
 
-def _join(cwd, sessions_root, *, table=None, cwd_reader=None, now=NOW, **kwargs):
+def _join(
+    cwd, sessions_root, *, table=None, cwd_reader=None, now=NOW, registry_root=None, **kwargs
+):
     """Call `join_pane` with the agent's cwd reported as `cwd` by default.
 
     `now` is an explicit parameter rather than part of `**kwargs` so a test
@@ -139,6 +141,10 @@ def _join(cwd, sessions_root, *, table=None, cwd_reader=None, now=NOW, **kwargs)
         cwd_reader=(lambda pid: cwd) if cwd_reader is None else cwd_reader,
         sessions_root=sessions_root,
         now=now,
+        # Hermetic by default: without this every test would consult the real
+        # ~/.claude/sessions and pass only because no live pid happens to
+        # claim a tmp_path cwd.
+        registry_root=(sessions_root / "no-registry") if registry_root is None else registry_root,
     )
 
 
@@ -1139,3 +1145,147 @@ def test_a_real_agent_is_found_from_its_own_descendants_in_the_live_table():
             return
 
     pytest.skip(f"{agent.name} has no non-shell descendant to walk up from")
+
+
+# --- the registry: naming the live session the mtime window cannot ----------
+
+
+def _registry(root: Path, pid: int, cwd: Path, session_id: str, overrides=None) -> Path:
+    """Write one Claude Code live-process record, in the shape measured."""
+    root.mkdir(parents=True, exist_ok=True)
+    record = {
+        "pid": pid,
+        "sessionId": session_id,
+        "cwd": str(cwd),
+        "startedAt": 1787091441961,
+        "version": "2.1.226",
+        "kind": "interactive",
+    }
+    record.update(overrides or {})
+    path = root / f"{pid}.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def _two_recent_sessions(sessions_root: Path, cwd: Path) -> Path:
+    """Leave a project directory in the state that refuses every candidate."""
+    project_dir = sessions_root / project_key_for_cwd(cwd)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    for name, age in (("aaaa-1111", 60), ("bbbb-2222", 30)):
+        store = project_dir / f"{name}.jsonl"
+        store.write_text("{}\n", encoding="utf-8")
+        os.utime(store, (NOW.timestamp() - age, NOW.timestamp() - age))
+    return project_dir
+
+
+def test_the_registry_names_the_live_session_among_equally_recent_ones(project, tmp_path):
+    """The measured failure: one project, several stores written this hour.
+
+    Every one of them is inside the activity window, so the scan is right to
+    refuse and the pane is left UNJOINED. The registry is the only thing on
+    this machine that says which pid owns which session.
+    """
+    cwd, sessions_root = project
+    _two_recent_sessions(sessions_root, cwd)
+    registry = tmp_path / "registry"
+    _registry(registry, AGENT_PID, cwd, "bbbb-2222")
+
+    join = _join(cwd, sessions_root, registry_root=registry)
+
+    assert join is not None
+    assert join.session_key == "bbbb-2222", "did not use the pid's own session"
+    assert join.session_candidates == ("bbbb-2222",)
+    assert join.store_path == (
+        sessions_root / project_key_for_cwd(cwd) / "bbbb-2222.jsonl"
+    ).resolve(strict=False)
+
+
+def test_without_a_registry_equally_recent_sessions_are_still_refused(project, tmp_path):
+    """The fallback is unchanged, so an older Claude Code still fails closed."""
+    cwd, sessions_root = project
+    _two_recent_sessions(sessions_root, cwd)
+
+    join = _join(cwd, sessions_root, registry_root=tmp_path / "absent")
+
+    assert join is not None
+    assert join.session_key is None
+    assert join.session_candidates == ("aaaa-1111", "bbbb-2222")
+
+
+def test_the_registry_finds_a_project_directory_spelled_with_dashes(tmp_path):
+    """Claude Code changed how it encodes `_`, and both spellings are on disk.
+
+    Measured on this machine: `...-CipherBlade-okx_case` kept its underscore
+    and `...-fairaday-labs` did not. The encoder can only produce one of the
+    two, which is why this pane never joined at all -- its project directory
+    existed under a name the encoder never generates.
+    """
+    cwd = tmp_path / "Projects" / "fairaday_labs"
+    cwd.mkdir(parents=True)
+    sessions_root = tmp_path / "store"
+    dashed = sessions_root / project_key_for_cwd(cwd).replace("_", "-")
+    dashed.mkdir(parents=True)
+    (dashed / "cccc-3333.jsonl").write_text("{}\n", encoding="utf-8")
+    registry = tmp_path / "registry"
+    _registry(registry, AGENT_PID, cwd, "cccc-3333")
+
+    join = _join(cwd, sessions_root, registry_root=registry)
+
+    assert join is not None, "refused a project directory it could not spell"
+    assert join.session_key == "cccc-3333"
+    assert join.store_path == (dashed / "cccc-3333.jsonl").resolve(strict=False)
+    assert join.project_key == dashed.name
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"cwd": "/somewhere/else"}, "a record for a different directory"),
+        ({"pid": AGENT_PID + 1}, "a record claiming another pid"),
+        ({"sessionId": "../bbbb-2222"}, "a session id that escapes its directory"),
+        ({"sessionId": ""}, "an empty session id"),
+        ({"sessionId": 17}, "a session id that is not a string"),
+    ],
+)
+def test_a_registry_that_cannot_prove_itself_falls_back(project, tmp_path, overrides, reason):
+    """A stale registry file from a reused pid must not become a wrong join.
+
+    Falling back is the whole safety property: the pane returns to the
+    ambiguous-but-honest state rather than adopting an unverified session.
+    """
+    cwd, sessions_root = project
+    _two_recent_sessions(sessions_root, cwd)
+    registry = tmp_path / "registry"
+    _registry(registry, AGENT_PID, cwd, "bbbb-2222", overrides)
+
+    join = _join(cwd, sessions_root, registry_root=registry)
+
+    assert join is not None
+    assert join.session_key is None, f"trusted {reason}"
+
+
+def test_a_registry_naming_a_transcript_that_is_not_there_falls_back(project, tmp_path):
+    """The record is only a name; the transcript it names must exist."""
+    cwd, sessions_root = project
+    _two_recent_sessions(sessions_root, cwd)
+    registry = tmp_path / "registry"
+    _registry(registry, AGENT_PID, cwd, "dddd-4444")
+
+    join = _join(cwd, sessions_root, registry_root=registry)
+
+    assert join is not None
+    assert join.session_key is None
+
+
+def test_an_unreadable_registry_record_falls_back(project, tmp_path):
+    """Malformed JSON is a version change, not a reason to fail the pane."""
+    cwd, sessions_root = project
+    _two_recent_sessions(sessions_root, cwd)
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    (registry / f"{AGENT_PID}.json").write_text("not json at all", encoding="utf-8")
+
+    join = _join(cwd, sessions_root, registry_root=registry)
+
+    assert join is not None
+    assert join.session_key is None

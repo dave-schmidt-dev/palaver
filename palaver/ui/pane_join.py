@@ -109,6 +109,18 @@ PIN_VARIABLE = "user.palaver_session_pin"
 PANE_PIN_VARIABLE = PIN_VARIABLE
 
 
+def default_registry_root() -> Path:
+    """Return Claude Code's live-process registry directory.
+
+    Claude Code writes one `<pid>.json` here per running process, carrying
+    that process's own `sessionId` and `cwd`. It is undocumented and tied to
+    the CLI version (observed on 2.1.226), so every read of it is treated as
+    a hint that must agree with what the pane already proved, and its absence
+    is not an error -- `join_pane` falls back to the mtime candidate scan.
+    """
+    return Path.home() / ".claude" / "sessions"
+
+
 def default_store_roots() -> dict[str, Path]:
     """Return the independent on-disk roots used by supported file sources."""
     return {
@@ -501,6 +513,86 @@ def project_key_for_cwd(cwd: Path) -> str:
     return str(cwd).replace("/", "-").replace(".", "-")
 
 
+def project_keys_for_cwd(cwd: Path) -> tuple[str, ...]:
+    """Name every encoding under which this cwd's project directory may exist.
+
+    Measured on this machine (2026-08-18): `~/.claude/projects` holds both
+    `-Users-dave-Documents-Projects-CipherBlade-okx_case`, which preserved an
+    underscore, and `-Users-dave-Documents-Projects-fairaday-labs`, which did
+    not -- Claude Code changed the encoding between the two, and both
+    directories are still on disk. A single rule therefore cannot be right,
+    so both are offered and the one that exists wins.
+
+    Args:
+        cwd: An absolute working directory.
+
+    Returns:
+        Candidate directory names, most historically faithful first.
+    """
+    preserved = project_key_for_cwd(cwd)
+    converted = preserved.replace("_", "-")
+    return (preserved,) if converted == preserved else (preserved, converted)
+
+
+def registered_session(pid: int, cwd: Path, *, registry_root: Path | None = None) -> str | None:
+    """Read the session id Claude Code itself published for `pid`.
+
+    This is the only exact pane-to-transcript discriminator found on this
+    machine. The alternative -- narrowing a project directory by mtime --
+    cannot separate the live session from the several others run in the same
+    project within the hour, which is what leaves a pane UNJOINED.
+
+    Every field is checked rather than trusted: the record must claim the pid
+    that was asked for, must claim the same cwd the pane and the agent
+    process already agreed on, and must carry a session id that is a plain
+    filename. A registry naming some other directory is a stale file from a
+    reused pid, not a join.
+
+    Args:
+        pid: The agent process resolved from the pane.
+        cwd: The directory the pane and the agent process agree on.
+        registry_root: The registry directory; defaults to the real one.
+
+    Returns:
+        The session id, or `None` if the registry cannot prove one.
+    """
+    root = default_registry_root() if registry_root is None else registry_root
+    try:
+        raw = (root / f"{pid}.json").read_text(encoding="utf-8")
+    except OSError, ValueError:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("pid") != pid:
+        return None
+    registered_cwd = record.get("cwd")
+    if not isinstance(registered_cwd, str) or Path(registered_cwd) != cwd:
+        return None
+    session_id = record.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if session_id in {".", ".."} or "/" in session_id or "\\" in session_id:
+        return None
+    return session_id
+
+
+def _registered_store(root: Path, cwd: Path, session_id: str) -> Path | None:
+    """Locate one named session's transcript under either project encoding."""
+    for key in project_keys_for_cwd(cwd):
+        store = root / key / f"{session_id}.jsonl"
+        if _readable_file(store):
+            return store.resolve(strict=False)
+    # Neither encoding exists, so the directory name is one this code does
+    # not know how to spell. The session id is unique, so a single match
+    # anywhere under the root identifies it without guessing at spelling.
+    matches = sorted(root.glob(f"*/{session_id}.jsonl"))
+    if len(matches) == 1 and _readable_file(matches[0]):
+        return matches[0].resolve(strict=False)
+    return None
+
+
 def session_candidates(
     project_key: str,
     sessions_root: Path,
@@ -638,6 +730,7 @@ def join_pane(
     activity_window: timedelta = DEFAULT_ACTIVITY_WINDOW,
     pin: PanePin | Mapping[str, object] | str | None = None,
     candidate_cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
+    registry_root: Path | None = None,
 ) -> PaneJoin | None:
     """Resolve a pane to its agent process and project, or refuse.
 
@@ -662,7 +755,9 @@ def join_pane(
     6. The agent's own working directory is readable **and equal to**
        `path`, unless a validated explicit pin is present. A pin is the
        deliberate rename/move recovery escape hatch, not an automatic guess.
-    7. The detected source's own store layout supplies exactly one candidate.
+    7. For Claude Code, the live-process registry names this pid's own
+       session and that transcript is readable. Failing that, the source's
+       own store layout supplies exactly one candidate.
 
     Args:
         variables: The pane's iTerm2 variables.
@@ -676,6 +771,9 @@ def join_pane(
         now: Reference time for the candidate window; defaults to now, UTC.
         activity_window: How recently a candidate's store must have been
             written.
+        registry_root: Claude Code's live-process registry directory;
+            defaults to the real one. Injectable so a test can describe a
+            registry that is not running.
 
     Returns:
         A `PaneJoin`, or `None` if any check above fails.
@@ -735,16 +833,28 @@ def join_pane(
         store_path = codex_paths[0] if len(codex_paths) == 1 else None
     else:
         project_key = project_key_for_cwd(cwd)
-        if not (root / project_key).is_dir():
-            return None
-        candidates = session_candidates(project_key, root, now=now, activity_window=activity_window)
-        store_path = (
-            (root / project_key / f"{candidates[0]}.jsonl").resolve(strict=False)
-            if len(candidates) == 1
-            else None
-        )
-        if store_path is not None and not _readable_file(store_path):
-            return None
+        # Claude Code names its own live session, which the mtime window
+        # cannot: a project run several times within the hour offers several
+        # equally recent stores and the scan below correctly refuses all of
+        # them. The registry is consulted first and its answer is exact.
+        named = registered_session(agent.pid, cwd, registry_root=registry_root)
+        store_path = None if named is None else _registered_store(root, cwd, named)
+        if store_path is not None:
+            candidates = (named,)
+            project_key = store_path.parent.name
+        else:
+            if not (root / project_key).is_dir():
+                return None
+            candidates = session_candidates(
+                project_key, root, now=now, activity_window=activity_window
+            )
+            store_path = (
+                (root / project_key / f"{candidates[0]}.jsonl").resolve(strict=False)
+                if len(candidates) == 1
+                else None
+            )
+            if store_path is not None and not _readable_file(store_path):
+                return None
     return PaneJoin(
         pane_id=variables.pane_id,
         pid=agent.pid,

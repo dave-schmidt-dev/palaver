@@ -148,6 +148,16 @@ overlong words; only Palaver-owned headers, labels, and statuses receive ANSI
 color. User-provided values are rendered as plain text. Input typed into a
 companion is discarded and never forwarded.
 
+Claude Code panes join through `~/.claude/sessions/<pid>.json`, the registry
+the CLI keeps for each of its own live processes. That record names the pid's
+session directly, which the alternative -- narrowing a project directory by
+file mtime -- cannot do once the same project has been run more than once
+within the hour. The record is accepted only when it claims the pid that was
+asked for and the directory the pane and the agent process already agree on;
+anything else falls back to the mtime scan, so an older CLI that does not
+write the registry behaves exactly as before. Project directories are looked
+up under both spellings Claude Code has used for `_`, since both are on disk.
+
 Automatic Codex joining requires one recent root rollout whose recorded cwd
 exactly matches the pane. For an intentional directory rename or move, pin the
 known rollout to the pane without focusing it, and clear the override later:
