@@ -246,6 +246,10 @@ class CompanionController:
         self._manager_closing: set[str] = set()
         self._restart_attempts: dict[str, int] = {}
         self._retry_after: dict[str, float] = {}
+        # iTerm assigns a new API session GUID when an exited session is
+        # restarted. Keep the old identity only long enough to reacquire the
+        # exact marked pane after App refreshes its layout model.
+        self._rollover_pending: dict[str, str] = {}
 
     @property
     def pairs(self) -> Mapping[str, CompanionPair]:
@@ -274,7 +278,12 @@ class CompanionController:
         return found
 
     async def _reconcile_locked(
-        self, app: Any, *, create: bool, only_agent_id: str | None
+        self,
+        app: Any,
+        *,
+        create: bool,
+        only_agent_id: str | None,
+        skip_restart: frozenset[str] = frozenset(),
     ) -> ReconcileResult:
         inventory = await self._inventory(app)
         companions = {
@@ -288,6 +297,7 @@ class CompanionController:
         refused: list[str] = []
         pairs: dict[str, CompanionPair] = {}
         restarting: set[str] = set()
+        rollover_protected: set[str] = set()
 
         # A reciprocal pair is reused without changing its size or focus.
         candidates: dict[str, list[SessionMetadata]] = {}
@@ -311,8 +321,30 @@ class CompanionController:
                 for item in owned
                 if agent is not None and agent.companion_session == item.session_id
             ]
+            pending_old_id = self._rollover_pending.get(agent_id)
+            if (
+                agent is not None
+                and pending_old_id is not None
+                and len(owned) == 1
+                and owned[0].session_id != pending_old_id
+            ):
+                # Restart preserves session user variables but changes iTerm's
+                # API GUID. The exact owner marker is the stable identity.
+                item = owned[0]
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, item.session_id)
+                self._rollover_pending.pop(agent_id, None)
+                reciprocal = [item]
+            elif pending_old_id is not None:
+                # Never publish the pre-restart handle to the updater. A later
+                # refresh/reconcile will either observe the new marked GUID or
+                # keep this agent fail-closed without creating a duplicate.
+                restarting.add(agent_id)
+                rollover_protected.update(item.session_id for item in owned)
+                continue
             exited = [item for item in reciprocal if item.pane.job_pid is None]
             for item in exited:
+                if item.session_id in skip_restart:
+                    continue
                 if self._clock() < self._retry_after.get(agent_id, 0.0):
                     restarting.add(agent_id)
                     continue
@@ -322,8 +354,24 @@ class CompanionController:
                     self._record_restart_failure(agent_id)
                     restarting.add(agent_id)
                 else:
+                    self._rollover_pending[agent_id] = item.session_id
+                    new_id = await self._rebind_restarted_companion(app, agent_id)
+                    if new_id is None:
+                        self._record_restart_failure(agent_id)
+                        return await self._reconcile_locked(
+                            app,
+                            create=create,
+                            only_agent_id=only_agent_id,
+                            skip_restart=skip_restart,
+                        )
                     self._restart_attempts.pop(agent_id, None)
                     self._retry_after.pop(agent_id, None)
+                    return await self._reconcile_locked(
+                        app,
+                        create=create,
+                        only_agent_id=only_agent_id,
+                        skip_restart=skip_restart | {new_id},
+                    )
             keeper = sorted(reciprocal, key=lambda item: item.session_id)[:1]
             if keeper:
                 item = keeper[0]
@@ -343,7 +391,11 @@ class CompanionController:
         # Marker-only panes with no owner are Palaver-owned orphans.
         paired_companions = {pair.companion_id for pair in pairs.values()}
         for companion_id, companion in companions.items():
-            if companion_id in paired_companions or companion_id in closed:
+            if (
+                companion_id in paired_companions
+                or companion_id in rollover_protected
+                or companion_id in closed
+            ):
                 continue
             if not companion.agent_session or companion.agent_session not in agents:
                 if await self._close_owned(companion):
@@ -363,6 +415,9 @@ class CompanionController:
             if agent_id in pairs or agent.disabled:
                 continue
             if not create or (only_agent_id is not None and agent_id != only_agent_id):
+                continue
+            if agent_id in self._rollover_pending:
+                refused.append(agent_id)
                 continue
             if agent.companion_session and agent_id not in restarting:
                 # A missing reciprocal peer represents a user-closed pane.
@@ -405,6 +460,33 @@ class CompanionController:
         )
         return result
 
+    async def _rebind_restarted_companion(self, app: Any, agent_id: str) -> str | None:
+        """Refresh iTerm and bind an exact marked pane after GUID rollover."""
+        self._on_status(f"refreshing companion identity after restart for {agent_id}")
+        try:
+            await app.async_refresh()
+        except Exception:
+            self._on_status(f"could not refresh companion identity for {agent_id}")
+            return None
+        inventory = await self._inventory(app)
+        agent = inventory.get(agent_id)
+        owned = sorted(
+            (
+                item
+                for item in inventory.values()
+                if item.is_companion and item.agent_session == agent_id
+            ),
+            key=lambda item: item.session_id,
+        )
+        if agent is None or len(owned) != 1:
+            self._on_status(f"could not uniquely reacquire restarted companion for {agent_id}")
+            return None
+        new_id = owned[0].session_id
+        await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, new_id)
+        old_id = self._rollover_pending.pop(agent_id, None)
+        self._on_status(f"companion identity changed for {agent_id}: {old_id} -> {new_id}")
+        return new_id
+
     async def _create(
         self,
         app: Any,
@@ -418,12 +500,12 @@ class CompanionController:
         if agent.session.grid_size.height < SUMMARY_ROWS + MIN_AGENT_ROWS:
             return None
         state_path = opaque_state_path(self.state_dir, agent.session_id)
-        self._on_status(f"writing initial companion state for {agent.session_id}")
-        await asyncio.to_thread(self._write_initial_state, state_path, detected, joined)
-        command = companion_command(state_path)
-        profile = self._profile_builder(command)
         companion = None
         try:
+            self._on_status(f"writing initial companion state for {agent.session_id}")
+            await asyncio.to_thread(self._write_initial_state, state_path, detected, joined)
+            command = companion_command(state_path)
+            profile = self._profile_builder(command)
             companion = await agent.session.async_split_pane(
                 vertical=False, before=True, profile_customizations=profile
             )
@@ -502,31 +584,83 @@ class CompanionController:
         return True
 
     async def handle_termination(self, app: Any, session_id: str) -> None:
-        """Apply user-close or agent-teardown semantics for one termination."""
+        """Classify a PTY process end after refreshing iTerm's visible layout."""
         async with self._lock:
             manager_close = session_id in self._manager_closing
             self._manager_closing.discard(session_id)
             pair_by_companion = next(
                 (pair for pair in self._pairs.values() if pair.companion_id == session_id), None
             )
+            self._on_status(f"refreshing layout after session termination {session_id}")
+            try:
+                await app.async_refresh()
+            except Exception:
+                self._on_status(f"could not classify session termination {session_id}")
+                return
+            inventory = await self._inventory(app)
+
             if pair_by_companion is not None:
-                self._pairs.pop(pair_by_companion.agent_id, None)
-                agent = app.get_session_by_id(pair_by_companion.agent_id)
-                if agent is not None:
-                    await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
-                    if not manager_close:
-                        await agent.async_set_variable(DISABLED_VARIABLE, True)
+                agent_id = pair_by_companion.agent_id
+                agent = inventory.get(agent_id)
+                if manager_close:
+                    self._pairs.pop(agent_id, None)
+                    if agent is not None:
+                        await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                    return
+
+                visible = sorted(
+                    (
+                        item
+                        for item in inventory.values()
+                        if item.is_companion and item.agent_session == agent_id
+                    ),
+                    key=lambda item: item.session_id,
+                )
+                if len(visible) == 1 and agent is not None:
+                    current = visible[0]
+                    if current.session_id != pair_by_companion.companion_id:
+                        await agent.session.async_set_variable(
+                            COMPANION_SESSION_VARIABLE, current.session_id
+                        )
+                        self._pairs[agent_id] = CompanionPair(
+                            agent_id, current.session_id, pair_by_companion.state_path
+                        )
+                        self._rollover_pending.pop(agent_id, None)
+                        self._on_status(
+                            f"rebound companion identity for {agent_id} to {current.session_id}"
+                        )
+                        return
+                    if current.pane.job_pid is None:
+                        await self._reconcile_locked(app, create=True, only_agent_id=agent_id)
+                    return
+
+                # Only absence from the refreshed visible layout is a close.
+                if not visible:
+                    self._pairs.pop(agent_id, None)
+                    self._rollover_pending.pop(agent_id, None)
+                    if agent is not None:
+                        await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                        await agent.session.async_set_variable(DISABLED_VARIABLE, True)
+                    try:
+                        pair_by_companion.state_path.unlink(missing_ok=True)
+                    except OSError:
+                        self._on_status(f"could not remove companion state for {agent_id}")
                 return
 
-            pair = self._pairs.pop(session_id, None)
+            pair = self._pairs.get(session_id)
             if pair is None:
+                # A delayed notification for the pre-restart GUID is harmless.
                 return
-            companion = app.get_session_by_id(pair.companion_id)
-            if companion is not None:
+            if session_id in inventory:
+                # The PTY ended but its pane remains visible; it was not torn down.
+                return
+            self._pairs.pop(session_id, None)
+            companion = inventory.get(pair.companion_id)
+            if companion is not None and companion.is_companion:
                 # Pair membership proves this is the exact companion. Agent
                 # session ids are never passed to async_close.
                 self._manager_closing.add(pair.companion_id)
-                await companion.async_close(force=True)
+                await companion.session.async_close(force=True)
             try:
                 pair.state_path.unlink(missing_ok=True)
             except OSError:
@@ -542,7 +676,11 @@ class CompanionController:
             metadata = inventory.get(agent_id)
             if metadata is None or metadata.is_companion:
                 return False
-            if agent_id not in self._pairs:
+            if (
+                agent_id not in self._pairs
+                and agent_id not in self._rollover_pending
+                and not metadata.disabled
+            ):
                 self._on_status(f"validating companion target {agent_id}")
                 table = await asyncio.to_thread(self._read_process_table)
                 kwargs: dict[str, Any] = {"table": table}
@@ -551,22 +689,52 @@ class CompanionController:
                 detected = await asyncio.to_thread(self._detect, metadata.pane, **kwargs)
                 if detected is None:
                     return False
-            await agent.async_set_variable(DISABLED_VARIABLE, not enabled)
             if enabled:
+                owned = [
+                    item
+                    for item in inventory.values()
+                    if item.is_companion and item.agent_session == agent_id
+                ]
+                if agent_id in self._rollover_pending and owned:
+                    self._on_status(
+                        f"disable companion for {agent_id} before re-enabling rollover recovery"
+                    )
+                    return False
+                await agent.async_set_variable(DISABLED_VARIABLE, False)
                 await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                self._rollover_pending.pop(agent_id, None)
+                self._restart_attempts.pop(agent_id, None)
                 self._retry_after.pop(agent_id, None)
             else:
+                await agent.async_set_variable(DISABLED_VARIABLE, True)
                 pair = self._pairs.pop(agent_id, None)
-                if pair is not None:
+                owned = [
+                    item
+                    for item in inventory.values()
+                    if item.is_companion and item.agent_session == agent_id
+                ]
+                closed_ids: set[str] = set()
+                for item in owned:
+                    if await self._close_owned(item):
+                        closed_ids.add(item.session_id)
+                if pair is not None and pair.companion_id not in closed_ids:
                     companion = app.get_session_by_id(pair.companion_id)
                     if companion is not None:
                         self._manager_closing.add(pair.companion_id)
                         await companion.async_close(force=True)
-                    await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
-                    try:
-                        pair.state_path.unlink(missing_ok=True)
-                    except OSError:
-                        self._on_status(f"could not remove companion state for {agent_id}")
+                await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                self._rollover_pending.pop(agent_id, None)
+                self._restart_attempts.pop(agent_id, None)
+                self._retry_after.pop(agent_id, None)
+                state_path = (
+                    pair.state_path
+                    if pair is not None
+                    else opaque_state_path(self.state_dir, agent_id)
+                )
+                try:
+                    state_path.unlink(missing_ok=True)
+                except OSError:
+                    self._on_status(f"could not remove companion state for {agent_id}")
             return True
 
 

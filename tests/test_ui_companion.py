@@ -82,9 +82,18 @@ class FakeApp:
     def __init__(self, tab):
         self.tab = tab
         self.terminal_windows = [types.SimpleNamespace(tabs=[tab])]
+        self.refresh_calls = 0
+        self.refresh_hook = None
 
     def get_session_by_id(self, session_id):
         return next((item for item in self.tab.sessions if item.session_id == session_id), None)
+
+    async def async_refresh(self):
+        self.refresh_calls += 1
+        if self.refresh_hook is not None:
+            result = self.refresh_hook()
+            if asyncio.iscoroutine(result):
+                await result
 
 
 def metadata_reader(session, tab):
@@ -378,14 +387,49 @@ def test_split_failure_removes_the_state_seed(tmp_path):
     assert list(tmp_path.glob("*.json")) == []
 
 
+def test_initial_state_failure_is_guarded_per_pane_and_next_agent_creates(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
+    bad = FakeSession("bad")
+    good = FakeSession("good")
+    summary = FakeSession("good-summary", job_pid=20)
+    good.split_result = summary
+    tab = FakeTab([bad, good])
+    calls = []
+
+    def seed(path, *_args):
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError("state directory unavailable")
+
+    ctl = CompanionController(
+        tmp_path,
+        read_metadata=metadata_reader,
+        write_initial_state=seed,
+        process_detector=detected,
+        transcript_joiner=lambda *_args, **_kwargs: None,
+        process_table_reader=lambda: {},
+        profile_builder=lambda command: command,
+    )
+
+    result = asyncio.run(ctl.reconcile(FakeApp(tab)))
+
+    assert result.created == ("good-summary",)
+    assert "bad" in result.refused
+    assert bad.split_calls == []
+    assert len(calls) == 2
+
+
 def test_user_close_disables_but_manager_close_does_not(tmp_path):
     app, agent, summary = paired_app()
     app.tab.sessions.append(summary)
     pair = companion.CompanionPair("agent", "summary", tmp_path / "state.json")
+    pair.state_path.write_text("state", encoding="utf-8")
     ctl, _ = controller(tmp_path)
     ctl._pairs = {"agent": pair}
+    app.tab.sessions.remove(summary)
     asyncio.run(ctl.handle_termination(app, "summary"))
     assert agent.vars[DISABLED_VARIABLE] is True
+    assert not pair.state_path.exists()
 
     agent.vars.clear()
     ctl._pairs = {"agent": pair}
@@ -405,6 +449,36 @@ def test_explicit_disable_closes_companion_and_enable_clears_suppression(tmp_pat
     assert asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
     assert agent.vars[DISABLED_VARIABLE] is False
     assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+
+
+def test_stuck_rollover_requires_disable_cleanup_before_enable(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary-old"
+    summary.session_id = "summary-new"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    state_path = companion.opaque_state_path(tmp_path, "agent")
+    state_path.write_text("state", encoding="utf-8")
+    ctl, _ = controller(tmp_path, detector=lambda *_args, **_kwargs: None)
+    ctl._rollover_pending["agent"] = "summary-old"
+
+    assert not asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
+    assert summary.close_calls == []
+    assert ctl._rollover_pending == {"agent": "summary-old"}
+
+    assert asyncio.run(ctl.set_enabled(app, "agent", enabled=False))
+    assert summary.close_calls == [{"force": True}]
+    assert agent.vars[DISABLED_VARIABLE] is True
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+    assert ctl._rollover_pending == {}
+    assert not state_path.exists()
+    assert agent.close_calls == []
+    assert agent.sent_text == []
+
+    app.tab.sessions.remove(summary)
+    assert asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
+    assert agent.vars[DISABLED_VARIABLE] is False
+    assert agent.split_calls == []
 
 
 def test_enable_rejects_companion_and_ordinary_shell_targets(tmp_path):
@@ -433,14 +507,46 @@ def test_known_pair_owner_remains_a_valid_target_after_process_exit(tmp_path):
 def test_agent_teardown_closes_only_its_exact_registered_companion(tmp_path):
     app, agent, summary = paired_app()
     app.tab.sessions.append(summary)
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
     ctl, _ = controller(tmp_path)
     ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", tmp_path / "state.json")}
+    app.tab.sessions.remove(agent)
     asyncio.run(ctl.handle_termination(app, "agent"))
     assert summary.close_calls == [{"force": True}]
     assert agent.close_calls == []
 
 
-def test_exited_companion_restarts_in_place_and_failure_uses_backoff(tmp_path):
+def test_exited_companion_restart_rebinds_new_guid_without_layout_mutation(tmp_path):
+    now = [0.0]
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    summary.job_pid = None
+    replacement = FakeSession("summary-new", job_pid=30)
+    replacement.vars.update(summary.vars)
+
+    def roll_guid():
+        app.tab.sessions.remove(summary)
+        app.tab.sessions.append(replacement)
+        replacement.tab = app.tab
+
+    app.refresh_hook = roll_guid
+    ctl, _ = controller(tmp_path, clock=lambda: now[0])
+
+    first = asyncio.run(ctl.reconcile(app))
+    assert first.created == ()
+    assert summary.restart_calls == [{"only_if_exited": True}]
+    assert summary.close_calls == []
+    assert first.pairs[0].companion_id == "summary-new"
+    assert ctl.pairs["agent"].companion_id == "summary-new"
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary-new"
+    assert agent.split_calls == []
+    assert agent.activate_calls == []
+    assert app.refresh_calls == 1
+
+
+def test_restart_failure_keeps_existing_pair_and_link_under_backoff(tmp_path):
     now = [0.0]
     app, agent, summary = paired_app()
     app.tab.sessions.append(summary)
@@ -449,22 +555,93 @@ def test_exited_companion_restarts_in_place_and_failure_uses_backoff(tmp_path):
     summary.job_pid = None
     ctl, _ = controller(tmp_path, clock=lambda: now[0])
 
-    first = asyncio.run(ctl.reconcile(app))
-    assert first.created == ()
-    assert summary.restart_calls == [{"only_if_exited": True}]
-    assert summary.close_calls == []
-
     async def fail_restart(**_kwargs):
         raise RuntimeError("still exited")
 
     summary.async_restart = fail_restart
-    asyncio.run(ctl.reconcile(app))
+    first = asyncio.run(ctl.reconcile(app))
+    assert first.pairs[0].companion_id == "summary"
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
     assert ctl._retry_after["agent"] == companion.INITIAL_RESTART_BACKOFF
     asyncio.run(ctl.reconcile(app))
     assert ctl._restart_attempts["agent"] == 1
     now[0] = companion.INITIAL_RESTART_BACKOFF
     asyncio.run(ctl.reconcile(app))
     assert ctl._restart_attempts["agent"] == 2
+
+
+def test_restart_refresh_failure_never_publishes_stale_handle_or_splits(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    summary.job_pid = None
+
+    async def fail_refresh():
+        app.refresh_calls += 1
+        raise RuntimeError("layout unavailable")
+
+    app.async_refresh = fail_refresh
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.pairs == ()
+    assert ctl.pairs == {}
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert agent.split_calls == []
+    assert summary.close_calls == []
+
+
+def test_visible_process_end_does_not_disable_companion(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    summary.job_pid = None
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", tmp_path / "state")}
+    ctl._retry_after["agent"] = 10.0
+
+    asyncio.run(ctl.handle_termination(app, "summary"))
+
+    assert app.refresh_calls == 1
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert ctl.pairs["agent"].companion_id == "summary"
+
+
+def test_stale_old_guid_termination_after_rollover_is_harmless(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary-new"
+    summary.session_id = "summary-new"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary-new", tmp_path / "state")}
+
+    asyncio.run(ctl.handle_termination(app, "summary-old"))
+
+    assert ctl.pairs["agent"].companion_id == "summary-new"
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary-new"
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+
+
+def test_termination_rebinds_visible_new_guid_exact_marker(tmp_path):
+    app, agent, summary = paired_app()
+    summary.session_id = "summary-new"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary-old"
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary-old", tmp_path / "state")}
+
+    asyncio.run(ctl.handle_termination(app, "summary-old"))
+
+    assert ctl.pairs["agent"].companion_id == "summary-new"
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary-new"
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert summary.close_calls == []
 
 
 def test_one_pane_failure_does_not_prevent_another_creation(tmp_path, monkeypatch):
@@ -554,6 +731,7 @@ def test_operation_trace_never_closes_or_sends_text_to_agent(tmp_path, monkeypat
     app, agent, summary = paired_app()
     ctl, _ = controller(tmp_path)
     asyncio.run(ctl.reconcile(app))
+    app.tab.sessions.remove(agent)
     asyncio.run(ctl.handle_termination(app, "agent"))
     assert agent.close_calls == []
     assert agent.sent_text == []

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 import re
 import select
@@ -155,7 +154,6 @@ class TerminalSession:
         self.input_fd = input_fd
         self.output_fd = output_fd
         self._attributes: list | None = None
-        self._flags: int | None = None
 
     def __enter__(self) -> TerminalSession:
         if not os.isatty(self.input_fd) or not os.isatty(self.output_fd):
@@ -167,19 +165,13 @@ class TerminalSession:
         changed[6][termios.VTIME] = 0
         try:
             termios.tcsetattr(self.input_fd, termios.TCSANOW, changed)
-            self._flags = fcntl.fcntl(self.input_fd, fcntl.F_GETFL)
-            fcntl.fcntl(self.input_fd, fcntl.F_SETFL, self._flags | os.O_NONBLOCK)
             os.write(self.output_fd, ENTER_SCREEN)
         except BaseException:
             try:
                 termios.tcflush(self.input_fd, termios.TCIFLUSH)
             except OSError:
                 pass
-            try:
-                termios.tcsetattr(self.input_fd, termios.TCSANOW, self._attributes)
-            finally:
-                if self._flags is not None:
-                    fcntl.fcntl(self.input_fd, fcntl.F_SETFL, self._flags)
+            termios.tcsetattr(self.input_fd, termios.TCSANOW, self._attributes)
             raise
         return self
 
@@ -193,10 +185,12 @@ class TerminalSession:
                 termios.tcsetattr(self.input_fd, termios.TCSANOW, self._attributes)
         finally:
             try:
-                if self._flags is not None:
-                    fcntl.fcntl(self.input_fd, fcntl.F_SETFL, self._flags)
-            finally:
                 os.write(self.output_fd, LEAVE_SCREEN)
+            except OSError:
+                # Preserve the exception that caused context teardown. A dead
+                # output fd must not replace the renderer's primary failure.
+                if _exc_type is None:
+                    raise
 
     def size(self) -> tuple[int, int]:
         size = os.get_terminal_size(self.output_fd)

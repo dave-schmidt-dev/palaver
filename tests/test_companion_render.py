@@ -255,13 +255,16 @@ def test_pty_redraws_at_new_width_after_sigwinch(tmp_path):
 
 def test_pty_marks_a_quiet_producer_stale_without_another_write(tmp_path):
     path = tmp_path / "state.json"
-    crossing = time.time() - companion_render.STALE_AFTER_SECONDS + 0.3
-    atomic_write_state(path, _state(updated=crossing))
     process, master, slave = _start_renderer(path)
+    _read_until(master, b"PALAVER ERROR")
+    crossing = time.time() - companion_render.STALE_AFTER_SECONDS + 1.0
+    atomic_write_state(path, _state(updated=crossing))
     initial = _read_until(master, b"PALAVER WORKING")
     assert b"STALE" not in initial
-    transitioned = _read_until(master, b"PALAVER STALE", timeout=2)
+    written_stamp = path.stat().st_mtime_ns
+    transitioned = _read_until(master, b"PALAVER STALE", timeout=3)
     assert b"PALAVER STALE" in transitioned
+    assert path.stat().st_mtime_ns == written_stamp
     _stop_renderer(process, master, slave)
 
 
@@ -297,9 +300,31 @@ def test_normal_return_restores_terminal_flags_and_screen(tmp_path):
     assert ENTER_SCREEN in output
     assert LEAVE_SCREEN in output
     assert _restorable_attributes(termios.tcgetattr(slave)) == original_attributes
-    # macOS marks a PTY after its first output write with an internal 0x10000
-    # bit. The flag this process changed, O_NONBLOCK, must be restored.
     assert fcntl.fcntl(slave, fcntl.F_GETFL) & os.O_NONBLOCK == original_flags & os.O_NONBLOCK
+    os.close(master)
+    os.close(slave)
+
+
+def test_terminal_session_keeps_shared_output_blocking_while_discarding_input():
+    master, slave = pty.openpty()
+    output = os.dup(slave)
+    original_attributes = termios.tcgetattr(slave)
+    original_nonblocking = fcntl.fcntl(output, fcntl.F_GETFL) & os.O_NONBLOCK
+    assert original_nonblocking == 0
+
+    with TerminalSession(slave, output) as terminal:
+        assert fcntl.fcntl(slave, fcntl.F_GETFL) & os.O_NONBLOCK == original_nonblocking
+        assert fcntl.fcntl(output, fcntl.F_GETFL) & os.O_NONBLOCK == original_nonblocking
+        _read_available(master)
+        marker = b"DISCARD_WITHOUT_NONBLOCK"
+        os.write(master, marker)
+        terminal.discard_input()
+        assert marker not in _read_available(master)
+
+    assert _restorable_attributes(termios.tcgetattr(slave)) == original_attributes
+    assert fcntl.fcntl(output, fcntl.F_GETFL) & os.O_NONBLOCK == original_nonblocking
+    assert LEAVE_SCREEN in _read_available(master)
+    os.close(output)
     os.close(master)
     os.close(slave)
 
@@ -317,6 +342,23 @@ def test_enter_failure_restores_terminal_modes(monkeypatch):
         TerminalSession(slave, slave).__enter__()
     assert _restorable_attributes(termios.tcgetattr(slave)) == original_attributes
     assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
+    os.close(master)
+    os.close(slave)
+
+
+def test_leave_screen_write_failure_does_not_mask_primary_exception(monkeypatch):
+    master, slave = pty.openpty()
+    original_write = companion_render.os.write
+
+    def fail_leave(fd, data):
+        if data == LEAVE_SCREEN:
+            raise OSError("leave screen failed")
+        return original_write(fd, data)
+
+    monkeypatch.setattr(companion_render.os, "write", fail_leave)
+    with pytest.raises(ValueError, match="primary failure"):
+        with TerminalSession(slave, slave):
+            raise ValueError("primary failure")
     os.close(master)
     os.close(slave)
 

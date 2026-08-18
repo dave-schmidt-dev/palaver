@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,7 @@ from palaver.ui.companion import (
 from palaver.ui.companion_render import STALE_AFTER_SECONDS
 from palaver.ui.companion_state import CompanionState, JoinState, atomic_write_state
 from palaver.ui.connection import COOKIE_ENV, KEY_ENV
-from palaver.ui.pane_join import PaneJoin, PaneVariables, SupportedPaneProcess
+from palaver.ui.pane_join import PaneJoin, PaneVariables, SupportedPaneProcess, read_process_table
 
 LIVE_ENV = "PALAVER_RUN_LIVE_COMPANION_TEST"
 LIVE_ENABLED = (
@@ -50,6 +51,7 @@ class _OwnedApp:
 
     def __init__(self, real_app, window, owned_ids: set[str]) -> None:
         self._real_app = real_app
+        self._window_id = window.window_id
         self.terminal_windows = [window]
         self.owned_ids = owned_ids
 
@@ -57,6 +59,16 @@ class _OwnedApp:
         if session_id not in self.owned_ids:
             return None
         return self._real_app.get_session_by_id(session_id)
+
+    async def async_refresh(self) -> None:
+        """Refresh the real model, retaining only the disposable test window."""
+        await self._real_app.async_refresh()
+        window = self._real_app.get_window_by_id(self._window_id)
+        self.terminal_windows = [] if window is None else [window]
+        if window is not None:
+            self.owned_ids.update(
+                session.session_id for tab in window.tabs for session in tab.sessions
+            )
 
 
 async def _eventually(check, *, timeout: float = 12.0, interval: float = 0.1):
@@ -97,9 +109,119 @@ async def _job_has_exited(session) -> bool:
     return await _job_pid(session) is None
 
 
+async def _renderer_pid(state_path: Path) -> int | None:
+    """Locate the unique test-owned renderer rather than iTerm's shell wrapper."""
+
+    table = await asyncio.to_thread(read_process_table)
+    marker = str(state_path)
+    candidates = [
+        info
+        for info in table.values()
+        if "palaver.ui.companion_render" in info.command and marker in info.command
+    ]
+    parent_ids = {info.ppid for info in candidates}
+    leaves = [info.pid for info in candidates if info.pid not in parent_ids]
+    return leaves[0] if len(leaves) == 1 else None
+
+
+async def _job_status(session) -> str:
+    """Return a bounded status label without exposing a process identifier."""
+
+    if session is None:
+        return "missing"
+    try:
+        return "running" if await _job_pid(session) is not None else "exited"
+    except Exception:  # The diagnostic must survive a racing session teardown.
+        return "unavailable"
+
+
 async def _collect_focus(monitor, events: list[object]) -> None:
     while True:
         events.append(await monitor.async_get_next_update())
+
+
+async def _collect_terminations(
+    monitor,
+    owned_ids: set[str],
+    events: list[str],
+) -> None:
+    while True:
+        session_id = await monitor.async_get()
+        if session_id in owned_ids:
+            events.append(session_id)
+
+
+def _session_ids_from_node(node) -> set[str]:
+    session_ids: set[str] = set()
+    for link in node.links:
+        if link.HasField("session"):
+            session_ids.add(link.session.unique_identifier)
+        elif link.HasField("node"):
+            session_ids.update(_session_ids_from_node(link.node))
+    return session_ids
+
+
+async def _raw_session_ids(iterm2, connection_value) -> set[str] | None:
+    """Read iTerm's uncached session inventory, if the diagnostic RPC succeeds."""
+
+    try:
+        result = await iterm2.rpc.async_list_sessions(connection_value)
+        response = result.list_sessions_response
+        session_ids: set[str] = set()
+        for window in response.windows:
+            for tab in window.tabs:
+                session_ids.update(_session_ids_from_node(tab.root))
+                session_ids.update(session.unique_identifier for session in tab.minimized_sessions)
+        session_ids.update(session.unique_identifier for session in response.buried_sessions)
+        return session_ids
+    except Exception:  # Keep the primary failure report useful across API variants.
+        return None
+
+
+async def _assert_pairs_still_live(
+    app,
+    iterm2,
+    connection_value,
+    pair_ids: set[str],
+    terminated_owned: list[str],
+) -> None:
+    """Refresh the cache and report bounded evidence for a vanished owned pane."""
+
+    await app.async_refresh()
+    raw_ids = await _raw_session_ids(iterm2, connection_value)
+    cached_sessions = {
+        session_id: app.get_session_by_id(session_id) for session_id in sorted(pair_ids)
+    }
+    cached_membership = {
+        session_id: session is not None for session_id, session in cached_sessions.items()
+    }
+    raw_membership = (
+        None
+        if raw_ids is None
+        else {session_id: session_id in raw_ids for session_id in sorted(pair_ids)}
+    )
+    missing = [
+        session_id
+        for session_id in sorted(pair_ids)
+        if not cached_membership[session_id]
+        or (raw_membership is not None and not raw_membership[session_id])
+    ]
+    if not missing:
+        return
+
+    job_status = {
+        session_id: await _job_status(cached_sessions[session_id])
+        for session_id in sorted(pair_ids)
+        if raw_membership is None or raw_membership[session_id]
+    }
+    pytest.fail(
+        "owned pair vanished after reconciliation: "
+        f"missing={missing!r}; "
+        f"terminated_owned={sorted(set(terminated_owned) & pair_ids)!r}; "
+        f"raw_membership={raw_membership!r}; "
+        f"cached_membership={cached_membership!r}; "
+        f"job_status={job_status!r}"
+    )
 
 
 async def _focus_events_during(iterm2, connection_value, operation) -> list[object]:
@@ -184,6 +306,9 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
         state_dir = tmp_path / ".state" / "companions"
         owned_ids: set[str] = set()
         agent_ids: set[str] = set()
+        terminated_owned: list[str] = []
+        termination_monitor = None
+        termination_collector = None
         try:
             window = await iterm2.Window.async_create(connection_value, command="/bin/sleep 300")
             assert window is not None
@@ -206,6 +331,11 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
                 transcript_joiner=lambda pane, **kwargs: _joiner(agent_ids, pane, **kwargs),
                 process_table_reader=lambda: {},
             )
+            termination_monitor = iterm2.SessionTerminationMonitor(connection_value)
+            await termination_monitor.__aenter__()
+            termination_collector = asyncio.create_task(
+                _collect_terminations(termination_monitor, owned_ids, terminated_owned)
+            )
 
             selected_tab = window.current_tab.tab_id
 
@@ -227,6 +357,14 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             assert second.created == ()
             assert len(second.pairs) == 3
             assert sum(len(tab.sessions) for tab in window.tabs) == 6
+            pair_ids = agent_ids | {pair.companion_id for pair in pairs.values()}
+            await _assert_pairs_still_live(
+                app,
+                iterm2,
+                connection_value,
+                pair_ids,
+                terminated_owned,
+            )
 
             for agent_id, pair in pairs.items():
                 companion = owned_app.get_session_by_id(pair.companion_id)
@@ -293,16 +431,21 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
             assert marker not in await _screen_text(first_companion)
             assert marker not in await _screen_text(first_agent)
 
-            # Ctrl-C kills only the test-owned renderer; reconciliation restarts
-            # the same iTerm session rather than splitting another pane.
+            # Terminate only the test-owned renderer. iTerm keeps the same
+            # pane/layout but assigns a new API session GUID on restart.
             restart_pair = ordered[2]
             restart_companion = owned_app.get_session_by_id(restart_pair.companion_id)
-            assert await _job_pid(restart_companion) is not None
-            await restart_companion.async_send_text("\x03", suppress_broadcast=True)
+            renderer_pid = await _eventually(lambda: _renderer_pid(restart_pair.state_path))
+            os.kill(renderer_pid, signal.SIGTERM)
             await _eventually(lambda: _job_has_exited(restart_companion), timeout=3.0)
             await controller.reconcile(owned_app)
-            assert controller.pairs[restart_pair.agent_id].companion_id == restart_pair.companion_id
-            await _eventually(lambda: _screen_contains(restart_companion, "LIVE-3"))
+            restarted_pair = controller.pairs[restart_pair.agent_id]
+            assert restarted_pair.companion_id != restart_pair.companion_id
+            restarted_companion = owned_app.get_session_by_id(restarted_pair.companion_id)
+            assert restarted_companion is not None
+            assert sum(len(tab.sessions) for tab in owned_app.terminal_windows[0].tabs) == 6
+            await _eventually(lambda: _screen_contains(restarted_companion, "LIVE-3"))
+            ordered[2] = restarted_pair
 
             async def steady_refresh():
                 atomic_write_state(ordered[0].state_path, _snapshot(1, request="STEADY-REFRESH"))
@@ -336,6 +479,12 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
                 app.get_session_by_id(session_id) is not None for session_id in surviving_ids
             )
         finally:
+            if termination_collector is not None:
+                termination_collector.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await termination_collector
+            if termination_monitor is not None:
+                await termination_monitor.__aexit__(None, None, None)
             if window_id is not None:
                 owned_window = app.get_window_by_id(window_id)
                 if owned_window is not None:
