@@ -214,9 +214,7 @@ def test_status_codex_and_explicit_all_use_only_fixture_roots(tmp_path):
     codex_root = tmp_path / "codex"
 
     default_out = io.StringIO()
-    status_cli.run(
-        SimpleNamespace(once=True, sample=claude_root), out=default_out, now=NOW
-    )
+    status_cli.run(SimpleNamespace(once=True, sample=claude_root), out=default_out, now=NOW)
     assert default_out.getvalue() == "proj-a claude-session AWAITING_HUMAN 5m\n"
 
     codex_out = io.StringIO()

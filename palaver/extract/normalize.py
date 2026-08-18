@@ -372,9 +372,7 @@ def _codex_structural_summary(record: dict) -> str | None:
         failed = payload.get("status") == "failed" or payload.get("success") is False
         exit_code = payload.get("exit_code")
         failed = failed or (
-            isinstance(exit_code, int)
-            and not isinstance(exit_code, bool)
-            and exit_code != 0
+            isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
         )
         if failed:
             detail = payload.get("message") or payload.get("status") or "tool failed"
@@ -384,10 +382,7 @@ def _codex_structural_summary(record: dict) -> str | None:
 
 def _render_codex_record(record: dict) -> list[str]:
     """Render a bounded semantic subset of one Codex rollout record."""
-    if (
-        record.get("type") == "response_item"
-        and _codex_payload(record).get("type") == "message"
-    ):
+    if record.get("type") == "response_item" and _codex_payload(record).get("type") == "message":
         text = message_text(record).strip()
         if not text:
             return []

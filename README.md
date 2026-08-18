@@ -73,6 +73,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 - **Identity:** Codex projects use the canonical working directory plus a stable collision-resistant suffix; Claude Code preserves its existing cwd-key identity. A pane-local session pin is available for deliberate rename/move recovery. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
 - **Memory is append-only.** Correction creates a new superseding row; nothing is deleted or mutated in place. Provenance ordering is enforced by database constraint, not by prompt text — an observer inference cannot supersede an explicit user instruction.
 - **UI:** each agent pane gets its own shallow companion pane above it, showing that session's deterministic activity summary, goal, tasks, and open questions. A local LLM is optional compression, not the source of status.
+- **Pane layout:** labeled sections in a fixed gutter — `REQUEST`, `NOW`, `TASKS`, `ASK`, `COMMAND`, `DETAIL`. Every section with content earns one row before any earns a second, then spare rows go to the lists and `NOW` absorbs the remainder, so a two-row pane still shows the request and a ten-row pane fills. Activity rows are colored by the producer's evidence kind (red for a failure, dim for tool traffic, default weight for the agent's own prose); the renderer never reads display text to pick a color.
 - **Self-observation:** Palaver records the *fact* of a query from the server side and does not feed its own output back through the observer.
 
 ## Sensitivity

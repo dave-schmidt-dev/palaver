@@ -412,9 +412,10 @@ def test_codex_project_identity_uses_cwd_not_same_day_rollout_directory(tmp_path
     }
     assert len({identity.name for identity in identities}) == 4
     assert all("2026" not in identity.name for identity in identities)
-    assert project_identity_for_cwd(punctuation_cwd).name != project_identity_for_cwd(
-        punctuation_collision_cwd
-    ).name
+    assert (
+        project_identity_for_cwd(punctuation_cwd).name
+        != project_identity_for_cwd(punctuation_collision_cwd).name
+    )
 
 
 def test_adapters_never_open_source_writable(tmp_path, monkeypatch):

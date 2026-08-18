@@ -128,13 +128,9 @@ def collect_status(
         raise ValueError(f"unsupported status source: {source}")
     adapters = []
     explicit_roots = sample_root is not None or codex_root is not None
-    if source in {"claude-code", "all"} and (
-        sample_root is not None or not explicit_roots
-    ):
+    if source in {"claude-code", "all"} and (sample_root is not None or not explicit_roots):
         adapters.append(ClaudeCodeAdapter(root=sample_root))
-    if source in {"codex", "all"} and (
-        codex_root is not None or not explicit_roots
-    ):
+    if source in {"codex", "all"} and (codex_root is not None or not explicit_roots):
         adapters.append(CodexAdapter(root=codex_root))
 
     for adapter in adapters:

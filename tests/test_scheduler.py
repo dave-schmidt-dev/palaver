@@ -299,12 +299,18 @@ def test_observe_default_and_explicit_roots_select_only_fixture_sources(monkeypa
     constructed.clear()
     claude_root = tmp_path / "claude-fixture"
     codex_root = tmp_path / "codex-fixture"
-    assert [adapter.source for adapter in observe_cli._configured_adapters(
-        SimpleNamespace(sample=claude_root, codex_root=None)
-    )] == ["claude-code"]
-    assert [adapter.source for adapter in observe_cli._configured_adapters(
-        SimpleNamespace(sample=None, codex_root=codex_root)
-    )] == ["codex"]
+    assert [
+        adapter.source
+        for adapter in observe_cli._configured_adapters(
+            SimpleNamespace(sample=claude_root, codex_root=None)
+        )
+    ] == ["claude-code"]
+    assert [
+        adapter.source
+        for adapter in observe_cli._configured_adapters(
+            SimpleNamespace(sample=None, codex_root=codex_root)
+        )
+    ] == ["codex"]
     assert constructed == [("claude-code", claude_root), ("codex", codex_root)]
 
 
@@ -775,9 +781,7 @@ def test_one_writer_extracts_ephemeral_state_for_claude_and_codex(tmp_path, stub
 
     with daemon:
         result = daemon.tick(now=NOW)
-        sources = daemon.conn.execute(
-            "SELECT source FROM sessions ORDER BY source"
-        ).fetchall()
+        sources = daemon.conn.execute("SELECT source FROM sessions ORDER BY source").fetchall()
         state_count = daemon.conn.execute("SELECT COUNT(*) FROM current_state").fetchone()[0]
         runs = daemon.conn.execute(
             "SELECT COUNT(*) FROM model_runs WHERE purpose = 'observer-extraction'"
