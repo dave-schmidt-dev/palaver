@@ -27,13 +27,17 @@ rationale: Palaver is a
   behind it are tagged.
 
 ### INV-2 — Palaver never writes to, controls, or interrupts an observed agent session
-area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py"]
+area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/companion.py"]
 gate_test: tests/test_adapters.py::test_adapters_never_open_source_writable
+gate_test: tests/test_ui_companion.py::test_operation_trace_never_closes_or_sends_text_to_agent
 threshold: 3
 rationale: The brief's first non-goal is autonomous control of coding agents, and the second is
   automatic injection of warnings into agent prompts. An observer that can write to the thing it
   observes stops being evidence and becomes a participant — its own writes appear in the next tick's
-  transcript and it begins reasoning about its own output. Warnings surface in Palaver's UI only.
+  transcript and it begins reasoning about its own output. Palaver may create, resize, restart, and
+  close only a pane carrying its exact companion marker; the one permitted observed-pane focus call
+  is a conditional post-split restore with no tab selection or window activation. Warnings surface
+  in Palaver's UI only.
   This holds until Palaver has demonstrated reliability the user explicitly signs off on; it is not a
   temporary scaffold.
 

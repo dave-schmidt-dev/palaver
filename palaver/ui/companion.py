@@ -1,0 +1,545 @@
+"""Lifecycle ownership for Palaver's per-agent iTerm2 companion panes.
+
+The controller owns only panes carrying Palaver's exact marker.  Agent panes
+are observed and may be split once; they are never sent input, closed, or
+resized.  All mutating operations are serialized so the new-session and
+layout monitors cannot turn one split into a recursive chain of companions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import shlex
+import sys
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from palaver.ui.companion_state import (
+    CompanionState,
+    JoinState,
+    atomic_write_state,
+)
+from palaver.ui.connection import import_iterm2
+from palaver.ui.pane_join import (
+    PIN_VARIABLE,
+    PaneJoin,
+    PaneVariables,
+    ProcessTable,
+    SupportedPaneProcess,
+    detect_supported_process,
+    join_pane,
+    read_process_table,
+)
+
+ROLE_VARIABLE = "user.palaver_role"
+AGENT_SESSION_VARIABLE = "user.palaver_agent_session"
+COMPANION_SESSION_VARIABLE = "user.palaver_companion_session"
+DISABLED_VARIABLE = "user.palaver_companion_disabled"
+COMPANION_ROLE = "companion-v1"
+
+SUMMARY_ROWS = 6
+MIN_AGENT_ROWS = 1
+SCROLLBACK_LINES = 100
+INITIAL_RESTART_BACKOFF = 2.0
+MAX_RESTART_BACKOFF = 60.0
+
+
+def _no_status(_message: str) -> None:
+    """Default progress sink."""
+
+
+@dataclass(frozen=True)
+class SessionMetadata:
+    """One iTerm session plus the variables used by lifecycle decisions."""
+
+    session: Any
+    tab: Any
+    pane: PaneVariables
+    role: str | None = None
+    agent_session: str | None = None
+    companion_session: str | None = None
+    disabled: bool = False
+
+    @property
+    def session_id(self) -> str:
+        """Return iTerm2's stable-within-run session identifier."""
+        return self.pane.pane_id
+
+    @property
+    def is_companion(self) -> bool:
+        """Whether this pane bears Palaver's exact ownership marker."""
+        return self.role == COMPANION_ROLE
+
+
+@dataclass(frozen=True)
+class CompanionPair:
+    """A reciprocal live agent/companion pair."""
+
+    agent_id: str
+    companion_id: str
+    state_path: Path
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """Observable result of one reconciliation pass."""
+
+    pairs: tuple[CompanionPair, ...]
+    created: tuple[str, ...]
+    closed: tuple[str, ...]
+    refused: tuple[str, ...]
+
+
+ReadMetadata = Callable[[Any, Any], Awaitable[SessionMetadata | None]]
+WriteInitialState = Callable[[Path, SupportedPaneProcess, PaneJoin | None], None]
+
+
+def opaque_state_path(state_dir: Path, agent_id: str) -> Path:
+    """Return a non-identifying state filename for one iTerm agent pane."""
+    digest = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()
+    return state_dir / f"{digest}.json"
+
+
+def companion_command(state_path: Path, *, executable: str | None = None) -> str:
+    """Build the custom command without shell interpolation hazards."""
+    python = sys.executable if executable is None else executable
+    return shlex.join([python, "-m", "palaver.ui.companion_render", "--state", str(state_path)])
+
+
+METADATA_VARIABLES = (
+    "jobPid",
+    "jobName",
+    "path",
+    PIN_VARIABLE,
+    ROLE_VARIABLE,
+    AGENT_SESSION_VARIABLE,
+    COMPANION_SESSION_VARIABLE,
+    DISABLED_VARIABLE,
+)
+
+
+def make_metadata_reader(connection: Any) -> ReadMetadata:
+    """Read all process and ownership variables in one iTerm RPC."""
+    import_iterm2()
+    import iterm2.api_pb2  # noqa: PLC0415 - optional UI dependency
+    import iterm2.rpc  # noqa: PLC0415 - optional UI dependency
+
+    ok = iterm2.api_pb2.VariableResponse.Status.Value("OK")
+
+    async def read_metadata(session: Any, tab: Any) -> SessionMetadata | None:
+        result = await iterm2.rpc.async_variable(
+            connection, session.session_id, [], list(METADATA_VARIABLES)
+        )
+        response = result.variable_response
+        if response.status != ok or len(response.values) < 3:
+            return None
+        decoded = [_decode_variable(item) for item in response.values]
+        decoded.extend([None] * (len(METADATA_VARIABLES) - len(decoded)))
+        job_pid, job_name, path, pin, role, agent_id, companion_id, disabled = decoded
+        try:
+            parsed_pid = int(job_pid) if int(job_pid) > 0 else None
+        except TypeError, ValueError:
+            parsed_pid = None
+        pane = PaneVariables(
+            pane_id=session.session_id,
+            job_pid=parsed_pid,
+            job_name=job_name if isinstance(job_name, str) else None,
+            path=path if isinstance(path, str) else None,
+            pin=pin if isinstance(pin, str) else None,
+        )
+        return SessionMetadata(
+            session=session,
+            tab=tab,
+            pane=pane,
+            role=role if isinstance(role, str) else None,
+            agent_session=agent_id if isinstance(agent_id, str) and agent_id else None,
+            companion_session=(
+                companion_id if isinstance(companion_id, str) and companion_id else None
+            ),
+            disabled=disabled is True,
+        )
+
+    return read_metadata
+
+
+def _decode_variable(raw: str) -> object:
+    try:
+        return json.loads(raw)
+    except TypeError, ValueError:
+        return None
+
+
+def build_companion_profile(command: str):
+    """Build session-local iTerm profile overrides for a quiet summary pane."""
+    iterm2 = import_iterm2()
+    profile = iterm2.LocalWriteOnlyProfile()
+    profile.set_use_custom_command("Yes")
+    profile.set_command(command)
+    profile.set_close_sessions_on_end(False)
+    profile.set_prompt_before_closing(False)
+    profile.set_unlimited_scrollback(False)
+    profile.set_scrollback_lines(SCROLLBACK_LINES)
+    profile.set_silence_bell(True)
+    profile.set_send_bell_alert(False)
+    profile.set_flashing_bell(False)
+    profile.set_visual_bell(False)
+    profile.set_use_custom_window_title(True)
+    profile.set_custom_window_title("Palaver")
+    return profile
+
+
+def write_initial_state(
+    path: Path,
+    detected: SupportedPaneProcess,
+    joined: PaneJoin | None,
+) -> None:
+    """Seed the renderer transport before its process can start reading."""
+    exact = joined is not None and joined.session_key is not None
+    atomic_write_state(
+        path,
+        CompanionState(
+            producer_updated_at=time.time(),
+            project=detected.cwd.name,
+            source=detected.source,
+            status="UNKNOWN",
+            join_state=JoinState.JOINED if exact else JoinState.UNJOINED,
+            detail=None if exact else "Agent detected; waiting for an exact session join",
+        ),
+    )
+
+
+class CompanionController:
+    """Reconcile supported agent panes with exactly one owned companion."""
+
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        read_metadata: ReadMetadata,
+        write_initial_state: WriteInitialState = write_initial_state,
+        process_detector=detect_supported_process,
+        transcript_joiner=join_pane,
+        process_table_reader=read_process_table,
+        cwd_reader=None,
+        profile_builder=build_companion_profile,
+        clock: Callable[[], float] | None = None,
+        on_status: Callable[[str], None] = _no_status,
+    ) -> None:
+        self.state_dir = state_dir
+        self._read_metadata = read_metadata
+        self._write_initial_state = write_initial_state
+        self._detect = process_detector
+        self._join = transcript_joiner
+        self._read_process_table = process_table_reader
+        self._cwd_reader = cwd_reader
+        self._profile_builder = profile_builder
+        self._clock = time.monotonic if clock is None else clock
+        self._on_status = on_status
+        self._lock = asyncio.Lock()
+        self._pending: set[str] = set()
+        self._pairs: dict[str, CompanionPair] = {}
+        self._manager_closing: set[str] = set()
+        self._restart_attempts: dict[str, int] = {}
+        self._retry_after: dict[str, float] = {}
+
+    @property
+    def pairs(self) -> Mapping[str, CompanionPair]:
+        """Return a copy of the current agent-keyed pair map."""
+        return dict(self._pairs)
+
+    async def reconcile(self, app: Any) -> ReconcileResult:
+        """Make current iTerm state agree with the companion ownership rules."""
+        async with self._lock:
+            return await self._reconcile_locked(app)
+
+    async def _inventory(self, app: Any) -> dict[str, SessionMetadata]:
+        found: dict[str, SessionMetadata] = {}
+        for window in app.terminal_windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    try:
+                        metadata = await self._read_metadata(session, tab)
+                    except Exception:
+                        self._on_status(f"could not inspect pane {session.session_id}")
+                        continue
+                    if metadata is not None:
+                        found[metadata.session_id] = metadata
+        return found
+
+    async def _reconcile_locked(self, app: Any) -> ReconcileResult:
+        inventory = await self._inventory(app)
+        companions = {
+            pane_id: metadata
+            for pane_id, metadata in inventory.items()
+            if metadata.is_companion or pane_id in self._pending
+        }
+        agents = {pane_id: item for pane_id, item in inventory.items() if pane_id not in companions}
+        closed: list[str] = []
+        created: list[str] = []
+        refused: list[str] = []
+        pairs: dict[str, CompanionPair] = {}
+        restarting: set[str] = set()
+
+        # A reciprocal pair is reused without changing its size or focus.
+        candidates: dict[str, list[SessionMetadata]] = {}
+        for companion in companions.values():
+            if companion.agent_session:
+                candidates.setdefault(companion.agent_session, []).append(companion)
+        for agent_id, owned in candidates.items():
+            agent = agents.get(agent_id)
+            if agent is not None and agent.disabled:
+                for item in owned:
+                    if await self._close_owned(item):
+                        closed.append(item.session_id)
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                try:
+                    opaque_state_path(self.state_dir, agent_id).unlink(missing_ok=True)
+                except OSError:
+                    self._on_status(f"could not remove disabled companion state for {agent_id}")
+                continue
+            reciprocal = [
+                item
+                for item in owned
+                if agent is not None and agent.companion_session == item.session_id
+            ]
+            exited = [item for item in reciprocal if item.pane.job_pid is None]
+            for item in exited:
+                if self._clock() < self._retry_after.get(agent_id, 0.0):
+                    restarting.add(agent_id)
+                    continue
+                try:
+                    await item.session.async_restart(only_if_exited=True)
+                except Exception:
+                    self._record_restart_failure(agent_id)
+                    restarting.add(agent_id)
+                else:
+                    self._restart_attempts.pop(agent_id, None)
+                    self._retry_after.pop(agent_id, None)
+            keeper = sorted(reciprocal, key=lambda item: item.session_id)[:1]
+            if keeper:
+                item = keeper[0]
+                pairs[agent_id] = CompanionPair(
+                    agent_id, item.session_id, opaque_state_path(self.state_dir, agent_id)
+                )
+            for item in owned:
+                if not keeper or item.session_id != keeper[0].session_id:
+                    if await self._close_owned(item):
+                        closed.append(item.session_id)
+            if not keeper and owned:
+                try:
+                    opaque_state_path(self.state_dir, agent_id).unlink(missing_ok=True)
+                except OSError:
+                    self._on_status(f"could not remove unpaired state for {agent_id}")
+
+        # Marker-only panes with no owner are Palaver-owned orphans.
+        paired_companions = {pair.companion_id for pair in pairs.values()}
+        for companion_id, companion in companions.items():
+            if companion_id in paired_companions or companion_id in closed:
+                continue
+            if not companion.agent_session or companion.agent_session not in agents:
+                if await self._close_owned(companion):
+                    closed.append(companion_id)
+                    if companion.agent_session:
+                        try:
+                            opaque_state_path(self.state_dir, companion.agent_session).unlink(
+                                missing_ok=True
+                            )
+                        except OSError:
+                            self._on_status(
+                                f"could not remove orphan state for {companion.agent_session}"
+                            )
+
+        table: ProcessTable = self._read_process_table()
+        for agent_id, agent in sorted(agents.items()):
+            if agent_id in pairs or agent.disabled:
+                continue
+            if agent.companion_session and agent_id not in restarting:
+                # A missing reciprocal peer represents a user-closed pane.
+                await agent.session.async_set_variable(DISABLED_VARIABLE, True)
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                refused.append(agent_id)
+                continue
+            if self._clock() < self._retry_after.get(agent_id, 0.0):
+                refused.append(agent_id)
+                continue
+            kwargs: dict[str, Any] = {"table": table}
+            if self._cwd_reader is not None:
+                kwargs["cwd_reader"] = self._cwd_reader
+            detected = self._detect(agent.pane, **kwargs)
+            if detected is None:
+                refused.append(agent_id)
+                continue
+            joined = self._join(agent.pane, **kwargs)
+            pair = await self._create(app, agent, detected, joined)
+            if pair is None:
+                refused.append(agent_id)
+            else:
+                pairs[agent_id] = pair
+                created.append(pair.companion_id)
+
+        self._pairs = pairs
+        result = ReconcileResult(
+            pairs=tuple(pairs[key] for key in sorted(pairs)),
+            created=tuple(created),
+            closed=tuple(closed),
+            refused=tuple(refused),
+        )
+        self._on_status(
+            f"companions: {len(result.pairs)} paired, {len(created)} created, {len(closed)} cleaned"
+        )
+        return result
+
+    async def _create(
+        self,
+        app: Any,
+        agent: SessionMetadata,
+        detected: SupportedPaneProcess,
+        joined: PaneJoin | None,
+    ) -> CompanionPair | None:
+        # A six-row summary plus at least one agent row is the only local
+        # precondition. iTerm owns all other layout constraints and may still
+        # refuse the split, which is handled as a per-pane failure below.
+        if agent.session.grid_size.height < SUMMARY_ROWS + MIN_AGENT_ROWS:
+            return None
+        state_path = opaque_state_path(self.state_dir, agent.session_id)
+        self._write_initial_state(state_path, detected, joined)
+        command = companion_command(state_path)
+        profile = self._profile_builder(command)
+        companion = None
+        try:
+            companion = await agent.session.async_split_pane(
+                vertical=False, before=True, profile_customizations=profile
+            )
+            self._pending.add(companion.session_id)
+            await companion.async_set_variable(ROLE_VARIABLE, COMPANION_ROLE)
+            await companion.async_set_variable(AGENT_SESSION_VARIABLE, agent.session_id)
+            await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, companion.session_id)
+            await agent.session.async_set_variable(DISABLED_VARIABLE, False)
+            iterm2 = import_iterm2()
+            companion.preferred_size = iterm2.Size(agent.session.grid_size.width, SUMMARY_ROWS)
+            await agent.tab.async_update_layout()
+
+            # Splitting activates the new pane. Restore only when it is still
+            # active in this same tab; never steal focus after the user moved.
+            if (
+                agent.tab.current_session is not None
+                and agent.tab.current_session.session_id == companion.session_id
+            ):
+                await agent.session.async_activate(select_tab=False, order_window_front=False)
+            self._restart_attempts.pop(agent.session_id, None)
+            self._retry_after.pop(agent.session_id, None)
+            return CompanionPair(agent.session_id, companion.session_id, state_path)
+        except Exception:
+            self._record_restart_failure(agent.session_id)
+            if companion is not None:
+                self._manager_closing.add(companion.session_id)
+                try:
+                    await companion.async_close(force=True)
+                except Exception:
+                    pass
+            try:
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+            except Exception:
+                pass
+            try:
+                state_path.unlink(missing_ok=True)
+            except OSError:
+                self._on_status(f"could not remove partial companion state for {agent.session_id}")
+            return None
+        finally:
+            if companion is not None:
+                self._pending.discard(companion.session_id)
+
+    def _record_restart_failure(self, agent_id: str) -> None:
+        attempts = self._restart_attempts.get(agent_id, 0) + 1
+        self._restart_attempts[agent_id] = attempts
+        delay = min(INITIAL_RESTART_BACKOFF * (2 ** (attempts - 1)), MAX_RESTART_BACKOFF)
+        self._retry_after[agent_id] = self._clock() + delay
+
+    async def _close_owned(self, companion: SessionMetadata) -> bool:
+        """Close only an exact-marker companion, never an observed pane."""
+        if not companion.is_companion:
+            return False
+        self._manager_closing.add(companion.session_id)
+        try:
+            await companion.session.async_close(force=True)
+        except Exception:
+            self._manager_closing.discard(companion.session_id)
+            return False
+        return True
+
+    async def handle_termination(self, app: Any, session_id: str) -> None:
+        """Apply user-close or agent-teardown semantics for one termination."""
+        async with self._lock:
+            manager_close = session_id in self._manager_closing
+            self._manager_closing.discard(session_id)
+            pair_by_companion = next(
+                (pair for pair in self._pairs.values() if pair.companion_id == session_id), None
+            )
+            if pair_by_companion is not None:
+                self._pairs.pop(pair_by_companion.agent_id, None)
+                agent = app.get_session_by_id(pair_by_companion.agent_id)
+                if agent is not None:
+                    await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                    if not manager_close:
+                        await agent.async_set_variable(DISABLED_VARIABLE, True)
+                return
+
+            pair = self._pairs.pop(session_id, None)
+            if pair is None:
+                return
+            companion = app.get_session_by_id(pair.companion_id)
+            if companion is not None:
+                # Pair membership proves this is the exact companion. Agent
+                # session ids are never passed to async_close.
+                self._manager_closing.add(pair.companion_id)
+                await companion.async_close(force=True)
+            try:
+                pair.state_path.unlink(missing_ok=True)
+            except OSError:
+                self._on_status(f"could not remove companion state for {session_id}")
+
+    async def set_enabled(self, app: Any, agent_id: str, *, enabled: bool) -> bool:
+        """Persist an explicit enable/disable choice on an agent pane."""
+        async with self._lock:
+            agent = app.get_session_by_id(agent_id)
+            if agent is None:
+                return False
+            await agent.async_set_variable(DISABLED_VARIABLE, not enabled)
+            if enabled:
+                await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                self._retry_after.pop(agent_id, None)
+            else:
+                pair = self._pairs.pop(agent_id, None)
+                if pair is not None:
+                    companion = app.get_session_by_id(pair.companion_id)
+                    if companion is not None:
+                        self._manager_closing.add(pair.companion_id)
+                        await companion.async_close(force=True)
+                    await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                    try:
+                        pair.state_path.unlink(missing_ok=True)
+                    except OSError:
+                        self._on_status(f"could not remove companion state for {agent_id}")
+            return True
+
+
+__all__ = [
+    "AGENT_SESSION_VARIABLE",
+    "COMPANION_ROLE",
+    "COMPANION_SESSION_VARIABLE",
+    "DISABLED_VARIABLE",
+    "ROLE_VARIABLE",
+    "CompanionController",
+    "CompanionPair",
+    "ReconcileResult",
+    "SessionMetadata",
+    "build_companion_profile",
+    "companion_command",
+    "opaque_state_path",
+]

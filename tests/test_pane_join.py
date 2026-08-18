@@ -60,6 +60,7 @@ from palaver.ui.pane_join import (
     PaneVariables,
     ProcessInfo,
     agent_ancestor,
+    detect_supported_process,
     encode_pin,
     join_pane,
     observe_liveness,
@@ -178,6 +179,31 @@ def test_a_pane_running_the_agent_directly_joins_at_zero_hops(project):
     assert join is not None
     assert join.pid == 77201
     assert join.source == "codex"
+
+
+def test_supported_process_detection_does_not_require_a_transcript(project):
+    cwd, _sessions_root = project
+
+    detected = detect_supported_process(
+        _variables(cwd), table=_table(), cwd_reader=lambda _pid: cwd
+    )
+
+    assert detected is not None
+    assert detected.pane_id == "pane-1"
+    assert detected.pid == AGENT_PID
+    assert detected.source == CLAUDE_SOURCE
+    assert detected.cwd == cwd
+
+
+def test_supported_process_detection_fails_closed_on_cwd_disagreement(project, tmp_path):
+    cwd, _sessions_root = project
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    assert (
+        detect_supported_process(_variables(cwd), table=_table(), cwd_reader=lambda _pid: elsewhere)
+        is None
+    )
 
 
 def test_direct_codex_pid_can_override_a_foreground_helper_job_name(project):

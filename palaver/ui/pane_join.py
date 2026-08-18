@@ -196,6 +196,68 @@ class PaneJoin:
 
 
 @dataclass(frozen=True)
+class SupportedPaneProcess:
+    """A locally-running supported agent, before any transcript is joined.
+
+    Companion panes need only this much evidence to exist.  Keeping this
+    result separate from :class:`PaneJoin` prevents an absent or ambiguous
+    transcript from hiding a real Claude Code or Codex process, while still
+    refusing shells, remote processes, stale pane variables, and cwd
+    disagreements.
+    """
+
+    pane_id: str
+    pid: int
+    source: str
+    cwd: Path
+
+
+def detect_supported_process(
+    variables: PaneVariables,
+    *,
+    table: ProcessTable | None = None,
+    cwd_reader=None,
+) -> SupportedPaneProcess | None:
+    """Identify a supported local agent without consulting session stores.
+
+    The checks deliberately match the process half of :func:`join_pane`.
+    This is a fail-closed detector, not a weaker join: a pane must name an
+    existing local directory, its foreground process variables must agree
+    with one process-table snapshot, and the supported agent's own cwd must
+    equal the pane cwd.
+    """
+    if not variables.path:
+        return None
+    cwd = Path(variables.path)
+    if not cwd.is_absolute() or not cwd.is_dir():
+        return None
+    if variables.job_pid is None or variables.job_pid <= 0:
+        return None
+
+    process_table = read_process_table() if table is None else table
+    job = process_table.get(variables.job_pid)
+    if job is None:
+        return None
+    pid_is_agent = job.name.lstrip("-").lower() in AGENT_SOURCES
+    if variables.job_name and job.name != variables.job_name and not pid_is_agent:
+        return None
+
+    agent = agent_ancestor(variables.job_pid, process_table)
+    if agent is None:
+        return None
+    read_cwd = working_directory if cwd_reader is None else cwd_reader
+    agent_cwd = read_cwd(agent.pid)
+    if agent_cwd is None or agent_cwd != cwd:
+        return None
+    return SupportedPaneProcess(
+        pane_id=variables.pane_id,
+        pid=agent.pid,
+        source=AGENT_SOURCES[agent.name.lstrip("-").lower()],
+        cwd=cwd,
+    )
+
+
+@dataclass(frozen=True)
 class PanePin:
     """A pane-local explicit source/session override."""
 
@@ -212,7 +274,7 @@ def parse_pin(raw: object) -> PanePin | None:
             return None
         try:
             value = json.loads(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
     if not isinstance(value, Mapping):
         return None
@@ -528,7 +590,7 @@ def _codex_store_candidates(
             if path.stat().st_mtime < cutoff:
                 continue
             identity = adapter.read_identity(path)
-        except (OSError, ValueError, TypeError):
+        except OSError, ValueError, TypeError:
             continue
         if identity is None or identity.is_subagent or identity.cwd is None:
             continue
@@ -549,17 +611,16 @@ def _pinned_store_path(root: Path, pin: PanePin) -> Path | None:
         candidate = root / project_key / f"{session_id}.jsonl"
         matches = [candidate] if _readable_file(candidate) else []
     else:
-        matches = [
-            path
-            for path in root.rglob(f"{pin.session_key}.jsonl")
-            if _readable_file(path)
-        ] if root.is_dir() else []
+        matches = (
+            [path for path in root.rglob(f"{pin.session_key}.jsonl") if _readable_file(path)]
+            if root.is_dir()
+            else []
+        )
         adapter = CodexAdapter(root)
         matches = [
             path
             for path in matches
-            if (identity := adapter.read_identity(path)) is not None
-            and not identity.is_subagent
+            if (identity := adapter.read_identity(path)) is not None and not identity.is_subagent
         ]
     if len(matches) != 1:
         return None
