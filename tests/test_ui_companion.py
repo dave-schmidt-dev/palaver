@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import types
 from pathlib import Path
 
@@ -320,6 +321,48 @@ def test_partial_creation_failure_closes_only_new_companion(tmp_path, monkeypatc
     assert agent.close_calls == []
 
 
+def test_cancellation_after_split_cleans_partial_companion_and_state(tmp_path):
+    started = asyncio.Event()
+
+    class BlockingCompanion(FakeSession):
+        async def async_set_variable(self, name, value):
+            started.set()
+            await asyncio.Event().wait()
+
+    agent = FakeSession("agent")
+    summary = BlockingCompanion("summary", job_pid=20)
+    agent.split_result = summary
+    tab = FakeTab([agent])
+
+    def seed(path, *_args):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("seed", encoding="utf-8")
+
+    ctl = CompanionController(
+        tmp_path,
+        read_metadata=metadata_reader,
+        write_initial_state=seed,
+        process_detector=detected,
+        transcript_joiner=lambda *_args, **_kwargs: None,
+        process_table_reader=lambda: {},
+        profile_builder=lambda command: command,
+    )
+
+    async def drive():
+        task = asyncio.create_task(ctl.reconcile(FakeApp(tab)))
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+    assert summary.close_calls == [{"force": True}]
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+    assert list(tmp_path.glob("*.json")) == []
+
+
 def test_split_failure_removes_the_state_seed(tmp_path):
     app, agent, _summary = paired_app()
     agent.split_error = RuntimeError("cannot split")
@@ -362,6 +405,29 @@ def test_explicit_disable_closes_companion_and_enable_clears_suppression(tmp_pat
     assert asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
     assert agent.vars[DISABLED_VARIABLE] is False
     assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+
+
+def test_enable_rejects_companion_and_ordinary_shell_targets(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    ctl, _ = controller(tmp_path, detector=lambda *_args, **_kwargs: None)
+    assert not asyncio.run(ctl.set_enabled(app, "summary", enabled=True))
+    assert not asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
+    assert agent.vars == {}
+    assert summary.vars == {
+        ROLE_VARIABLE: COMPANION_ROLE,
+        AGENT_SESSION_VARIABLE: "agent",
+    }
+
+
+def test_known_pair_owner_remains_a_valid_target_after_process_exit(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    ctl, _ = controller(tmp_path, detector=lambda *_args, **_kwargs: None)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", tmp_path / "state")}
+    assert asyncio.run(ctl.set_enabled(app, "agent", enabled=False))
+    assert summary.close_calls == [{"force": True}]
 
 
 def test_agent_teardown_closes_only_its_exact_registered_companion(tmp_path):
@@ -415,6 +481,63 @@ def test_one_pane_failure_does_not_prevent_another_creation(tmp_path, monkeypatc
     result = asyncio.run(ctl.reconcile(FakeApp(tab)))
     assert result.created == ("summary",)
     assert "bad" in result.refused
+
+
+def test_targeted_reconcile_never_creates_an_unrequested_agent(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
+    first = FakeSession("first")
+    first_summary = FakeSession("first-summary", job_pid=20)
+    first.split_result = first_summary
+    second = FakeSession("second")
+    second.split_result = FakeSession("second-summary", job_pid=20)
+    tab = FakeTab([first, second])
+    ctl, _ = controller(tmp_path)
+    result = asyncio.run(ctl.reconcile(FakeApp(tab), only_agent_id="first"))
+    assert result.created == ("first-summary",)
+    assert second.split_calls == []
+
+
+def test_inventory_only_reconcile_does_not_probe_process_table(tmp_path):
+    app, _agent, _summary = paired_app()
+    ctl = CompanionController(
+        tmp_path,
+        read_metadata=metadata_reader,
+        process_table_reader=lambda: (_ for _ in ()).throw(AssertionError("process probe")),
+    )
+    result = asyncio.run(ctl.reconcile(app, create=False))
+    assert result.created == ()
+
+
+def test_blocking_process_probe_runs_off_event_loop_with_visible_progress(tmp_path):
+    app, _agent, _summary = paired_app()
+    started = threading.Event()
+    release = threading.Event()
+    statuses = []
+
+    def process_table():
+        started.set()
+        release.wait(timeout=2)
+        return {}
+
+    ctl = CompanionController(
+        tmp_path,
+        read_metadata=metadata_reader,
+        process_detector=lambda *_args, **_kwargs: None,
+        process_table_reader=process_table,
+        on_status=statuses.append,
+    )
+
+    async def drive():
+        task = asyncio.create_task(ctl.reconcile(app))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        await task
+
+    asyncio.run(drive())
+    assert "reading process table for companion reconciliation" in statuses
 
 
 def test_agent_mutations_are_bounded_to_split_link_and_conditional_focus():

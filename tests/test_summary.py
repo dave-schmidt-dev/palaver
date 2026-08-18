@@ -221,6 +221,24 @@ def test_malformed_complete_record_fails_semantic_provenance_closed():
     assert snapshot.questions.provenance is Provenance.UNKNOWN
 
 
+def test_claude_tool_error_is_current_turn_signal_and_success_clears_it():
+    failed = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (_claude_result("call", "permission denied", error=True),),
+    )
+    assert failed.command_result.text == "permission denied"
+    cleared = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (
+            _claude_result("call", "permission denied", error=True),
+            _claude_result("retry", "ok"),
+        ),
+    )
+    assert cleared.command_result.text is None
+
+
 def test_unsupported_structured_plan_is_unknown_not_an_empty_plan():
     claude = reduce_events(
         "claude-code", "fixture/session", (_claude_tool("TodoWrite", "p", {"todos": "bad"}),)

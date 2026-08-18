@@ -107,7 +107,11 @@ def reduce_claude_events(
     initial: SummarySnapshot | None = None,
 ) -> SummarySnapshot:
     """Reduce Claude Code events without interpreting assistant prose."""
-    snapshot = initial or SummarySnapshot(source=SOURCE, session_key=session_key)
+    snapshot = initial or SummarySnapshot(
+        source=SOURCE,
+        session_key=session_key,
+        command_result=Claim(None, Provenance.STRUCTURAL, "event_stream"),
+    )
     pending: dict[str, tuple[Claim, ...]] = {}
     for claim in snapshot.questions.items:
         if claim.evidence_id is not None:
@@ -145,6 +149,11 @@ def reduce_claude_events(
                     prefix = "Tool error" if block.get("is_error") else "Tool result"
                     snapshot = replace(
                         snapshot,
+                        command_result=(
+                            Claim.exact(text or "Tool failed this turn", "tool_result", tool_id)
+                            if block.get("is_error")
+                            else Claim(None, Provenance.STRUCTURAL, "tool_result", tool_id)
+                        ),
                         recent=append_recent(
                             snapshot.recent,
                             f"{prefix}: {text}",
@@ -162,6 +171,7 @@ def reduce_claude_events(
             request = Claim.exact(text, "human_message")
             snapshot = replace(
                 snapshot,
+                command_result=Claim(None, Provenance.STRUCTURAL, "human_message"),
                 request=request,
                 recent=append_recent(
                     snapshot.recent, f"Human: {text}", Provenance.EXACT, "human_message"

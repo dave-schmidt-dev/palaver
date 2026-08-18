@@ -1,4 +1,4 @@
-"""`palaver ui`: manage explicit pane-to-session pins without focusing panes.
+"""`palaver ui`: manage pane pins and companion enablement without focusing panes.
 
 The status-bar experiment was rejected. This command remains because an
 explicit pane pin is useful to the future companion-pane surface when a
@@ -13,13 +13,19 @@ import sys
 from collections.abc import Awaitable, Callable
 from typing import Any, TextIO
 
+from palaver.ui.autolaunch import STATE_DIR
+from palaver.ui.companion import CompanionController, make_metadata_reader
 from palaver.ui.connection import UiConnectionError, import_iterm2, preflight
 from palaver.ui.pane_join import CLAUDE_SOURCE, CODEX_SOURCE, PIN_VARIABLE
 
 NAME = "ui"
-HELP = "pin an iTerm2 pane to a known agent session"
+HELP = "manage an iTerm2 pane's session pin or companion"
 
 SetVariable = Callable[[str, str, Any], Awaitable[None]]
+
+
+def _stderr_status(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def make_variable_writer(connection: Any) -> SetVariable:
@@ -68,18 +74,29 @@ def add_arguments(parser) -> None:
         help="pin the pane to SOURCE and SESSION_KEY without focusing it",
     )
     parser.add_argument("--clear-pin", action="store_true", help="clear the pane's explicit pin")
+    parser.add_argument(
+        "--enable-companion", action="store_true", help="enable the companion for the named pane"
+    )
+    parser.add_argument(
+        "--disable-companion", action="store_true", help="disable and close its companion"
+    )
 
 
 def run(args, *, out: TextIO | None = None) -> int:
-    """Set or clear a pane pin, returning 2 for invalid CLI combinations."""
+    """Apply requested pane pin and companion lifecycle actions."""
     out = sys.stdout if out is None else out
     pin = args.pin
     clear_pin = args.clear_pin
+    enable = args.enable_companion
+    disable = args.disable_companion
     if pin and clear_pin:
         print("palaver ui: --pin and --clear-pin contradict each other", file=out)
         return 2
-    if not (pin or clear_pin):
-        print("palaver ui: nothing to do; pass --session with --pin or --clear-pin", file=out)
+    if enable and disable:
+        print("palaver ui: --enable-companion and --disable-companion contradict", file=out)
+        return 2
+    if not (pin or clear_pin or enable or disable):
+        print("palaver ui: nothing to do; pass --session with a pin or companion action", file=out)
         return 2
     if not args.session:
         print("palaver ui: --pin/--clear-pin requires --session PANE_ID", file=out)
@@ -97,18 +114,36 @@ def run(args, *, out: TextIO | None = None) -> int:
     writer_result: list[str] = []
 
     async def main(connection: Any) -> None:
-        writer = make_variable_writer(connection)
         if clear_pin:
+            writer = make_variable_writer(connection)
             await set_session_pin(writer, args.session)
             writer_result.append(f"cleared pin for pane {args.session}")
-        else:
+        elif pin:
+            writer = make_variable_writer(connection)
             await set_session_pin(writer, args.session, source=pin[0], session_key=pin[1])
             writer_result.append(f"pinned pane {args.session} to {pin[0]} {pin[1]}")
+        if enable or disable:
+            iterm2 = import_iterm2()
+            app = await iterm2.async_get_app(connection)
+            controller = CompanionController(
+                STATE_DIR,
+                read_metadata=make_metadata_reader(connection),
+                on_status=_stderr_status,
+            )
+            await controller.reconcile(app, create=False)
+            changed = await controller.set_enabled(app, args.session, enabled=enable)
+            if not changed:
+                raise RuntimeError(f"pane {args.session} does not exist")
+            if enable:
+                await controller.reconcile(app, only_agent_id=args.session)
+            writer_result.append(
+                f"{'enabled' if enable else 'disabled'} companion for pane {args.session}"
+            )
 
     try:
         import_iterm2().run_until_complete(main)
     except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
         print(f"palaver ui: could not attach to iTerm2: {exc}", file=out)
         return 1
-    print(writer_result[0], file=out)
+    print("; ".join(writer_result), file=out)
     return 0

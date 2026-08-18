@@ -252,10 +252,12 @@ class CompanionController:
         """Return a copy of the current agent-keyed pair map."""
         return dict(self._pairs)
 
-    async def reconcile(self, app: Any) -> ReconcileResult:
+    async def reconcile(
+        self, app: Any, *, create: bool = True, only_agent_id: str | None = None
+    ) -> ReconcileResult:
         """Make current iTerm state agree with the companion ownership rules."""
         async with self._lock:
-            return await self._reconcile_locked(app)
+            return await self._reconcile_locked(app, create=create, only_agent_id=only_agent_id)
 
     async def _inventory(self, app: Any) -> dict[str, SessionMetadata]:
         found: dict[str, SessionMetadata] = {}
@@ -271,7 +273,9 @@ class CompanionController:
                         found[metadata.session_id] = metadata
         return found
 
-    async def _reconcile_locked(self, app: Any) -> ReconcileResult:
+    async def _reconcile_locked(
+        self, app: Any, *, create: bool, only_agent_id: str | None
+    ) -> ReconcileResult:
         inventory = await self._inventory(app)
         companions = {
             pane_id: metadata
@@ -354,9 +358,11 @@ class CompanionController:
                                 f"could not remove orphan state for {companion.agent_session}"
                             )
 
-        table: ProcessTable = self._read_process_table()
+        table: ProcessTable | None = None
         for agent_id, agent in sorted(agents.items()):
             if agent_id in pairs or agent.disabled:
+                continue
+            if not create or (only_agent_id is not None and agent_id != only_agent_id):
                 continue
             if agent.companion_session and agent_id not in restarting:
                 # A missing reciprocal peer represents a user-closed pane.
@@ -367,14 +373,19 @@ class CompanionController:
             if self._clock() < self._retry_after.get(agent_id, 0.0):
                 refused.append(agent_id)
                 continue
+            if table is None:
+                self._on_status("reading process table for companion reconciliation")
+                table = await asyncio.to_thread(self._read_process_table)
             kwargs: dict[str, Any] = {"table": table}
             if self._cwd_reader is not None:
                 kwargs["cwd_reader"] = self._cwd_reader
-            detected = self._detect(agent.pane, **kwargs)
+            self._on_status(f"probing supported process for pane {agent_id}")
+            detected = await asyncio.to_thread(self._detect, agent.pane, **kwargs)
             if detected is None:
                 refused.append(agent_id)
                 continue
-            joined = self._join(agent.pane, **kwargs)
+            self._on_status(f"joining transcript for pane {agent_id}")
+            joined = await asyncio.to_thread(self._join, agent.pane, **kwargs)
             pair = await self._create(app, agent, detected, joined)
             if pair is None:
                 refused.append(agent_id)
@@ -407,7 +418,8 @@ class CompanionController:
         if agent.session.grid_size.height < SUMMARY_ROWS + MIN_AGENT_ROWS:
             return None
         state_path = opaque_state_path(self.state_dir, agent.session_id)
-        self._write_initial_state(state_path, detected, joined)
+        self._on_status(f"writing initial companion state for {agent.session_id}")
+        await asyncio.to_thread(self._write_initial_state, state_path, detected, joined)
         command = companion_command(state_path)
         profile = self._profile_builder(command)
         companion = None
@@ -434,6 +446,22 @@ class CompanionController:
             self._restart_attempts.pop(agent.session_id, None)
             self._retry_after.pop(agent.session_id, None)
             return CompanionPair(agent.session_id, companion.session_id, state_path)
+        except asyncio.CancelledError:
+            if companion is not None:
+                self._manager_closing.add(companion.session_id)
+                try:
+                    await companion.async_close(force=True)
+                except Exception:
+                    pass
+            try:
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+            except Exception:
+                pass
+            try:
+                state_path.unlink(missing_ok=True)
+            except OSError:
+                self._on_status(f"could not remove partial companion state for {agent.session_id}")
+            raise
         except Exception:
             self._record_restart_failure(agent.session_id)
             if companion is not None:
@@ -510,6 +538,19 @@ class CompanionController:
             agent = app.get_session_by_id(agent_id)
             if agent is None:
                 return False
+            inventory = await self._inventory(app)
+            metadata = inventory.get(agent_id)
+            if metadata is None or metadata.is_companion:
+                return False
+            if agent_id not in self._pairs:
+                self._on_status(f"validating companion target {agent_id}")
+                table = await asyncio.to_thread(self._read_process_table)
+                kwargs: dict[str, Any] = {"table": table}
+                if self._cwd_reader is not None:
+                    kwargs["cwd_reader"] = self._cwd_reader
+                detected = await asyncio.to_thread(self._detect, metadata.pane, **kwargs)
+                if detected is None:
+                    return False
             await agent.async_set_variable(DISABLED_VARIABLE, not enabled)
             if enabled:
                 await agent.async_set_variable(COMPANION_SESSION_VARIABLE, "")

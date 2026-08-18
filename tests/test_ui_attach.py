@@ -40,6 +40,7 @@ from palaver.ui.autolaunch import (
     attach_existing,
     install_shim,
     render_shim,
+    watch_layout_changes,
     watch_new_sessions,
     watch_terminations,
 )
@@ -355,6 +356,105 @@ def test_closed_panes_are_forgotten(monkeypatch):
     assert registry.attached == frozenset({"b"})
 
 
+def test_termination_callback_runs_even_when_registry_missed_the_owned_pane(monkeypatch):
+    monkeypatch.setattr(
+        autolaunch, "import_iterm2", lambda: _stub_iterm2(terminated_ids=["companion"])
+    )
+    seen = []
+    asyncio.run(
+        watch_terminations(
+            object(), SessionRegistry(), on_detach=lambda pane_id: seen.append(pane_id), limit=1
+        )
+    )
+    assert seen == ["companion"]
+
+
+def test_layout_burst_is_trailing_edge_debounced(monkeypatch):
+    monitor = _StubMonitor([1, 2, 3])
+    monkeypatch.setattr(
+        autolaunch,
+        "import_iterm2",
+        lambda: types.SimpleNamespace(LayoutChangeMonitor=lambda _conn: monitor),
+    )
+    monkeypatch.setattr(autolaunch, "LAYOUT_DEBOUNCE_SECONDS", 0)
+    calls = []
+    asyncio.run(
+        watch_layout_changes(object(), on_change=lambda: calls.append("reconcile"), limit=3)
+    )
+    assert calls == ["reconcile"]
+
+
+def test_layout_event_during_reconcile_schedules_serial_followup(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SplitMonitor(_StubMonitor):
+        async def async_get(self):
+            if self._ids[0] == 2:
+                await started.wait()
+            return await super().async_get()
+
+    monitor = SplitMonitor([1, 2])
+    monkeypatch.setattr(
+        autolaunch,
+        "import_iterm2",
+        lambda: types.SimpleNamespace(LayoutChangeMonitor=lambda _conn: monitor),
+    )
+    monkeypatch.setattr(autolaunch, "LAYOUT_DEBOUNCE_SECONDS", 0)
+    calls = []
+
+    async def reconcile():
+        calls.append("start")
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+        calls.append("end")
+
+    async def drive():
+        task = asyncio.create_task(watch_layout_changes(object(), on_change=reconcile, limit=2))
+        await started.wait()
+        await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(drive())
+    assert calls == ["start", "end", "start", "end"]
+
+
+def test_layout_watcher_cancellation_awaits_its_debounce_workers(monkeypatch):
+    delivered = asyncio.Event()
+
+    class BlockingMonitor(_StubMonitor):
+        async def async_get(self):
+            if self._ids:
+                delivered.set()
+                return self._ids.pop(0)
+            await asyncio.Event().wait()
+
+    monitor = BlockingMonitor([1])
+    monkeypatch.setattr(
+        autolaunch,
+        "import_iterm2",
+        lambda: types.SimpleNamespace(LayoutChangeMonitor=lambda _conn: monitor),
+    )
+
+    async def drive():
+        task = asyncio.create_task(watch_layout_changes(object(), on_change=lambda: None))
+        await delivered.wait()
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        current = asyncio.current_task()
+        assert [
+            item for item in asyncio.all_tasks() if item is not current and not item.done()
+        ] == []
+
+    asyncio.run(drive())
+
+
 def test_the_monitors_are_entered_as_context_managers(monkeypatch):
     """Not entering them means iTerm2 is never subscribed and nothing fires."""
     monitor = _StubMonitor(["a"])
@@ -396,8 +496,7 @@ def test_the_two_monitors_run_concurrently_rather_than_in_turn(monkeypatch):
     assert registry.attached == frozenset({"new"})
 
 
-def test_autolaunch_main_attaches_existing_and_runs_both_lifecycle_monitors(monkeypatch):
-    """The retained AutoLaunch path discovers panes without publishing UI state."""
+def test_autolaunch_reconciles_before_all_monitors_and_runs_updates(monkeypatch):
     app = types.SimpleNamespace(
         terminal_windows=(
             types.SimpleNamespace(
@@ -409,18 +508,51 @@ def test_autolaunch_main_attaches_existing_and_runs_both_lifecycle_monitors(monk
     async def async_get_app(_connection):
         return app
 
+    events = []
+
+    class Controller:
+        pairs = {}
+
+        async def reconcile(self, _app):
+            events.append("reconcile")
+
+        async def handle_termination(self, _app, pane_id):
+            events.append(f"terminated:{pane_id}")
+
+    class Updater:
+        async def run(self, _app, _controller, *, limit):
+            events.append("update")
+
+    class Monitor(_StubMonitor):
+        async def __aenter__(self):
+            assert events[0] == "reconcile"
+            return await super().__aenter__()
+
     monkeypatch.setattr(
         autolaunch,
         "import_iterm2",
         lambda: types.SimpleNamespace(
             async_get_app=async_get_app,
-            NewSessionMonitor=lambda _conn: _StubMonitor(["new"]),
-            SessionTerminationMonitor=lambda _conn: _StubMonitor(["old"]),
+            NewSessionMonitor=lambda _conn: Monitor(["new"]),
+            SessionTerminationMonitor=lambda _conn: Monitor(["old"]),
+            LayoutChangeMonitor=lambda _conn: Monitor(["layout"]),
         ),
     )
+    monkeypatch.setattr(autolaunch, "LAYOUT_DEBOUNCE_SECONDS", 0)
 
-    registry = asyncio.run(autolaunch.main(object(), limit=1))
+    registry = asyncio.run(
+        autolaunch.main(
+            object(),
+            limit=1,
+            controller=Controller(),
+            updater=Updater(),
+            reconcile_cadence=0,
+        )
+    )
     assert registry.attached == frozenset({"new"})
+    assert "update" in events
+    assert "terminated:old" in events
+    assert events.count("reconcile") >= 2, "periodic self-heal must close startup subscription gaps"
 
 
 # --- the shim --------------------------------------------------------------
@@ -463,6 +595,12 @@ def test_the_shim_spawns_the_interpreter_palaver_is_installed_into():
         "'/opt/pythons/3.14/bin/python3'" in source
     )
     assert '"-m", MODULE' in source
+
+
+def test_the_shim_pins_the_child_to_the_project_local_state_root():
+    source = render_shim(project_root=Path("/project/palaver"))
+    assert "CWD = '/project/palaver'" in source
+    assert "cwd=CWD" in source
 
 
 def test_the_shim_passes_the_cookie_by_environment_and_never_by_argv():
@@ -573,6 +711,46 @@ def test_pin_cli_writes_named_pane_without_focus_or_selection_calls():
     assert all(call[1] == PIN_VARIABLE for call in writes.calls)
     source = inspect.getsource(cli_ui.set_session_pin)
     assert all(token not in source for token in (".focus(", ".select(", ".activate("))
+
+
+@pytest.mark.parametrize(
+    ("flag", "enabled"), [("enable_companion", True), ("disable_companion", False)]
+)
+def test_companion_cli_action_works_without_a_pin(monkeypatch, flag, enabled):
+    calls = []
+
+    class Controller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def reconcile(self, _app, **kwargs):
+            calls.append(("reconcile", kwargs))
+
+        async def set_enabled(self, _app, pane_id, *, enabled):
+            calls.append(("enabled", pane_id, enabled))
+            return True
+
+    async def async_get_app(_connection):
+        return object()
+
+    module = types.SimpleNamespace(
+        async_get_app=async_get_app,
+        run_until_complete=lambda callback: asyncio.run(callback(object())),
+    )
+    monkeypatch.setattr(cli_ui, "preflight", lambda: None)
+    monkeypatch.setattr(cli_ui, "import_iterm2", lambda: module)
+    monkeypatch.setattr(cli_ui, "CompanionController", Controller)
+    monkeypatch.setattr(cli_ui, "make_metadata_reader", lambda _connection: None)
+    args = types.SimpleNamespace(
+        session="agent",
+        pin=None,
+        clear_pin=False,
+        enable_companion=flag == "enable_companion",
+        disable_companion=flag == "disable_companion",
+    )
+    assert cli_ui.run(args) == 0
+    assert ("enabled", "agent", enabled) in calls
+    assert calls[0] == ("reconcile", {"create": False})
 
 
 # --- live iTerm2 -----------------------------------------------------------

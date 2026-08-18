@@ -38,6 +38,8 @@ import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from palaver.ui.companion import CompanionController, make_metadata_reader
+from palaver.ui.companion_update import CompanionUpdater
 from palaver.ui.connection import (
     COOKIE_ENV,
     KEY_ENV,
@@ -63,6 +65,9 @@ SHIM_MAX_BACKOFF = 60
 #: How the shim identifies itself when asking iTerm2 for a cookie. iTerm2
 #: shows this name in its API-permission UI, so it is user-facing.
 ADVISORY_NAME = "palaver"
+STATE_DIR = Path.cwd() / ".state" / "companions"
+LAYOUT_DEBOUNCE_SECONDS = 0.25
+RECONCILE_SECONDS = 5.0
 
 
 class SessionRegistry:
@@ -219,6 +224,7 @@ async def watch_terminations(
     connection,
     registry: SessionRegistry,
     *,
+    on_detach: Callable[[str], object] | None = None,
     on_status: Callable[[str], None] = _no_status,
     limit: int | None = None,
 ) -> int:
@@ -241,10 +247,78 @@ async def watch_terminations(
         while limit is None or seen < limit:
             session_id = await monitor.async_get()
             seen += 1
+            if session_id and on_detach is not None:
+                result = on_detach(session_id)
+                if asyncio.iscoroutine(result):
+                    await result
             if session_id and registry.detach(session_id):
                 detached += 1
                 on_status(f"pane closed ({len(registry)} attached)")
     return detached
+
+
+async def watch_layout_changes(
+    connection,
+    *,
+    on_change: Callable[[], object],
+    on_status: Callable[[str], None] = _no_status,
+    limit: int | None = None,
+) -> int:
+    """Debounce iTerm layout events before reconciling companion ownership."""
+    iterm2 = import_iterm2()
+    seen = 0
+    changed = asyncio.Event()
+    producer_done = asyncio.Event()
+
+    async def produce(monitor) -> None:
+        nonlocal seen
+        try:
+            while limit is None or seen < limit:
+                await monitor.async_get()
+                seen += 1
+                changed.set()
+                on_status("layout changed; debouncing companion reconciliation")
+        finally:
+            producer_done.set()
+
+    async def consume() -> None:
+        while True:
+            await changed.wait()
+            changed.clear()
+            while True:
+                await asyncio.sleep(LAYOUT_DEBOUNCE_SECONDS)
+                if not changed.is_set():
+                    break
+                changed.clear()
+            result = on_change()
+            if asyncio.iscoroutine(result):
+                await result
+            if producer_done.is_set() and not changed.is_set():
+                return
+
+    async with iterm2.LayoutChangeMonitor(connection) as monitor:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(produce(monitor))
+            group.create_task(consume())
+    return seen
+
+
+async def reconcile_forever(
+    app,
+    controller,
+    *,
+    on_status: Callable[[str], None] = _no_status,
+    cadence: float = RECONCILE_SECONDS,
+    limit: int | None = None,
+) -> int:
+    """Periodically repair lifecycle events missed during monitor subscription."""
+    ticks = 0
+    while limit is None or ticks < limit:
+        on_status(f"companion self-heal sleeping {cadence:g}s")
+        await asyncio.sleep(cadence)
+        await controller.reconcile(app)
+        ticks += 1
+    return ticks
 
 
 async def main(
@@ -254,6 +328,10 @@ async def main(
     on_attach: Callable[[str], object] | None = None,
     on_status: Callable[[str], None] = _no_status,
     limit: int | None = None,
+    state_dir: Path = STATE_DIR,
+    controller: CompanionController | None = None,
+    updater: CompanionUpdater | None = None,
+    reconcile_cadence: float = RECONCILE_SECONDS,
 ) -> SessionRegistry:
     """Attach to every pane and keep the registry current.
 
@@ -270,16 +348,68 @@ async def main(
     iterm2 = import_iterm2()
     registry = SessionRegistry() if registry is None else registry
     app = await iterm2.async_get_app(connection)
+    if controller is None or updater is None:
+        metadata_reader = make_metadata_reader(connection)
+    if controller is None:
+        controller = CompanionController(
+            state_dir, read_metadata=metadata_reader, on_status=on_status
+        )
+    if updater is None:
+        updater = CompanionUpdater(read_metadata=metadata_reader, on_status=on_status)
+    on_status("reconciling existing companion panes")
+    await controller.reconcile(app)
     await attach_existing(app, registry, on_attach=on_attach, on_status=on_status)
+
     # Gathered rather than sequenced: a pane can close while another opens,
     # and awaiting one monitor at a time would hold the other's events until
     # the first happened to fire.
-    await asyncio.gather(
-        watch_new_sessions(
-            connection, registry, on_attach=on_attach, on_status=on_status, limit=limit
-        ),
-        watch_terminations(connection, registry, on_status=on_status, limit=limit),
-    )
+    async def attach_and_reconcile(session_id: str) -> None:
+        if on_attach is not None:
+            result = on_attach(session_id)
+            if asyncio.iscoroutine(result):
+                await result
+        await controller.reconcile(app)
+
+    async def detach_and_reconcile(session_id: str) -> None:
+        await controller.handle_termination(app, session_id)
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(
+            watch_new_sessions(
+                connection,
+                registry,
+                on_attach=attach_and_reconcile,
+                on_status=on_status,
+                limit=limit,
+            )
+        )
+        group.create_task(
+            watch_terminations(
+                connection,
+                registry,
+                on_detach=detach_and_reconcile,
+                on_status=on_status,
+                limit=limit,
+            )
+        )
+        group.create_task(
+            watch_layout_changes(
+                connection,
+                on_change=lambda: controller.reconcile(app),
+                on_status=on_status,
+                limit=limit,
+            )
+        )
+        group.create_task(updater.run(app, controller, limit=limit))
+        group.create_task(
+            reconcile_forever(
+                app,
+                controller,
+                on_status=on_status,
+                cadence=reconcile_cadence,
+                limit=limit,
+            )
+        )
     return registry
 
 
