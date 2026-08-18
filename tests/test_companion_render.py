@@ -20,6 +20,7 @@ import pytest
 
 from palaver.ui import companion_render
 from palaver.ui.companion_render import (
+    _LABEL_WIDTH,
     ENTER_SCREEN,
     LEAVE_SCREEN,
     TerminalSession,
@@ -70,42 +71,76 @@ def _strip_ansi(value: str | bytes) -> str | bytes:
 
 
 def test_golden_frame_20_by_2_prioritizes_request():
-    assert _frame_text(_state(), 20, 2) == ("PALAVER WORKING Alp…\r\nREQUEST ship        ")
+    assert _frame_text(_state(), 20, 2) == ("PALAVER  WORKING  A…\r\nREQUEST  ship compa…")
 
 
 def test_golden_frame_40_by_4_uses_latest_activity_and_question():
     assert _frame_text(_state(), 40, 4) == (
-        "PALAVER WORKING Alpha Project           \r\n"
-        "REQUEST ship companion panes            \r\n"
-        "NOW updated plan                        \r\n"
-        "ASK deploy now?                         "
+        "PALAVER  WORKING  Alpha Project · codex \r\n"
+        "REQUEST  ship companion panes           \r\n"
+        "NOW      updated plan                   \r\n"
+        "ASK      deploy now?                    "
     )
 
 
-def test_golden_frame_80_by_6_shows_full_priority_order():
+def test_golden_frame_80_by_6_shows_every_section_once():
     assert _frame_text(_state(), 80, 6) == (
-        "PALAVER WORKING Alpha Project                                                   \r\n"
-        "REQUEST ship companion panes                                                    \r\n"
-        "NOW updated plan                                                                \r\n"
-        "ASK deploy now?                                                                 \r\n"
-        "TASKS render · verify                                                           \r\n"
-        "DETAIL exact pane joined                                                        "
+        "PALAVER  WORKING  Alpha Project · codex                                         \r\n"
+        "REQUEST  ship companion panes                                                   \r\n"
+        "NOW      updated plan                                                           \r\n"
+        "TASKS    render                                                                 \r\n"
+        "ASK      deploy now?                                                            \r\n"
+        "COMMAND  tests are passing                                                      "
     )
 
 
-def test_command_occupies_question_row_only_when_no_question_exists():
-    frame = _frame_text(_state(questions=()), 80, 6)
-    assert "COMMAND tests are passing" in frame
-    assert "ASK " not in frame
+def test_golden_frame_80_by_10_grows_lists_under_one_label():
+    assert _frame_text(_state(), 80, 10) == (
+        "PALAVER  WORKING  Alpha Project · codex                                         \r\n"
+        "REQUEST  ship companion panes                                                   \r\n"
+        "NOW      updated plan                                                           \r\n"
+        "         parsed tool result                                                     \r\n"
+        "TASKS    render                                                                 \r\n"
+        "         verify                                                                 \r\n"
+        "ASK      deploy now?                                                            \r\n"
+        "COMMAND  tests are passing                                                      \r\n"
+        "DETAIL   exact pane joined                                                      \r\n"
+        "                                                                                "
+    )
+
+
+def test_spare_rows_go_to_recent_activity_newest_first():
+    busy = _state(recent=tuple(f"step {index}" for index in range(MAX_ITEMS)))
+    rows = _frame_text(busy, 40, 10).split("\r\n")
+    assert rows[2].startswith("NOW      ")
+    assert [row[_LABEL_WIDTH:].strip() for row in rows[2:5]] == ["step 7", "step 6", "step 5"]
+    assert [row.split()[0] for row in rows[5:]] == ["TASKS", "verify", "ASK", "COMMAND", "DETAIL"]
+    taller = _frame_text(busy, 40, 12).split("\r\n")
+    assert [row[_LABEL_WIDTH:].strip() for row in taller[2:7]] == [
+        f"step {n}" for n in (7, 6, 5, 4, 3)
+    ]
+
+
+def test_a_question_and_a_command_result_no_longer_compete_for_one_row():
+    frame = _frame_text(_state(), 80, 10)
+    assert "ASK      deploy now?" in frame
+    assert "COMMAND  tests are passing" in frame
+
+
+def test_the_detail_row_appears_only_when_the_producer_supplied_one():
+    joined = _frame_text(_state(detail=None), 80, 10)
+    assert "DETAIL" not in joined
+    unjoined = _state(detail="Waiting for an exact session join", join_state=JoinState.UNJOINED)
+    assert "DETAIL   Waiting for an exact session join" in _frame_text(unjoined, 80, 10)
 
 
 def test_join_and_stale_states_override_model_status():
     unjoined = _state(join_state=JoinState.UNJOINED, status="done")
-    assert "PALAVER UNJOINED" in _frame_text(unjoined, 40, 2)
-    assert "PALAVER STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=200).decode())
-    assert "PALAVER STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=0).decode())
+    assert "PALAVER  UNJOINED" in _frame_text(unjoined, 40, 2)
+    assert "PALAVER  STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=200).decode())
+    assert "PALAVER  STALE" in _strip_ansi(render_frame(unjoined, 40, 2, now=0).decode())
     failed = _state(join_state=JoinState.ERROR, status="working")
-    assert "PALAVER ERROR" in _frame_text(failed, 40, 2)
+    assert "PALAVER  ERROR" in _frame_text(failed, 40, 2)
 
 
 @pytest.mark.parametrize(
@@ -148,13 +183,12 @@ def test_control_and_ansi_sequences_are_removed_not_rendered():
     assert b"[31m" not in frame
 
 
-def test_payload_wraps_to_cells_and_only_owned_tokens_are_colored():
+def test_payload_clips_to_cells_and_only_owned_tokens_are_colored():
     state = _state(request="first 界 second third", status="done", project="user text")
     frame = render_frame(state, 16, 5, now=101).decode()
     plain = _strip_ansi(frame)
     rows = plain.split("\r\n")
-    assert rows[1] == "REQUEST first 界"
-    assert rows[2].startswith("        second")
+    assert rows[1] == "REQUEST  first …"
     assert all(cell_width(row) == 16 for row in rows)
     assert b"\x1b[36mPALAVER" in frame.encode()
     assert b"\x1b[32mDONE" in frame.encode()
@@ -304,7 +338,7 @@ def test_pty_redraws_at_new_width_after_sigwinch(tmp_path):
     _read_until(master, b"A very long project name")
     _set_size(slave, 20, 4)
     process.send_signal(signal.SIGWINCH)
-    resized = _read_until(master, "PALAVER WORKING A v…".encode())
+    resized = _read_until(master, "PALAVER  WORKING  A…".encode())
     assert b"A very long project name" not in resized
     _stop_renderer(process, master, slave)
 
@@ -312,14 +346,14 @@ def test_pty_redraws_at_new_width_after_sigwinch(tmp_path):
 def test_pty_marks_a_quiet_producer_stale_without_another_write(tmp_path):
     path = tmp_path / "state.json"
     process, master, slave = _start_renderer(path)
-    _read_until(master, b"PALAVER ERROR")
+    _read_until(master, b"PALAVER  ERROR")
     crossing = time.time() - companion_render.STALE_AFTER_SECONDS + 1.0
     atomic_write_state(path, _state(updated=crossing))
-    initial = _read_until(master, b"PALAVER WORKING")
+    initial = _read_until(master, b"PALAVER  WORKING")
     assert b"STALE" not in initial
     written_stamp = path.stat().st_mtime_ns
-    transitioned = _read_until(master, b"PALAVER STALE", timeout=3)
-    assert b"PALAVER STALE" in _strip_ansi(transitioned)
+    transitioned = _read_until(master, b"PALAVER  STALE", timeout=3)
+    assert b"PALAVER  STALE" in _strip_ansi(transitioned)
     assert path.stat().st_mtime_ns == written_stamp
     _stop_renderer(process, master, slave)
 
@@ -327,13 +361,13 @@ def test_pty_marks_a_quiet_producer_stale_without_another_write(tmp_path):
 def test_pty_recovers_from_missing_then_malformed_then_valid_state(tmp_path):
     path = tmp_path / "state.json"
     process, master, slave = _start_renderer(path)
-    _read_until(master, b"PALAVER ERROR")
+    _read_until(master, b"PALAVER  ERROR")
     path.write_text("{bad", encoding="utf-8")
     time.sleep(0.15)
     assert process.poll() is None
     atomic_write_state(path, _state(updated=time.time(), status="done"))
-    recovered = _read_until(master, b"PALAVER DONE")
-    assert b"PALAVER DONE" in _strip_ansi(recovered)
+    recovered = _read_until(master, b"PALAVER  DONE")
+    assert b"PALAVER  DONE" in _strip_ansi(recovered)
     _stop_renderer(process, master, slave)
 
 

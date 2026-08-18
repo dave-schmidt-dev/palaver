@@ -11,10 +11,16 @@ import sys
 import termios
 import time
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-from palaver.ui.companion_state import CompanionState, CompanionStateError, JoinState, read_state
+from palaver.ui.companion_state import (
+    MAX_ITEMS,
+    CompanionState,
+    CompanionStateError,
+    JoinState,
+    read_state,
+)
 
 POLL_INTERVAL_SECONDS = 0.1
 STALE_AFTER_SECONDS = 10.0
@@ -120,83 +126,82 @@ def _take_cells(value: str, width: int) -> tuple[str, str]:
     return value, ""
 
 
-def _wrap_words(value: str, width: int) -> list[str]:
-    """Wrap normalized text to terminal cells, splitting overlong words."""
+def _nonempty(*values: str | None) -> tuple[str, ...]:
+    """Keep only the values that would put something on screen."""
 
-    if width <= 0:
-        return []
-    words = value.split()
+    return tuple(value for value in values if value and value.strip())
+
+
+def _section_items(state: CompanionState) -> dict[str, tuple[str, ...]]:
+    """Return each labeled section's items, in the order they should be read.
+
+    ``recent`` is stored oldest-first and is reversed here so NOW's first row
+    is always the newest activity. That keeps the row honest in a pane only
+    tall enough for one of them, and stops a resize from changing which end
+    of the history the label refers to.
+    """
+
+    return {
+        "REQUEST": _nonempty(state.request),
+        "NOW": _nonempty(*reversed(state.recent)),
+        "TASKS": _nonempty(*state.tasks),
+        "ASK": _nonempty(*state.questions),
+        "COMMAND": _nonempty(state.command_result),
+        "DETAIL": _nonempty(state.detail),
+    }
+
+
+# Every section with content earns its first row in this order, so a two-line
+# pane still shows the request and a four-line one still reaches the question.
+_ROW_ORDER = ("REQUEST", "NOW", "ASK", "TASKS", "COMMAND", "DETAIL")
+# Spare rows then go to the sections that hold lists, smallest appetite first,
+# and NOW absorbs whatever is left because it is the only open-ended one.
+_GROWTH_ORDER = ("ASK", "TASKS", "NOW")
+_GROWTH_CAPS = {"ASK": 2, "TASKS": 3, "NOW": MAX_ITEMS}
+# Reading order down the pane, which is deliberately not the order above.
+_DISPLAY_ORDER = ("REQUEST", "NOW", "TASKS", "ASK", "COMMAND", "DETAIL")
+# The widest label plus the gutter that lines every section's items up.
+_LABEL_WIDTH = 9
+
+
+def _allocate_rows(items: Mapping[str, Sequence[str]], rows: int) -> dict[str, int]:
+    """Divide the available content rows among the sections that have any."""
+
+    counts = dict.fromkeys(items, 0)
+    remaining = max(0, rows)
+    for label in _ROW_ORDER:
+        if remaining <= 0:
+            break
+        if items[label]:
+            counts[label] = 1
+            remaining -= 1
+    for label in _GROWTH_ORDER:
+        if remaining <= 0:
+            break
+        if not counts[label]:
+            continue
+        allowed = min(counts[label] + remaining, len(items[label]), _GROWTH_CAPS[label])
+        remaining -= allowed - counts[label]
+        counts[label] = allowed
+    return counts
+
+
+def _content_lines(state: CompanionState, width: int, rows: int) -> list[str]:
+    """Lay the sections out as one clipped row per item under a single label."""
+
+    items = _section_items(state)
+    counts = _allocate_rows(items, rows)
+    gutter = min(_LABEL_WIDTH, max(1, width))
+    value_width = width - gutter
     lines: list[str] = []
-    current = ""
-    for word in words:
-        chunks: list[str] = []
-        remainder = word
-        while remainder:
-            chunk, remainder = _take_cells(remainder, width)
-            if not chunk:
-                chunk, remainder = remainder[:1], remainder[1:]
-            chunks.append(chunk)
-        if len(chunks) > 1:
-            if current:
-                lines.append(current)
-                current = ""
-            lines.extend(chunks[:-1])
-            current = chunks[-1]
-            continue
-        candidate = word if not current else f"{current} {word}"
-        if not current or cell_width(candidate) <= width:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+    for label in _DISPLAY_ORDER:
+        for index, value in enumerate(items[label][: counts[label]]):
+            prefix = label.ljust(gutter) if index == 0 else " " * gutter
+            if value_width <= 0:
+                lines.append(prefix)
+            else:
+                lines.append(prefix + clip_cells(value, value_width))
     return lines
-
-
-def _line(label: str, value: str | None) -> str | None:
-    if value is None or not value.strip():
-        return None
-    return f"{label} {value}"
-
-
-def _joined(values: Sequence[str]) -> str | None:
-    return " · ".join(values) if values else None
-
-
-def _content_lines(state: CompanionState, width: int | None = None) -> list[str]:
-    latest = state.recent[-1] if state.recent else None
-    connection = state.detail or f"{state.source} · {state.join_state.value.lower()}"
-    candidates = [
-        ("REQUEST", state.request),
-        ("NOW", latest),
-        ("ASK", _joined(state.questions)) if state.questions else ("COMMAND", state.command_result),
-        ("TASKS", _joined(state.tasks)),
-        ("DETAIL", connection),
-    ]
-    if width is None:
-        return [line for label, value in candidates if (line := _line(label, value)) is not None]
-    wrapped: list[str] = []
-    width = max(1, width)
-    for label, value in candidates:
-        if value is None or not value.strip():
-            continue
-        clean_value = sanitize(value)
-        prefix = f"{label} "
-        prefix_width = cell_width(prefix)
-        first_width = width - prefix_width
-        if first_width > 0:
-            value_lines = _wrap_words(clean_value, first_width)
-            first_value = value_lines.pop(0) if value_lines else ""
-            wrapped.append(_take_cells(prefix, width)[0] + first_value)
-            continuation_width = max(1, width - prefix_width)
-            for continuation in value_lines:
-                continuation, _ = _take_cells(continuation, continuation_width)
-                wrapped.append(" " * prefix_width + continuation)
-        else:
-            wrapped.append(_take_cells(prefix, width)[0])
-            wrapped.extend(_wrap_words(clean_value, width))
-    return wrapped
 
 
 _STATUS_COLORS = {
@@ -256,15 +261,16 @@ def render_frame(
         label = state.join_state.value
     else:
         label = state.status.upper()
-    header = f"PALAVER {label} {sanitize(state.project)}"
-    lines = [header, *_content_lines(state, width)]
+    header = f"PALAVER  {label}  {sanitize(state.project)} · {sanitize(state.source)}"
+    lines = [header, *_content_lines(state, width, height - 1)]
     return _encode_frame(lines, width, height)
 
 
 def render_error_frame(detail: str, width: int, height: int) -> bytes:
     """Render a recoverable transport error without exposing its path."""
 
-    return _encode_frame(["PALAVER ERROR", f"DETAIL {sanitize(detail)}"], width, height)
+    body = "DETAIL".ljust(_LABEL_WIDTH) + clip_cells(detail, max(0, width - _LABEL_WIDTH))
+    return _encode_frame(["PALAVER  ERROR", body], width, height)
 
 
 def _encode_frame(lines: Sequence[str], width: int, height: int) -> bytes:

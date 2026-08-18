@@ -478,7 +478,7 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
                 ordered[1].state_path,
                 _snapshot(2, updated=time.time() - STALE_AFTER_SECONDS - 1),
             )
-            await _eventually(lambda: _screen_contains(second_companion, "PALAVER STALE"))
+            await _eventually(lambda: _screen_contains(second_companion, "PALAVER  STALE"))
             atomic_write_state(ordered[1].state_path, _snapshot(2))
 
             # Accidental typing is consumed by the companion and never reaches its agent.

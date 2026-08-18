@@ -13,7 +13,10 @@ from enum import Enum
 from typing import Generic, TypeVar
 
 DISPLAY_TEXT_LIMIT = 240
-RECENT_ACTIVITY_LIMIT = 5
+# The companion pane's activity section is the one that grows into whatever
+# rows the other sections leave unused, so this matches the state schema's
+# per-list ceiling rather than the single row the pane used to spare.
+RECENT_ACTIVITY_LIMIT = 8
 MAX_COLLECTION_ITEMS = 32
 MAX_UNKNOWN_REASONS = 8
 
