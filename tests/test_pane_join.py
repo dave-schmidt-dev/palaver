@@ -59,6 +59,7 @@ from palaver.ui.pane_join import (
     SHELL_NAMES,
     PaneVariables,
     ProcessInfo,
+    _agent_open_store_paths,
     agent_ancestor,
     detect_supported_process,
     encode_pin,
@@ -277,6 +278,124 @@ def test_codex_join_requires_one_exact_recent_root_rollout(tmp_path):
     assert ambiguous.store_path is None
 
 
+def test_codex_ambiguity_narrows_to_the_rollout_the_live_pid_still_has_open(tmp_path):
+    """The measured fix: a stale rollout cannot be what the live pid is writing.
+
+    Reported live (2026-08-19): a project with three recent rollouts left its
+    pane UNJOINED even though only one of them was still open by the pid the
+    pane actually resolved to -- the other two were from codex invocations
+    that had already exited, still inside the one-hour activity window. A
+    candidate the live pid does not hold open is excluded from the write it
+    cannot be performing, narrowing what the cwd+mtime scan alone could not.
+    """
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    live = _codex_rollout(root, cwd, "rollout-live")
+    _codex_rollout(root, cwd, "rollout-exited")
+
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+        open_files_reader=lambda _pid: frozenset({live.resolve()}),
+    )
+    assert joined is not None
+    assert joined.session_key == live.stem
+    assert joined.store_path == live.resolve()
+
+
+def test_codex_ambiguity_is_not_resolved_by_an_empty_or_multi_member_open_set(tmp_path):
+    """The narrowing only trusts an intersection that lands on exactly one.
+
+    Fact 3 in the module docstring measured ten rollouts open on a single
+    codex pid at once, so an fd being open proves nothing by itself -- only
+    ruling every candidate but one *out* is trusted. Neither "the live pid
+    holds nothing under this project open" (an untracked file, or `lsof`
+    unavailable) nor "the live pid holds every candidate open" (the ten-
+    rollout shape) may resolve the pane; both must still refuse exactly as
+    the plain mtime scan did before this fix existed.
+    """
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    first = _codex_rollout(root, cwd, "rollout-a")
+    second = _codex_rollout(root, cwd, "rollout-b")
+
+    def _join_with(open_paths):
+        return join_pane(
+            variables,
+            table=table,
+            cwd_reader=lambda _pid: cwd,
+            store_roots={CODEX_SOURCE: root},
+            now=NOW,
+            open_files_reader=lambda _pid: open_paths,
+        )
+
+    empty = _join_with(frozenset())
+    assert empty is not None
+    assert empty.session_key is None
+
+    both_open = _join_with(frozenset({first.resolve(), second.resolve()}))
+    assert both_open is not None
+    assert both_open.session_key is None
+
+
+def test_codex_ambiguity_narrowing_asks_about_the_agent_pid_not_the_job_pid(tmp_path):
+    """The two fixes in this diff interact: narrowing must ask about `agent.pid`.
+
+    Before the walk-through-a-task-shell fix, a codex pane's `jobPid` and
+    agent pid were always the same pid -- codex is its own foreground job.
+    The task-shell fix makes them diverge for exactly the shape it was
+    written to rescue (`bash test-gate.sh` between the pane's job and
+    `codex`, as in the walk test above), and nothing before this test caught
+    an `open_files_reader` call keyed on the wrong pid: every other narrowing
+    test discards its `_pid` argument, so `job_pid` and `agent.pid` were
+    indistinguishable there. Asking `lsof` about the task shell instead of
+    the agent would silently return nothing and leave a rescuable pane
+    ambiguous again -- so this asserts both the join result and the exact
+    pid `open_files_reader` was called with.
+    """
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(
+        (
+            (700, 600, "python3 scripts/hybrid_verify.py"),
+            (600, 500, "/bin/bash ./app/test-gate.sh --phase native"),
+            (500, 400, "codex"),
+            (400, 1, "-zsh"),
+        )
+    )
+    variables = PaneVariables("codex-pane", 700, "python3", str(cwd))
+    live = _codex_rollout(root, cwd, "rollout-live")
+    _codex_rollout(root, cwd, "rollout-exited")
+    asked_pids: list[int] = []
+
+    def _record_and_narrow(pid):
+        asked_pids.append(pid)
+        return frozenset({live.resolve()})
+
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+        open_files_reader=_record_and_narrow,
+    )
+    assert joined is not None
+    assert joined.pid == 500
+    assert joined.session_key == live.stem
+    assert asked_pids == [500], "narrowing must ask about the agent pid, not jobPid"
+
+
 def test_codex_join_excludes_identity_marked_subagents(tmp_path):
     cwd = tmp_path / "codex-project"
     cwd.mkdir()
@@ -442,6 +561,65 @@ def test_the_walk_stops_at_the_login_shell(project):
     joined = _join(cwd, sessions_root, table=below_the_shell, job_pid=500, job_name="vim")
     assert joined is not None
     assert joined.pid == 450
+
+
+def test_the_walk_climbs_through_a_task_shell_the_agent_itself_spawned(project):
+    """A background command's own shell is not the pane's login shell.
+
+    Both supported agents run shell commands through `bash script.sh` or
+    `zsh -c "..."` -- exactly the shape that left a live quizzler pane
+    UNJOINED (2026-08-19): a backgrounded `./test-gate.sh` invocation put the
+    pane's foreground job several hops below `codex`, crossing one task shell
+    with no login-shell dash. Before this fix `agent_ancestor` stopped at that
+    shell by name alone, the same way it correctly stops at a real login
+    shell, and never found `codex` above it.
+    """
+    cwd, sessions_root = project
+    table = _table(
+        (
+            (700, 600, "python3 scripts/hybrid_verify.py"),
+            (600, 500, "/bin/bash ./app/test-gate.sh --phase native"),
+            (500, 400, "codex"),
+            (400, 1, "-zsh"),
+        )
+    )
+
+    joined = _join(cwd, sessions_root, table=table, job_pid=700, job_name="python3")
+    assert joined is not None
+    assert joined.pid == 500
+    assert joined.source == CODEX_SOURCE
+
+    # Positive control: starting the walk at the task shell itself, one hop
+    # closer to the agent, still finds it.
+    joined_from_shell = _join(cwd, sessions_root, table=table, job_pid=600, job_name="bash")
+    assert joined_from_shell is not None
+    assert joined_from_shell.pid == 500
+
+
+def test_a_hand_started_nested_shell_can_still_climb_to_a_coincidental_agent(project):
+    """The trade-off `agent_ancestor` accepts in exchange for the fix above.
+
+    Not every non-login shell is a task shell an agent spawned -- a shell the
+    *user* starts by hand inside a pane (typing `bash` at their prompt) is
+    also not dash-prefixed. If it happens to sit above an unrelated agent in
+    the same process tree, the walk now climbs through it and reports that
+    agent. Narrower than the false negative this fix closes (agents shell out
+    constantly; users rarely nest an interactive shell whose ancestry passes
+    through a foreign agent), and pinned down here so the trade-off is a
+    decision on record, not a surprise found later.
+    """
+    cwd, sessions_root = project
+    table = _table(
+        (
+            (500, 400, "vim"),
+            (400, 350, "zsh"),  # hand-started inside the pane, not the login shell
+            (350, 1, "claude"),
+        )
+    )
+
+    joined = _join(cwd, sessions_root, table=table, job_pid=500, job_name="vim")
+    assert joined is not None
+    assert joined.pid == 350
 
 
 def test_the_walk_terminates_on_a_cyclic_process_table():
@@ -1126,6 +1304,27 @@ def test_the_real_working_directory_of_this_process_is_readable():
     reaped = subprocess.Popen([sys.executable, "-c", "pass"])
     reaped.wait()
     assert working_directory(reaped.pid) is None
+
+
+@live
+def test_the_real_open_file_scan_finds_a_file_this_process_has_open(tmp_path):
+    """The `lsof -Fn` parsing behind the codex ambiguity narrowing, for real.
+
+    A mocked-only suite would have shipped the narrowing without ever
+    confirming `lsof`'s output shape actually parses on this machine -- the
+    same risk the module docstring names for `ps`. Opening a file this test
+    process controls, in a directory nothing else touches, proves the scan
+    finds it without depending on any codex process being alive right now.
+    """
+    marker = tmp_path / "open-file-marker"
+    with marker.open("w") as handle:
+        handle.write("held open for the duration of the scan\n")
+        handle.flush()
+        assert marker.resolve() in _agent_open_store_paths(os.getpid())
+
+    reaped = subprocess.Popen([sys.executable, "-c", "pass"])
+    reaped.wait()
+    assert _agent_open_store_paths(reaped.pid) == frozenset()
 
 
 @live

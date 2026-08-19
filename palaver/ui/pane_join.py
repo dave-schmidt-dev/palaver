@@ -32,12 +32,19 @@ can actually prove: it must still match the live process table's name for
 `jobPid`, which detects pane variables that have gone stale relative to the
 process that produced them.
 
-**3. The file-descriptor join does not work either.** Codex holds its
-rollout files open, so `lsof` on a codex pane looks like an exact
-pane-to-transcript join — until you count them and find **ten** rollouts open
-at once. Claude Code holds none at all. There is no per-pane transcript
-discriminator on either source, which is why `PaneJoin` resolves the
-*project* and reports `session_candidates` rather than picking one.
+**3. The file-descriptor join does not work alone.** Codex holds its rollout
+files open, so `lsof` on a codex pane looks like an exact pane-to-transcript
+join — until you count them and find **ten** rollouts open at once (session
+history, not just the live thread). Claude Code holds none at all. Neither
+source offers a discriminator that stands on its own, which is why `PaneJoin`
+resolves the *project* and reports `session_candidates` rather than picking
+one from an unambiguous scan. `lsof` still earns its keep as a narrowing
+filter once the cwd+mtime scan is already ambiguous (measured 2026-08-19: a
+project with three recent rollouts narrowed to the one live thread because
+it, and only it, was still open by the resolved agent pid) — the ten-rollout
+finding says a process's open files cannot be trusted *by themselves*, not
+that they carry no information at all. See `_agent_open_store_paths` for how
+that narrowing is used, and its residual pid-reuse race.
 
 What is left is a join on **agreement between two independently-obtained
 values**: the pane says `path`, the agent process's own working directory
@@ -57,7 +64,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,11 +82,16 @@ AGENT_SOURCES: Mapping[str, str] = {
     "opencode": "opencode",
 }
 
-#: Names that end the ancestry walk. An agent started in a pane is a
+#: Names that can end the ancestry walk. An agent started in a pane is a
 #: descendant of that pane's login shell, so anything at or above the shell
 #: belongs to iTerm2 rather than to the pane's work, and a match up there
 #: would be a coincidence rather than a join. `login` is included because
-#: iTerm2 execs the shell through it.
+#: iTerm2 execs the shell through it, and always ends the walk on sight —
+#: see `agent_ancestor`. The other names end the walk only when
+#: `_is_login_shell` also holds, because an agent commonly shells out
+#: through the *same* binaries to run the command whose pane is being
+#: joined (`bash test-gate.sh`, `/bin/zsh -c "npm test"`), and a name match
+#: alone cannot tell that task shell from the pane's own login shell.
 SHELL_NAMES: frozenset[str] = frozenset(
     {"zsh", "bash", "sh", "fish", "tcsh", "csh", "dash", "ksh", "login"}
 )
@@ -188,13 +200,18 @@ class PaneJoin:
         session_candidates: Session ids under `project_key` whose stores
             were written within the activity window, sorted. Possibly empty
             — a pane can be joined to a project before its agent has written
-            anything.
+            anything. Narrowed to a single id when a source-specific
+            discriminator names one: Claude Code's live-process registry
+            (see `registered_session`), or, for Codex, an ambiguous mtime
+            scan narrowed by which rollout the agent pid still holds open
+            (see `_agent_open_store_paths`). Otherwise the full recent-store
+            list, exactly as documented above.
         session_key: The single candidate, or `None` when there is not
             exactly one. `None` is the ordinary outcome for a project with
-            two panes open, and it is a refusal rather than a failure: no
-            evidence available on either source distinguishes two same-project
-            panes (fact 3 in the module docstring), so naming one would be
-            the guess this module exists to avoid.
+            two panes open and no discriminator able to name one, and it is
+            a refusal rather than a failure: guessing among genuinely
+            equally-recent, equally-open candidates is the wrong answer this
+            module exists to avoid.
     """
 
     pane_id: str
@@ -458,13 +475,47 @@ def process_is_alive(pid: int) -> bool:
     return True
 
 
+def _is_login_shell(info: ProcessInfo) -> bool:
+    """Whether `info` is a login shell rather than a task shell spawned to run a command.
+
+    `ps` reports a login shell's `argv[0]` with a leading `-` — literally
+    `-zsh`, never a path (the `-zsh` row throughout this module's fixtures).
+    Confirmed against this machine's live process table (2026-08-19): both a
+    `bash script.sh` invocation and the `/bin/zsh -c "..."` shell Claude Code
+    and Codex spawn for every tool command report their ordinary name with no
+    leading dash. That is the only signal here that distinguishes the two —
+    `info.name` alone cannot, since `process_name` strips the dash before
+    either row reaches this function.
+    """
+    first = info.command.strip().split(" ", 1)[0]
+    return first.startswith("-")
+
+
 def agent_ancestor(job_pid: int, table: ProcessTable) -> ProcessInfo | None:
     """Walk up from a pane's foreground job to the agent that spawned it.
 
     Starts *at* `job_pid`, because a pane running the agent directly — as
-    codex does — needs no hops at all, and stops at the first login shell,
+    codex does — needs no hops at all, and stops at the pane's login shell,
     because everything at or above it belongs to iTerm2 rather than to the
-    pane's work.
+    pane's work. A *task* shell the agent spawned along the way — to run the
+    very command whose pane is being joined — is walked through rather than
+    treated as that boundary; see `_is_login_shell`.
+
+    This trades one false-negative for a narrow false-positive: any pane
+    whose own shell is not login-prefixed loses the boundary this walk
+    depends on, not only a shell the *user* starts by hand mid-pane — an
+    iTerm2 profile with a custom Command instead of "Login shell", or a
+    non-login `tmux`/`screen` default-command, has the same shape. If an
+    unrelated agent happens to sit above such a shell in that same process
+    tree, the walk climbs through and misjoins. Accepted deliberately: on
+    this machine every pane's own shell is `-zsh` under `login`, which still
+    ends the walk unconditionally, so the exposure is nil in the configuration
+    this module was built against, and an agent shelling out to run its own
+    command is the far more common shape either way. Both callers of this
+    walk share the trade-off — `join_pane` for status, and
+    `detect_supported_process` for whether a companion pane is created at
+    all — though the `agent_cwd == pane cwd` check both perform bounds how
+    far a misjoin can reach.
 
     Args:
         job_pid: The pane's `jobPid`.
@@ -472,8 +523,8 @@ def agent_ancestor(job_pid: int, table: ProcessTable) -> ProcessInfo | None:
 
     Returns:
         The nearest ancestor (or `job_pid` itself) whose name is in
-        `AGENT_SOURCES`, or `None` if the walk reaches a shell, leaves the
-        table, or exhausts `MAX_ANCESTRY_HOPS` first.
+        `AGENT_SOURCES`, or `None` if the walk reaches the login shell, leaves
+        the table, or exhausts `MAX_ANCESTRY_HOPS` first.
     """
     pid = job_pid
     for _ in range(MAX_ANCESTRY_HOPS):
@@ -482,7 +533,7 @@ def agent_ancestor(job_pid: int, table: ProcessTable) -> ProcessInfo | None:
             return None
         if info.name.lstrip("-").lower() in AGENT_SOURCES:
             return info
-        if info.name in SHELL_NAMES:
+        if info.name in SHELL_NAMES and (info.name == "login" or _is_login_shell(info)):
             return None
         if info.ppid == pid or info.ppid <= 1:
             return None
@@ -696,6 +747,59 @@ def _codex_store_candidates(
     return result
 
 
+def _agent_open_store_paths(pid: int) -> frozenset[Path]:
+    """Return every absolute path `pid` currently holds a file descriptor open for.
+
+    A candidate rollout this pid does not hold open cannot be the transcript
+    it is currently writing — a structural fact about file descriptors, not a
+    guess — so `join_pane` uses this to narrow an already-ambiguous
+    cwd-and-mtime candidate set rather than to pick among it blind. Deliberately
+    not used alone: fact 3 in the module docstring measured **ten** rollouts
+    open on a single codex pid at once, spanning old sessions as well as the
+    live one, so an open fd proves nothing on its own — only an intersection
+    that narrows the existing candidate set to exactly one is trusted by the
+    caller.
+
+    Residual race, accepted rather than closed: `pid` is a `ps` snapshot taken
+    moments earlier, and if that process has since exited and the pid been
+    reused by an unrelated process, this reads that process's descriptors
+    instead. Structurally the same class of staleness `join_pane`'s own
+    `job_name` check (fact 2) exists to catch for `jobPid`, just not caught
+    here the same way, because a pid does not carry its own identity to
+    re-check against. Bounded by `JOIN_SECONDS`: a wrong narrowing from either
+    this or the reuse race corrects itself at the next join attempt rather
+    than sticking.
+
+    Args:
+        pid: The agent's own pid, resolved by `agent_ancestor`.
+
+    Returns:
+        Resolved absolute paths of every open regular file, or an empty set
+        if `lsof` is unavailable, the pid is gone, or it holds nothing open —
+        any of which leaves the caller's candidate set exactly as ambiguous
+        as before, never more so. Pipes, sockets, and other non-path
+        descriptors (`lsof` reports these as e.g. `n->0x...`, with no leading
+        `/`) are excluded rather than resolved against the caller's own cwd.
+    """
+    try:
+        completed = subprocess.run(
+            ["/usr/sbin/lsof", "-a", "-p", str(pid), "-Fn"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except OSError, subprocess.SubprocessError, UnicodeDecodeError:
+        return frozenset()
+    if completed.returncode != 0:
+        return frozenset()
+    return frozenset(
+        Path(line[1:]).resolve(strict=False)
+        for line in completed.stdout.splitlines()
+        if line.startswith("n/")
+    )
+
+
 def _pinned_store_path(root: Path, pin: PanePin) -> Path | None:
     """Validate a pin's source store, allowing an intentional cwd mismatch."""
     if pin.source == CLAUDE_SOURCE:
@@ -731,6 +835,7 @@ def join_pane(
     pin: PanePin | Mapping[str, object] | str | None = None,
     candidate_cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
     registry_root: Path | None = None,
+    open_files_reader: Callable[[int], frozenset[Path]] = _agent_open_store_paths,
 ) -> PaneJoin | None:
     """Resolve a pane to its agent process and project, or refuse.
 
@@ -757,7 +862,10 @@ def join_pane(
        deliberate rename/move recovery escape hatch, not an automatic guess.
     7. For Claude Code, the live-process registry names this pid's own
        session and that transcript is readable. Failing that, the source's
-       own store layout supplies exactly one candidate.
+       own store layout supplies exactly one candidate. For Codex, the
+       cwd+mtime scan supplies exactly one candidate, or — failing that —
+       narrows to exactly one by which rollout the agent pid still holds
+       open (`_agent_open_store_paths`).
 
     Args:
         variables: The pane's iTerm2 variables.
@@ -774,6 +882,9 @@ def join_pane(
         registry_root: Claude Code's live-process registry directory;
             defaults to the real one. Injectable so a test can describe a
             registry that is not running.
+        open_files_reader: Callable taking a pid and returning the resolved
+            paths it holds open, used to narrow an ambiguous Codex candidate
+            set. Injectable for the same reason as `cwd_reader`.
 
     Returns:
         A `PaneJoin`, or `None` if any check above fails.
@@ -828,6 +939,15 @@ def join_pane(
         codex_paths = _codex_store_candidates(
             root, cwd, now=now, activity_window=activity_window, cache=candidate_cache
         )
+        if len(codex_paths) > 1:
+            # More than one recent rollout in this project is often several
+            # sessions run here within the hour, not one -- most are from
+            # processes that have since exited. Narrow to the one(s) the
+            # live agent pid still holds open; a stale rollout cannot be.
+            open_paths = open_files_reader(agent.pid)
+            narrowed = tuple(path for path in codex_paths if path in open_paths)
+            if len(narrowed) == 1:
+                codex_paths = narrowed
         candidates = tuple(path.stem for path in codex_paths)
         project_key = project_key_for_cwd(cwd)
         store_path = codex_paths[0] if len(codex_paths) == 1 else None

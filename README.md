@@ -168,9 +168,11 @@ anything else falls back to the mtime scan, so an older CLI that does not
 write the registry behaves exactly as before. Project directories are looked
 up under both spellings Claude Code has used for `_`, since both are on disk.
 
-Automatic Codex joining requires one recent root rollout whose recorded cwd
-exactly matches the pane. For an intentional directory rename or move, pin the
-known rollout to the pane without focusing it, and clear the override later:
+Automatic Codex joining finds recent root rollouts whose recorded cwd exactly
+matches the pane. When multiple recent rollouts match, the join narrows them to
+the one the live agent process still holds open, refusing to guess when zero or
+multiple remain. For an intentional directory rename or move, pin the known
+rollout to the pane without focusing it, and clear the override later:
 
 ```sh
 uv run palaver ui --session PANE_ID --pin codex SESSION_KEY
