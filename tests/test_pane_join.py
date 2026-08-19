@@ -579,6 +579,32 @@ def test_a_stale_job_name_returns_no_join(project):
     assert _join(cwd, sessions_root, job_name="node") is not None
 
 
+def test_capitalized_python_job_name_joins_against_lowercase_parsed_row(project):
+    """iTerm's capitalized `Python` jobName must join against a lowercase `python` row.
+
+    iTerm2 may report `jobName` as `Python` while the process table parsed
+    executable name is `python`. Both are normalized before comparison so that
+    case differences do not cause the pane join to fail closed. A genuinely stale
+    job name must still return no join.
+    """
+    cwd, sessions_root = project
+    table = _table(
+        (
+            (63488, 63354, "python server.py"),
+            (63354, 62921, "claude"),
+            (62921, 1, "-zsh"),
+        )
+    )
+
+    join = _join(cwd, sessions_root, table=table, job_pid=63488, job_name="Python")
+    assert join is not None
+    assert join.pid == 63354
+    assert join.source == "claude-code"
+
+    # A genuinely stale job name returns no join
+    assert _join(cwd, sessions_root, table=table, job_pid=63488, job_name="ruby") is None
+
+
 def test_a_project_with_no_store_directory_returns_no_join(project, tmp_path):
     """An agent working somewhere Palaver has no store for is not joinable."""
     cwd, sessions_root = project

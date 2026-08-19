@@ -251,7 +251,7 @@ def detect_supported_process(
     if job is None:
         return None
     pid_is_agent = job.name.lstrip("-").lower() in AGENT_SOURCES
-    if variables.job_name and job.name != variables.job_name and not pid_is_agent:
+    if variables.job_name and job.name != process_name(variables.job_name) and not pid_is_agent:
         return None
 
     agent = agent_ancestor(variables.job_pid, process_table)
@@ -793,7 +793,7 @@ def join_pane(
         return None
 
     pid_is_agent = job.name.lstrip("-").lower() in AGENT_SOURCES
-    if variables.job_name and job.name != variables.job_name and not pid_is_agent:
+    if variables.job_name and job.name != process_name(variables.job_name) and not pid_is_agent:
         return None
 
     agent = agent_ancestor(variables.job_pid, process_table)
