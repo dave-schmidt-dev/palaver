@@ -12,9 +12,13 @@ import os
 from pathlib import Path
 
 from palaver.ingest.adapters.claude_code import (
+    BACKGROUND_TASK_TERMINAL_STATUSES,
     CHANNEL_HUMAN,
     CHANNEL_INJECTED,
     ClaudeCodeAdapter,
+    active_background_task_ids,
+    background_task_id,
+    background_task_notification,
     classify_channel,
 )
 from palaver.ingest.cursors import Cursor
@@ -291,6 +295,7 @@ def test_classify_channel_injected_by_prefix_without_isMeta():
         _user_record("<bash-input>pkill -f palaver</bash-input>"),
         _user_record("<bash-stdout>(Bash completed with no output)</bash-stdout>"),
         _user_record("<bash-stderr>command not found</bash-stderr>"),
+        _user_record("<task-notification>\n<task-id>task-1</task-id>\n</task-notification>"),
     ]
 
     for record in prefixed_records:
@@ -302,6 +307,25 @@ def test_classify_channel_human_positive_control_not_vacuous():
     human message with no isMeta flag and no matching prefix must come back
     human."""
     assert classify_channel(_user_record("what's the status of the deploy?")) == CHANNEL_HUMAN
+
+
+def test_background_task_markers_are_bounded_and_terminal_only():
+    launch = {"toolUseResult": {"backgroundTaskId": "bg-1"}}
+    completed = {
+        "type": "queue-operation",
+        "content": (
+            "<task-notification><task-id>bg-1</task-id>"
+            "<status>timed-out</status></task-notification>"
+        ),
+    }
+    assert background_task_id(launch) == "bg-1"
+    assert background_task_notification(completed) == ("bg-1", "timed_out")
+    assert "timed_out" in BACKGROUND_TASK_TERMINAL_STATUSES
+    assert active_background_task_ids((launch, completed)) == frozenset()
+    assert background_task_notification(
+        {"type": "queue-operation", "content": "<status>queued</status>"}
+    ) is None
+    assert background_task_id({"toolUseResult": {"backgroundTaskId": "x" * 200}}) == "x" * 128
 
 
 # --- tail: message / compaction / error events -------------------------------

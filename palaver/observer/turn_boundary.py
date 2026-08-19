@@ -49,8 +49,11 @@ The five cases the backwards walk resolves, in the order it tests them:
 4. An `assistant` record with an unresolved `tool_use` block naming any
    other tool — nothing conversational follows it, so the call is
    unresolved and the agent is mid-turn.
-5. An `assistant` record with no `tool_use` block — every call resolved,
-   nothing after it: control is back with the human.
+5. An `assistant` record with no `tool_use` block but an active structured
+   background task — the queued work is still in flight, so the turn remains
+   open until its terminal notification.
+6. An `assistant` record with no `tool_use` block and no active background task
+   — every call resolved, nothing after it: control is back with the human.
 
 Anything else (no conversational record at all, or a record that did not
 decode) is `Tri.UNKNOWN`. `UNKNOWN` is a first-class answer here, not a
@@ -77,6 +80,7 @@ from palaver.ingest.adapters.base import Event, read_complete_records
 from palaver.ingest.adapters.claude_code import (
     CHANNEL_INJECTED,
     MESSAGE_RECORD_TYPES,
+    active_background_task_ids,
     classify_channel,
 )
 from palaver.observer.signals import Signals, Tri
@@ -104,6 +108,7 @@ HUMAN_BLOCKING_TOOL_NAMES = frozenset({"AskUserQuestion"})
 BASIS_ASSISTANT_FINAL = "assistant_final"
 BASIS_UNRESOLVED_TOOL_USE = "unresolved_tool_use"
 BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE = "unresolved_human_blocking_tool_use"
+BASIS_BACKGROUND_TASK_PENDING = "background_task_pending"
 BASIS_TOOL_RESULT_PENDING = "tool_result_pending"
 BASIS_HUMAN_MESSAGE_PENDING = "human_message_pending"
 BASIS_NO_CONVERSATIONAL_RECORD = "no_conversational_record"
@@ -123,6 +128,7 @@ BASIS_NAMES: tuple[str, ...] = (
     BASIS_ASSISTANT_FINAL,
     BASIS_UNRESOLVED_TOOL_USE,
     BASIS_UNRESOLVED_HUMAN_BLOCKING_TOOL_USE,
+    BASIS_BACKGROUND_TASK_PENDING,
     BASIS_TOOL_RESULT_PENDING,
     BASIS_HUMAN_MESSAGE_PENDING,
     BASIS_NO_CONVERSATIONAL_RECORD,
@@ -284,7 +290,10 @@ def derive_turn_boundary(
                 ended, basis, boundary_index = Tri.FALSE, BASIS_UNRESOLVED_TOOL_USE, index
             break
 
-        ended, basis, boundary_index = Tri.TRUE, BASIS_ASSISTANT_FINAL, index
+        if active_background_task_ids(records):
+            ended, basis, boundary_index = Tri.FALSE, BASIS_BACKGROUND_TASK_PENDING, index
+        else:
+            ended, basis, boundary_index = Tri.TRUE, BASIS_ASSISTANT_FINAL, index
         break
 
     corroboration = _corroborate(

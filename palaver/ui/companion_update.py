@@ -83,7 +83,9 @@ def signals_from_snapshot(snapshot: SummarySnapshot) -> Signals:
     else:
         parsed = Tri.TRUE
     turn = snapshot.turn.text
-    if snapshot.turn.provenance is Provenance.UNKNOWN or turn is None:
+    if snapshot.background_tasks:
+        ended = Tri.FALSE
+    elif snapshot.turn.provenance is Provenance.UNKNOWN or turn is None:
         ended = Tri.UNKNOWN
     elif turn in {"Turn returned to human", "Turn aborted", "Awaiting explicit answer"}:
         ended = Tri.TRUE

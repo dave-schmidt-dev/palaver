@@ -45,6 +45,7 @@ from palaver.observer.signals import (
 )
 from palaver.observer.turn_boundary import (
     BASIS_ASSISTANT_FINAL,
+    BASIS_BACKGROUND_TASK_PENDING,
     BASIS_EVENT_MESSAGE_PENDING,
     BASIS_EVENT_TURN_BOUNDARY,
     BASIS_HUMAN_MESSAGE_PENDING,
@@ -141,6 +142,23 @@ def _tool_result(*, is_error: bool = False, content: str = "ok") -> dict:
                 }
             ],
         },
+    }
+
+
+def _background_tool_result() -> dict:
+    record = _tool_result()
+    record["toolUseResult"] = {"backgroundTaskId": "bg-1"}
+    return record
+
+
+def _background_notification(status: str = "completed") -> dict:
+    return {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": (
+            "<task-notification><task-id>bg-1</task-id>"
+            f"<status>{status}</status></task-notification>"
+        ),
     }
 
 
@@ -285,6 +303,30 @@ def test_assistant_final_reply_is_awaiting_human_never_done(tmp_path):
 
     assert status is Status.AWAITING_HUMAN
     assert status is not Status.DONE
+
+
+def test_active_background_task_keeps_followup_prose_working_until_notification(tmp_path):
+    pending = _session(
+        tmp_path,
+        "background-pending",
+        [_human(), _tool_use(), _background_tool_result(), _assistant()],
+    )
+    finished = _session(
+        tmp_path,
+        "background-finished",
+        [
+            _human(),
+            _tool_use(),
+            _background_tool_result(),
+            _assistant(),
+            _background_notification(),
+        ],
+    )
+
+    pending_observation = _observe(pending)
+    assert pending_observation.signals.agent_turn_ended is Tri.FALSE
+    assert pending_observation.boundary.basis == BASIS_BACKGROUND_TASK_PENDING
+    assert _status(finished) is Status.AWAITING_HUMAN
 
 
 def test_no_message_bearing_record_is_unknown(tmp_path):

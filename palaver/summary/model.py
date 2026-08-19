@@ -18,6 +18,7 @@ DISPLAY_TEXT_LIMIT = 240
 # per-list ceiling rather than the single row the pane used to spare.
 RECENT_ACTIVITY_LIMIT = 8
 MAX_COLLECTION_ITEMS = 32
+MAX_BACKGROUND_TASKS = 32
 MAX_UNKNOWN_REASONS = 8
 
 # CSI and OSC cover the terminal control sequences coding tools commonly put
@@ -132,6 +133,7 @@ class SummarySnapshot:
     command_result: Claim = field(
         default_factory=lambda: Claim.unknown("no command failure this turn")
     )
+    background_tasks: frozenset[str] = field(default_factory=frozenset)
     compaction: Claim = field(default_factory=lambda: Claim.unknown("no compaction observed"))
     turn: Claim = field(default_factory=lambda: Claim.unknown("turn boundary not observed"))
     source_integrity: Provenance = Provenance.EXACT
@@ -152,6 +154,7 @@ class SummarySnapshot:
             tasks=CollectionClaim.unknown(reason),
             questions=CollectionClaim.unknown(reason),
             command_result=Claim.unknown(reason),
+            background_tasks=self.background_tasks,
             compaction=self.compaction,
             turn=Claim.unknown(reason),
             source_integrity=Provenance.UNKNOWN,

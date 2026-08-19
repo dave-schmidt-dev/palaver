@@ -6,8 +6,15 @@ import json
 from dataclasses import replace
 
 from palaver.ingest.adapters.base import Event
-from palaver.ingest.adapters.claude_code import CHANNEL_INJECTED, classify_channel
+from palaver.ingest.adapters.claude_code import (
+    BACKGROUND_TASK_SUCCESS_STATUSES,
+    CHANNEL_INJECTED,
+    background_task_id,
+    background_task_notification,
+    classify_channel,
+)
 from palaver.summary.model import (
+    MAX_BACKGROUND_TASKS,
     MAX_COLLECTION_ITEMS,
     Claim,
     CollectionClaim,
@@ -46,6 +53,49 @@ def _result_text(block: dict) -> str:
     if isinstance(content, list):
         return " ".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
     return ""
+
+
+def _register_background_task(snapshot: SummarySnapshot, task_id: str) -> SummarySnapshot:
+    """Add one bounded detached task to the reducer's active state."""
+    if task_id in snapshot.background_tasks:
+        return replace(
+            snapshot,
+            turn=Claim.structural("Agent turn open", "background_task", task_id),
+        )
+    if len(snapshot.background_tasks) >= MAX_BACKGROUND_TASKS:
+        return snapshot.with_unknown("too many active Claude background tasks")
+    return replace(
+        snapshot,
+        background_tasks=snapshot.background_tasks | {task_id},
+        turn=Claim.structural("Agent turn open", "background_task", task_id),
+    )
+
+
+def _apply_background_notification(snapshot: SummarySnapshot, record: dict) -> SummarySnapshot:
+    """Apply a terminal queue notification when its task is active."""
+    notification = background_task_notification(record)
+    if notification is None:
+        return snapshot
+    task_id, status = notification
+    if task_id not in snapshot.background_tasks:
+        return snapshot
+    remaining = snapshot.background_tasks - {task_id}
+    failed = status not in BACKGROUND_TASK_SUCCESS_STATUSES
+    command_result = (
+        Claim.structural(f"Background task {status}", "background_task", task_id)
+        if failed
+        else Claim(None, Provenance.STRUCTURAL, "background_task", task_id)
+    )
+    return replace(
+        snapshot,
+        background_tasks=remaining,
+        command_result=command_result,
+        turn=Claim.structural(
+            "Agent turn open" if remaining else "Turn returned to human",
+            "background_task",
+            task_id,
+        ),
+    )
 
 
 def _task_snapshot(tool_input: object) -> CollectionClaim[TaskItem]:
@@ -134,11 +184,17 @@ def reduce_claude_events(
             continue
 
         record_type = record.get("type")
+        if record_type == "queue-operation":
+            snapshot = _apply_background_notification(snapshot, record)
+            continue
         if record_type not in {"user", "assistant"}:
             continue
 
         blocks = _blocks(record)
         if record_type == "user":
+            task_id = background_task_id(record)
+            if task_id is not None:
+                snapshot = _register_background_task(snapshot, task_id)
             result_blocks = [block for block in blocks if block.get("type") == "tool_result"]
             if result_blocks:
                 for block in result_blocks:
@@ -232,7 +288,7 @@ def reduce_claude_events(
                     "tool_use",
                 ),
             )
-        elif assistant_text:
+        elif assistant_text and not snapshot.background_tasks:
             snapshot = replace(
                 snapshot,
                 turn=Claim.structural("Turn returned to human", "assistant_final"),

@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 
 from palaver.ingest.adapters.base import Event
+from palaver.observer.signals import Status, derive_status
 from palaver.summary import Provenance, SummaryReducer, reduce_events
 from palaver.summary.model import DISPLAY_TEXT_LIMIT, sanitize_text
+from palaver.ui.companion_update import signals_from_snapshot
 
 
 def _claude(record: dict, kind: str = "message") -> Event:
@@ -48,6 +50,28 @@ def _claude_result(tool_id: str, text: str = "ok", *, error: bool = False) -> Ev
                 ],
             },
         }
+    )
+
+
+def _claude_background_result(tool_id: str, task_id: str) -> Event:
+    event = _claude_result(tool_id)
+    event.payload["toolUseResult"] = {"backgroundTaskId": task_id}
+    return event
+
+
+def _claude_task_notification(task_id: str, status: str) -> Event:
+    return _claude(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": (
+                "<task-notification>"
+                f"<task-id>{task_id}</task-id>"
+                f"<status>{status}</status>"
+                "</task-notification>"
+            ),
+        },
+        "queue-operation",
     )
 
 
@@ -256,6 +280,66 @@ def test_claude_tool_error_is_current_turn_signal_and_success_clears_it():
         ),
     )
     assert cleared.command_result.text is None
+
+
+def test_claude_background_task_stays_working_until_terminal_notification():
+    events = (
+        _claude_user("run the gate"),
+        _claude_tool("Bash", "call-1", {"command": "gate", "run_in_background": True}),
+        _claude_background_result("call-1", "task-1"),
+        _claude_agent({"type": "text", "text": "Running in the background."}),
+    )
+    running = reduce_events("claude-code", "fixture/session", events)
+
+    assert running.background_tasks == frozenset({"task-1"})
+    assert derive_status(signals_from_snapshot(running)) is Status.WORKING
+
+    finished = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (*events, _claude_task_notification("task-1", "completed")),
+    )
+    assert finished.background_tasks == frozenset()
+    assert finished.turn.text == "Turn returned to human"
+    assert derive_status(signals_from_snapshot(finished)) is Status.AWAITING_HUMAN
+
+
+def test_claude_background_task_failure_is_error_and_multiple_tasks_remain_working():
+    first = (
+        _claude_tool("Bash", "call-1", {"command": "one", "run_in_background": True}),
+        _claude_background_result("call-1", "task-1"),
+    )
+    second = (
+        _claude_tool("Bash", "call-2", {"command": "two", "run_in_background": True}),
+        _claude_background_result("call-2", "task-2"),
+    )
+    reducer = SummaryReducer("claude-code", "fixture/session")
+    reducer.feed(first)
+    reducer.feed(second)
+    reducer.feed((_claude_agent({"type": "text", "text": "Both are running."}),))
+    assert reducer.snapshot.background_tasks == frozenset({"task-1", "task-2"})
+
+    failed = reducer.feed((_claude_task_notification("task-1", "failed"),))
+    assert failed.background_tasks == frozenset({"task-2"})
+    assert failed.command_result.text == "Background task failed"
+    assert derive_status(signals_from_snapshot(failed)) is Status.ERROR
+
+    completed = reducer.feed((_claude_task_notification("task-2", "completed"),))
+    assert completed.background_tasks == frozenset()
+
+
+def test_claude_foreground_bash_still_returns_to_human_after_reply():
+    snapshot = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (
+            _claude_tool("Bash", "call-1", {"command": "foreground"}),
+            _claude_result("call-1"),
+            _claude_agent({"type": "text", "text": "The command finished."}),
+        ),
+    )
+    assert snapshot.background_tasks == frozenset()
+    assert derive_status(signals_from_snapshot(snapshot)) is Status.AWAITING_HUMAN
 
 
 def test_unsupported_structured_plan_is_unknown_not_an_empty_plan():
