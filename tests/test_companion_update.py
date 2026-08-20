@@ -176,6 +176,47 @@ def test_unjoined_pane_retries_join_on_slower_cadence(tmp_path):
     assert calls == ["join"]
 
 
+def test_unjoined_codex_retries_reuse_one_metadata_observation(tmp_path):
+    calls = []
+    clock = [0.0]
+    agent = types.SimpleNamespace(session_id="agent")
+    tab = types.SimpleNamespace(sessions=[agent])
+    app = types.SimpleNamespace(
+        terminal_windows=[types.SimpleNamespace(tabs=[tab])],
+        get_session_by_id=lambda _session_id: agent,
+    )
+    ambiguous = PaneJoin(
+        "agent", 10, "codex", tmp_path, "project", ("a", "b"), None, None
+    )
+
+    async def metadata(_session, _tab):
+        return SessionMetadata(
+            session=agent,
+            tab=tab,
+            pane=PaneVariables("agent", 10, "codex", str(tmp_path)),
+        )
+
+    def joiner(*_args, **kwargs):
+        progress = kwargs["candidate_progress"]
+        calls.append(progress)
+        return ambiguous
+
+    updater = CompanionUpdater(
+        read_metadata=metadata,
+        clock=lambda: clock[0],
+        wall_clock=lambda: clock[0],
+        joiner=joiner,
+        table_reader=lambda: {},
+        state_writer=lambda *_args: None,
+    )
+    pairs = {"agent": CompanionPair("agent", "summary", Path(tmp_path / "state"))}
+    asyncio.run(updater.refresh_once(app, pairs))
+    clock[0] = 5.0
+    asyncio.run(updater.refresh_once(app, pairs))
+    assert len(calls) == 2
+    assert calls[0] is calls[1]
+
+
 def test_blocking_initial_tail_does_not_stall_event_loop_and_reports_progress(
     tmp_path, monkeypatch
 ):

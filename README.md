@@ -172,9 +172,11 @@ up under both spellings Claude Code has used for `_`, since both are on disk.
 
 Automatic Codex joining finds recent root rollouts whose recorded cwd exactly
 matches the pane. When multiple recent rollouts match, the join narrows them to
-the one the live agent process still holds open, refusing to guess when zero or
-multiple remain. For an intentional directory rename or move, pin the known
-rollout to the pane without focusing it, and clear the override later:
+the one the live agent process still holds open. If several remain open, it
+waits for a second metadata-only observation and joins only when exactly one
+stable candidate advances; zero, multiple, or regressing candidates remain
+unjoined. For an intentional directory rename or move, pin the known rollout
+to the pane without focusing it, and clear the override later:
 
 ```sh
 uv run palaver ui --session PANE_ID --pin codex SESSION_KEY

@@ -16,7 +16,12 @@ from palaver.observer.signals import Liveness, Signals, Tri, apply_liveness, der
 from palaver.summary import Provenance, SummaryReducer, SummarySnapshot
 from palaver.ui.companion import CompanionPair, ReadMetadata
 from palaver.ui.companion_state import MAX_ITEMS, CompanionState, JoinState, atomic_write_state
-from palaver.ui.pane_join import join_pane, observe_liveness, read_process_table
+from palaver.ui.pane_join import (
+    CodexCandidateProgress,
+    join_pane,
+    observe_liveness,
+    read_process_table,
+)
 
 REFRESH_SECONDS = 1.0
 JOIN_SECONDS = 5.0
@@ -129,6 +134,7 @@ class CompanionUpdater:
         self._runtimes: dict[str, _Runtime] = {}
         self._next_join: dict[str, float] = {}
         self._unjoined: dict[str, tuple[CompanionState, float]] = {}
+        self._candidate_progress: dict[str, CodexCandidateProgress] = {}
 
     async def refresh_once(self, app: Any, pairs: dict[str, CompanionPair]) -> int:
         """Refresh every pair once; one failed pane never stops the others."""
@@ -137,6 +143,7 @@ class CompanionUpdater:
             self._runtimes.pop(stale, None)
             self._next_join.pop(stale, None)
             self._unjoined.pop(stale, None)
+            self._candidate_progress.pop(stale, None)
         table = None
         written = 0
         for agent_id, pair in pairs.items():
@@ -177,8 +184,16 @@ class CompanionUpdater:
                 if runtime is None or now_mono >= runtime.next_join:
                     self._on_status("refreshing companion joins and process liveness")
                     table = await asyncio.to_thread(self._read_table) if table is None else table
-                    joined = await asyncio.to_thread(self._join, metadata.pane, table=table)
+                    progress = self._candidate_progress.setdefault(agent_id, {})
+                    joined = await asyncio.to_thread(
+                        self._join,
+                        metadata.pane,
+                        table=table,
+                        candidate_progress=progress,
+                    )
                     if joined is None or joined.session_key is None or joined.store_path is None:
+                        if joined is None:
+                            progress.clear()
                         self._runtimes.pop(agent_id, None)
                         state = CompanionState(
                             producer_updated_at=self._wall_clock(),
@@ -193,6 +208,7 @@ class CompanionUpdater:
                         self._unjoined[agent_id] = (state, now_mono)
                         written += 1
                         continue
+                    progress.clear()
                     identity = (joined.source, joined.session_key, joined.store_path)
                     if (
                         runtime is None

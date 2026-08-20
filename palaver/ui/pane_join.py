@@ -842,6 +842,49 @@ def _same_process_identity(expected: ProcessInfo, actual: ProcessInfo | None) ->
     ) and expected.start_time is not None
 
 
+CodexCandidateProgress = MutableMapping[str, tuple[int, int]]
+
+
+def _narrow_codex_candidates_by_progress(
+    paths: tuple[Path, ...],
+    progress: CodexCandidateProgress,
+    *,
+    identity: tuple[int, Path],
+) -> tuple[Path, ...]:
+    """Narrow an ambiguous Codex set to one rollout that advanced between ticks.
+
+    The observation contains only file metadata: size and nanosecond mtime.
+    A candidate set must be identical across two observations, and metadata
+    must never move backwards. Any unreadable, changing, or multiply
+    advancing set remains ambiguous.
+    """
+    identity_prefix = f"{identity[0]}\0{identity[1]}\0"
+    current: dict[str, tuple[int, int]] = {}
+    try:
+        for path in paths:
+            stat = path.stat()
+            current[f"{identity_prefix}{path}"] = (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        progress.clear()
+        return paths
+
+    previous = dict(progress)
+    progress.clear()
+    progress.update(current)
+    if set(previous) != set(current):
+        return paths
+
+    advancing: list[Path] = []
+    for path in paths:
+        old_size, old_mtime = previous[f"{identity_prefix}{path}"]
+        size, mtime = current[f"{identity_prefix}{path}"]
+        if size < old_size or mtime < old_mtime:
+            return paths
+        if size > old_size or mtime > old_mtime:
+            advancing.append(path)
+    return tuple(advancing) if len(advancing) == 1 else paths
+
+
 def _pinned_store_path(root: Path, pin: PanePin) -> Path | None:
     """Validate a pin's source store, allowing an intentional cwd mismatch."""
     if pin.source == CLAUDE_SOURCE:
@@ -879,6 +922,7 @@ def join_pane(
     registry_root: Path | None = None,
     open_files_reader: Callable[[int], frozenset[Path]] = _agent_open_store_paths,
     process_table_reader: Callable[[], ProcessTable] | None = None,
+    candidate_progress: CodexCandidateProgress | None = None,
 ) -> PaneJoin | None:
     """Resolve a pane to its agent process and project, or refuse.
 
@@ -933,6 +977,10 @@ def join_pane(
             candidate set ambiguous instead of using another process's file
             descriptors. Tests that provide a static `table` may provide the
             matching static reader too.
+        candidate_progress: Optional per-pane metadata observations used to
+            narrow an ambiguous Codex set after a later tick. The mapping is
+            updated with current size and mtime only; transcript content is
+            never read.
 
     Returns:
         A `PaneJoin`, or `None` if any check above fails.
@@ -997,11 +1045,20 @@ def join_pane(
                 if process_table_reader is None
                 else process_table_reader()
             )
-            if _same_process_identity(agent, fresh_table.get(agent.pid)):
+            same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
+            if same_process:
                 open_paths = open_files_reader(agent.pid)
                 narrowed = tuple(path for path in codex_paths if path in open_paths)
                 if len(narrowed) == 1:
                     codex_paths = narrowed
+            if len(codex_paths) > 1 and candidate_progress is not None and same_process:
+                progressed = _narrow_codex_candidates_by_progress(
+                    codex_paths, candidate_progress, identity=(agent.pid, cwd)
+                )
+                if len(progressed) == 1:
+                    codex_paths = progressed
+            elif candidate_progress is not None and not same_process:
+                candidate_progress.clear()
         candidates = tuple(path.stem for path in codex_paths)
         project_key = project_key_for_cwd(cwd)
         store_path = codex_paths[0] if len(codex_paths) == 1 else None

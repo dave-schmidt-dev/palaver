@@ -353,6 +353,85 @@ def test_codex_ambiguity_is_not_resolved_by_an_empty_or_multi_member_open_set(tm
     assert both_open.session_key is None
 
 
+def test_codex_ambiguity_narrows_only_after_one_candidate_advances(tmp_path):
+    """A second metadata observation can identify the active rollout."""
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    live = _codex_rollout(root, cwd, "rollout-live")
+    historical = _codex_rollout(root, cwd, "rollout-historical")
+    open_paths = frozenset({live.resolve(), historical.resolve()})
+    progress = {}
+
+    first = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+        open_files_reader=lambda _pid: open_paths,
+        candidate_progress=progress,
+    )
+    assert first is not None
+    assert first.session_key is None
+
+    os.utime(live, ns=(live.stat().st_atime_ns, live.stat().st_mtime_ns + 1_000_000))
+    second = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+        open_files_reader=lambda _pid: open_paths,
+        candidate_progress=progress,
+    )
+    assert second is not None
+    assert second.session_key == live.stem
+    assert second.store_path == live.resolve()
+
+
+def test_codex_progress_narrowing_refuses_zero_multiple_or_unstable_advances(tmp_path):
+    """Progress is evidence only when exactly one stable candidate advances."""
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    first = _codex_rollout(root, cwd, "rollout-a")
+    second = _codex_rollout(root, cwd, "rollout-b")
+    open_paths = frozenset({first.resolve(), second.resolve()})
+
+    def _join(progress):
+        return join_pane(
+            variables,
+            table=table,
+            cwd_reader=lambda _pid: cwd,
+            store_roots={CODEX_SOURCE: root},
+            now=NOW,
+            open_files_reader=lambda _pid: open_paths,
+            candidate_progress=progress,
+        )
+
+    zero_progress = {}
+    assert _join(zero_progress).session_key is None
+    assert _join(zero_progress).session_key is None
+
+    multiple_progress = {}
+    assert _join(multiple_progress).session_key is None
+    for path in (first, second):
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    assert _join(multiple_progress).session_key is None
+
+    unstable_progress = {}
+    assert _join(unstable_progress).session_key is None
+    old_mtime = first.stat().st_mtime_ns
+    os.utime(first, ns=(first.stat().st_atime_ns, old_mtime - 1_000_000))
+    os.utime(second, ns=(second.stat().st_atime_ns, second.stat().st_mtime_ns + 1_000_000))
+    assert _join(unstable_progress).session_key is None
+
+
 def test_codex_ambiguity_narrowing_asks_about_the_agent_pid_not_the_job_pid(tmp_path):
     """The two fixes in this diff interact: narrowing must ask about `agent.pid`.
 
