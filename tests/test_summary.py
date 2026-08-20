@@ -59,6 +59,28 @@ def _claude_background_result(tool_id: str, task_id: str) -> Event:
     return event
 
 
+def test_tool_call_and_result_share_one_recent_activity_row():
+    snapshot = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (_claude_tool("Bash", "tool-1", {"command": "pytest"}), _claude_result("tool-1", "passed")),
+    )
+
+    assert len(snapshot.recent) == 1
+    assert snapshot.recent[0].text == "Tool Bash: pytest: passed"
+
+
+def test_codex_call_and_result_share_one_recent_activity_row():
+    snapshot = reduce_events(
+        "codex",
+        "fixture-codex",
+        (_codex_call("functions.exec", "call-1", {}), _codex_output("call-1", "passed")),
+    )
+
+    assert len(snapshot.recent) == 1
+    assert snapshot.recent[0].text == "Tool functions.exec: {}: passed"
+
+
 def _claude_task_notification(task_id: str, status: str) -> Event:
     return _claude(
         {

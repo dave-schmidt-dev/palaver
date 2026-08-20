@@ -28,31 +28,43 @@ not an oversight.
 `test_no_delete_or_drop_sql_is_ever_issued_by_the_memory_module` statically
 scans every `execute*` call under `palaver/memory/` for a `DELETE` or `DROP`
 SQL string, with a positive control proving the detector is live. (This
-does not extend to `palaver/store/schema.py`'s migration 4, which is
-allowed to `DROP TABLE memory_evidence` and recreate it — a schema
-migration reshaping a table's columns is not the append-only memory *write
-path* INV-4 governs, and the migration only ever runs once per database,
-before any `memories` row can exist at the new schema version.)
+does not extend to `palaver/store/schema.py`'s migrations 4 and 8, which
+are allowed to `DROP TABLE memory_evidence` and recreate it — a schema
+migration reshaping a table's columns or constraints is not the append-only
+memory *write path* INV-4 governs, and each runs once per database.
+Migration 8 copies every existing evidence row forward, ids included, and
+neither migration ever rebuilds `memories` itself, which is the table INV-4
+actually protects.)
 
 **INV-6 — every memory carries at least one evidence link.**
 `test_memory_without_evidence_is_rejected` is this invariant's charter gate
 (named in `INVARIANTS.md`). It asserts `write_memory` itself raises when
-called with no evidence anchors — a Python-level check in
-`palaver.memory.write.write_memory`, not a database trigger. That choice is
-deliberate, not a shortcut: a database-layer design (a `memories.
-primary_evidence_id` FK, written after the first evidence row) was
-considered and would reject immediately, but it restructures
-`memory_evidence` away from the 1-many `memory_id` shape task 2.4's
-supersession work depends on. A deferred-FK variant avoids that
-restructuring but only rejects at `conn.commit()` — after `write_memory`
-has already returned — which cannot satisfy a gate test asserting the
-*write call* raises. See `palaver/memory/write.py`'s module docstring for
-the full design comparison.
+called with no evidence anchors. This paragraph previously went on to
+explain why that Python-level check was the *only* enforcement and why a
+database-layer design had been rejected; migration 8 has since carried the
+rule into the database, so that reasoning is corrected here rather than
+left standing. The shape it landed in keeps what the rejected designs could
+not: evidence rows are written first, naming a pre-reserved memory id that
+migration 8's `DEFERRABLE INITIALLY DEFERRED` child foreign key permits, and
+`memories_requires_evidence` — a `BEFORE INSERT` trigger, so it fires
+whatever `PRAGMA foreign_keys` says and refuses at the write itself rather
+than at `conn.commit()` — is what actually enforces.
+`test_a_memory_with_no_evidence_is_refused_by_the_database_not_only_by_write_memory`
+attacks that floor with raw SQL,
+`test_evidence_and_mutation_rules_hold_on_a_connection_with_foreign_keys_off`
+proves it does not depend on the pragma, and
+`test_an_insert_letting_sqlite_pick_the_id_is_refused_even_with_evidence_at_minus_one`
+pins the measured `NEW.id = -1` quirk that makes the explicit id mandatory.
+A `memories.primary_evidence_id` FK remains rejected, for the reason it
+always was: it restructures `memory_evidence` away from the 1-many
+`memory_id` shape task 2.4's supersession work depends on. See
+`palaver/memory/write.py`'s module docstring for the full comparison.
 `test_write_memory_rejects_an_evidence_anchor_with_neither_chunk_nor_event_link`
 is the companion proof for the *other* half of "at least one": even if a
 caller assembles an `EvidenceAnchor` with neither id set, `write_memory`'s
-`INSERT` still fails, because the schema's own CHECK constraint (migration
-1) rejects a `memory_evidence` row with both link columns NULL — the same
+`INSERT` still fails, because the schema's own CHECK constraint — written
+in migration 1 and carried forward unchanged by both later rebuilds of the
+table — rejects a `memory_evidence` row with both link columns NULL — the same
 guarantee `resolve_evidence`'s otherwise-untested `else` branch assumes
 holds.
 
@@ -87,6 +99,7 @@ session.
 from __future__ import annotations
 
 import ast
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -165,6 +178,69 @@ def _seed_anchor(conn: sqlite3.Connection, session_id: int) -> EvidenceAnchor:
     chunk_id = _seed_transcript_chunk(conn, session_id, content, seq=seq)
     start, end = _span(content, "recording an invented observation")
     return EvidenceAnchor(transcript_chunk_id=chunk_id, start_offset=start, end_offset=end)
+
+
+def _seed_evidence_for(conn: sqlite3.Connection, session_id: int, memory_id: int) -> int:
+    """Write a `memory_evidence` row naming `memory_id` before that row exists.
+
+    Since migration 8 the database refuses a `memories` insert that no
+    evidence row already names (INV-6), and the deferred child foreign key
+    is what makes writing the child first legal. Every raw-SQL memory insert
+    below therefore states an explicit id and seeds its evidence through
+    here first — the same order `write_memory` itself now uses.
+    """
+    anchor = _seed_anchor(conn, session_id)
+    return conn.execute(
+        "INSERT INTO memory_evidence(memory_id, transcript_chunk_id, start_offset, end_offset) "
+        "VALUES (?, ?, ?, ?)",
+        (memory_id, anchor.transcript_chunk_id, anchor.start_offset, anchor.end_offset),
+    ).lastrowid
+
+
+def _seed_evidenced_memory_pre_v8(
+    conn: sqlite3.Connection,
+    project_id: int,
+    session_id: int,
+    statement: str,
+    tier: int,
+    origin: str = "observer",
+) -> int:
+    """Seed a memory and its evidence in the *pre*-migration-8 order.
+
+    Below version 8 `memory_evidence.memory_id` is an immediate foreign key,
+    so a child cannot name a parent that does not exist yet and
+    `write_memory`'s child-first order is invalid there — parent first is
+    the only order those versions accept. Used only by the staged-migration
+    tests, which are the only ones that operate on a store below the latest
+    schema version.
+    """
+    memory_id = conn.execute(
+        "INSERT INTO memories(project_id, session_id, statement, origin, tier) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (project_id, session_id, statement, origin, tier),
+    ).lastrowid
+    _seed_evidence_for(conn, session_id, memory_id)
+    return memory_id
+
+
+@contextlib.contextmanager
+def _reserved_memory_id(conn: sqlite3.Connection, session_id: int):
+    """Yield the next `memories.id`, with its evidence row already written.
+
+    The raw-SQL tests below hand that id to an INSERT they expect some
+    *other* guard to refuse. The evidence row would then be left naming a
+    parent that never arrives, and the deferred foreign key would fail the
+    next unrelated `commit()` — a failure in a later test's setup, which is
+    the worst place to debug one. So the reservation is dropped on the way
+    out whenever the memory did not land.
+    """
+    memory_id = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM memories").fetchone()[0]
+    _seed_evidence_for(conn, session_id, memory_id)
+    try:
+        yield memory_id
+    finally:
+        if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone() is None:
+            conn.execute("DELETE FROM memory_evidence WHERE memory_id = ?", (memory_id,))
 
 
 def _write_evidenced_memory(
@@ -392,6 +468,173 @@ def test_write_memory_rejects_an_evidence_anchor_with_neither_chunk_nor_event_li
         )
 
 
+@pytest.mark.inv6
+def test_a_memory_with_no_evidence_is_refused_by_the_database_not_only_by_write_memory(db):
+    """Raw SQL cannot write an unevidenced memory, whatever `write_memory` does.
+
+    `test_memory_without_evidence_is_rejected` above proves the
+    Python-level check; this proves the floor underneath it, added by
+    migration 8. The INSERT is hand-written `sqlite3` SQL and no code from
+    this project runs during it, so the refusal is the database's own — the
+    case a second module opening its own connection would otherwise walk
+    straight past.
+
+    Positive control: the identical INSERT succeeds the moment an evidence
+    row naming that id exists, so the refusal is about missing evidence and
+    not about raw inserts being blocked outright.
+    """
+    project_id, session_id = _seed_project_and_session(db)
+    memory_id = db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM memories").fetchone()[0]
+
+    with pytest.raises(sqlite3.IntegrityError, match="evidence"):
+        db.execute(
+            "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (memory_id, project_id, session_id, "fixture: an unevidenced claim", "attacker", 4),
+        )
+
+    _seed_evidence_for(db, session_id, memory_id)
+    db.execute(
+        "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (memory_id, project_id, session_id, "fixture: an evidenced claim", "observer", 4),
+    )
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+@pytest.mark.inv6
+def test_an_insert_letting_sqlite_pick_the_id_is_refused_even_with_evidence_at_minus_one(db):
+    """The evidence check cannot be satisfied by an id the row will never have.
+
+    Measured on SQLite 3.53: inside a `BEFORE INSERT` trigger, `NEW.id` for
+    an unspecified INTEGER PRIMARY KEY reads as **-1** — not NULL, and not
+    the rowid the row is about to receive. A trigger that only asked
+    `EXISTS (... memory_id = NEW.id)` would therefore be satisfied for every
+    implicit-id insert by a single evidence row planted at `memory_id = -1`.
+    With foreign keys off nothing else would catch that, so the trigger also
+    requires the id to be stated and positive.
+    """
+    project_id, session_id = _seed_project_and_session(db)
+    _seed_evidence_for(db, session_id, -1)
+
+    with pytest.raises(sqlite3.IntegrityError, match="explicit id"):
+        db.execute(
+            "INSERT INTO memories(project_id, session_id, statement, origin, tier) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (project_id, session_id, "fixture: a claim riding the -1 sentinel", "attacker", 4),
+        )
+
+    assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+
+
+@pytest.mark.inv6
+def test_evidence_and_mutation_rules_hold_on_a_connection_with_foreign_keys_off(tmp_path):
+    """Neither rule depends on `PRAGMA foreign_keys`, which is per connection.
+
+    `palaver.store.migrate.connect` turns foreign keys on; a bare
+    `sqlite3.connect(path)` — the next module, another process, a human at
+    the shell — does not. Migration 8's deferred child foreign key is inert
+    on this connection, which is precisely why the enforcement is a trigger:
+    a trigger fires whatever the pragma says.
+
+    Positive control on the same pragma-less connection: an evidenced,
+    explicitly-identified insert still succeeds, so the refusals are the
+    rules and not the missing pragma breaking writes in general.
+    """
+    db_path = tmp_path / "palaver.db"
+    migrate(db_path)
+    raw = sqlite3.connect(str(db_path))
+    try:
+        # Control for the premise: foreign keys really are off here.
+        assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        project_id, session_id = _seed_project_and_session(raw)
+
+        memory_id = raw.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM memories").fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="evidence"):
+            raw.execute(
+                "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (memory_id, project_id, session_id, "fixture: unevidenced, no FKs", "attacker", 4),
+            )
+
+        _seed_evidence_for(raw, session_id, memory_id)
+        raw.execute(
+            "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (memory_id, project_id, session_id, "fixture: evidenced, no FKs", "observer", 4),
+        )
+        raw.commit()
+
+        for clause, params in (
+            ("statement = ?", ("fixture: rewritten with foreign keys off",)),
+            ("origin = ?", ("attacker",)),
+            ("project_id = ?", (project_id,)),
+            ("session_id = ?", (None,)),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                raw.execute(f"UPDATE memories SET {clause} WHERE id = ?", (*params, memory_id))
+
+        assert (
+            raw.execute("SELECT statement FROM memories WHERE id = ?", (memory_id,)).fetchone()[0]
+            == "fixture: evidenced, no FKs"
+        )
+    finally:
+        raw.close()
+
+
+def test_write_memory_commits_one_and_many_evidence_rows_for_one_memory(db):
+    """The ordinary path: one anchor and several, both landing on disk.
+
+    Read back on a *second* connection after `commit()` rather than on the
+    writing one, because the child-first order leaves the evidence rows
+    naming a parent that does not exist yet for the length of the
+    transaction. Only a committed store proves the deferred foreign key was
+    satisfied rather than merely deferred.
+    """
+    project_id, session_id = _seed_project_and_session(db)
+    single_id = write_memory(
+        db,
+        project_id=project_id,
+        session_id=session_id,
+        statement="fixture: a memory resting on one line of transcript",
+        origin="observer",
+        tier=4,
+        evidence=[_seed_anchor(db, session_id)],
+    )
+    multi_id = write_memory(
+        db,
+        project_id=project_id,
+        session_id=session_id,
+        statement="fixture: a memory resting on three lines of transcript",
+        origin="observer",
+        tier=4,
+        evidence=[_seed_anchor(db, session_id) for _ in range(3)],
+    )
+    db.commit()
+    db_path = db.execute("PRAGMA database_list").fetchone()[2]
+
+    reader = sqlite3.connect(db_path)
+    try:
+        counts = dict(
+            reader.execute(
+                "SELECT memory_id, COUNT(*) FROM memory_evidence "
+                "WHERE memory_id IN (?, ?) GROUP BY memory_id",
+                (single_id, multi_id),
+            ).fetchall()
+        )
+        assert single_id != multi_id
+        assert counts == {single_id: 1, multi_id: 3}
+        # Each row still resolves against the source it points at, so the
+        # one-to-many link survived the inverted write order, not just the count.
+        for (evidence_id,) in reader.execute(
+            "SELECT id FROM memory_evidence WHERE memory_id = ? ORDER BY id", (multi_id,)
+        ).fetchall():
+            assert resolve_evidence(reader, evidence_id)
+    finally:
+        reader.close()
+
+
 # =============================================================================
 # Evidence anchoring and retrieval (task 2.2)
 # =============================================================================
@@ -563,7 +806,10 @@ def test_memory_evidence_offsets_replace_quote_by_migration_4_not_migration_1(tm
     finally:
         conn.close()
 
-    migrate(db_path)  # apply migration 4
+    # Stops at 4 rather than running to the latest version: the rebuild
+    # below leaves this store's one memory with no evidence at all, and
+    # migration 8 refuses to grandfather exactly that (INV-6).
+    assert migrate(db_path, target_version=4) == 4
 
     conn = connect(db_path)
     try:
@@ -577,9 +823,25 @@ def test_memory_evidence_offsets_replace_quote_by_migration_4_not_migration_1(tm
         # intentional, and asserted here rather than left implicit.
         assert conn.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0] == 0
 
+        # Re-anchor the memory the rebuild orphaned, in the new shape. This
+        # is the operator action migration 8's abort message asks for, and
+        # doing it here is what lets this store migrate the rest of the way.
         content = "fixture: a post-migration-4 evidence chunk"
         chunk_id = _seed_transcript_chunk(conn, session_id, content, seq=2)
         start, end = _span(content, "post-migration-4 evidence chunk")
+        conn.execute(
+            "INSERT INTO memory_evidence"
+            "(memory_id, transcript_chunk_id, start_offset, end_offset) VALUES (?, ?, ?, ?)",
+            (memory_id, chunk_id, start, end),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert migrate(db_path) == LATEST_VERSION
+
+    conn = connect(db_path)
+    try:
         new_memory_id = write_memory(
             conn,
             project_id=project_id,
@@ -587,9 +849,7 @@ def test_memory_evidence_offsets_replace_quote_by_migration_4_not_migration_1(tm
             statement="fixture: a memory written after migration 4",
             origin="observer",
             tier=TIER_OBSERVED_RESULT,
-            evidence=[
-                EvidenceAnchor(transcript_chunk_id=chunk_id, start_offset=start, end_offset=end)
-            ],
+            evidence=[_seed_anchor(conn, session_id)],
         )
         assert new_memory_id != memory_id
     finally:
@@ -665,13 +925,20 @@ def test_update_tier_raises_at_the_database_layer(db):
     )
     assert second_id != memory_id
 
-    # Positive control 3: an UPDATE naming a different column still succeeds
-    # on this same connection, proving the trigger is scoped to `tier`.
-    db.execute("UPDATE memories SET origin = ? WHERE id = ?", ("observer-corrected", memory_id))
-    corrected_origin = db.execute(
-        "SELECT origin FROM memories WHERE id = ?", (memory_id,)
-    ).fetchone()[0]
-    assert corrected_origin == "observer-corrected"
+    # Positive control 3: the trigger under test is still scoped to `tier`.
+    # Since migration 8 an UPDATE of `origin` is refused as well, but by a
+    # different rule carrying a different message — so this trigger is not
+    # simply refusing every UPDATE the table receives. `created_at`, which
+    # neither rule covers on a live row, still writes on this connection.
+    with pytest.raises(sqlite3.IntegrityError, match="supersede, never rewrite"):
+        db.execute("UPDATE memories SET origin = ? WHERE id = ?", ("observer-corrected", memory_id))
+    db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?", ("2002-02-02T00:00:00.000Z", memory_id)
+    )
+    assert (
+        db.execute("SELECT created_at FROM memories WHERE id = ?", (memory_id,)).fetchone()[0]
+        == "2002-02-02T00:00:00.000Z"
+    )
 
 
 @pytest.mark.inv5
@@ -692,12 +959,15 @@ def test_tier_immutable_trigger_is_added_by_migration_3_not_migration_1(tmp_path
     before the change permanently unmigrated and unprotected.
 
     The version-2 seed row is written with raw SQL
-    (`_seed_memory_directly`), not `write_memory`: `write_memory` now
-    targets the version-4 `memory_evidence` shape
-    (`start_offset`/`end_offset`, task 2.2) and cannot be called against a
-    database that hasn't been migrated that far yet. Only the post-migration
+    (`_seed_memory_directly`), not `write_memory`: `write_memory` targets
+    the version-4 `memory_evidence` shape (`start_offset`/`end_offset`, task
+    2.2) and, since migration 8, writes its evidence child-first against a
+    deferred foreign key that older versions do not have — so it cannot be
+    called against a store below version 8 at all. Only the post-migration
     positive control, which does run at the latest version, uses
-    `write_memory` itself.
+    `write_memory` itself. The seed is re-anchored partway through, because
+    migration 8 refuses to migrate a store whose memories have no evidence
+    rather than grandfather them.
     """
     db_path = tmp_path / "palaver.db"
     pre_trigger = tuple(m for m in SCHEMA_MIGRATIONS if m.version <= 2)
@@ -727,10 +997,30 @@ def test_tier_immutable_trigger_is_added_by_migration_3_not_migration_1(tmp_path
     finally:
         conn.close()
 
-    migrate(db_path)  # apply migration 3 (trigger) and migration 4 (evidence anchors)
+    # Stops at 4 for the same reason as the migration-4 test above: this
+    # store's seed memory has no evidence, and migration 8 will not
+    # grandfather it. The seed is re-anchored below, then migration
+    # continues — so this test also covers the upgrade path an existing
+    # store takes through both changes, not just through migration 3.
+    assert migrate(db_path, target_version=4) == 4
 
     conn = connect(db_path)
     try:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute(
+                "UPDATE memories SET tier = ? WHERE id = ?", (TIER_OBSERVED_RESULT, memory_id)
+            )
+        _seed_evidence_for(conn, session_id, memory_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert migrate(db_path) == LATEST_VERSION
+
+    conn = connect(db_path)
+    try:
+        # The trigger added at migration 3 is still the one refusing this at
+        # the latest version, on the same upgraded store.
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             conn.execute(
                 "UPDATE memories SET tier = ? WHERE id = ?", (TIER_OBSERVED_RESULT, memory_id)
@@ -739,7 +1029,7 @@ def test_tier_immutable_trigger_is_added_by_migration_3_not_migration_1(tmp_path
         # Positive control: a legitimate write still succeeds post-migration,
         # on this same connection, using the schema-v4 evidence-anchor shape.
         content = "fixture: a post-migration corroborating transcript line"
-        second_chunk_id = _seed_transcript_chunk(conn, session_id, content)
+        second_chunk_id = _seed_transcript_chunk(conn, session_id, content, seq=99)
         start, end = _span(content, "post-migration corroborating transcript line")
         second_id = write_memory(
             conn,
@@ -911,6 +1201,57 @@ def test_no_delete_or_drop_sql_is_ever_issued_by_the_memory_module(tmp_path):
     assert _executed_sql_strings(poisoned) == ["DELETE FROM memories WHERE id = ?"]
 
 
+@pytest.mark.inv4
+def test_a_live_memory_cannot_be_rewritten_in_place_by_raw_sql(db):
+    """A memory nothing supersedes is still not editable: rewriting is not correcting.
+
+    Migration 3 froze `tier` and migration 5 froze a *superseded* row
+    entirely; until migration 8 a current memory's `statement`, `origin`,
+    `project_id`, and `session_id` were rewritable by any raw `UPDATE` —
+    the history-destroying edit supersession exists to replace. Attacked
+    here with hand-written `sqlite3` SQL, never through `palaver.memory`.
+
+    Positive control: `created_at` is deliberately outside this rule, so the
+    same connection still writes it — the refusals are scoped rather than a
+    table freeze — and the legitimate correction path still works.
+    """
+    project_id, session_id = _seed_project_and_session(db)
+    memory_id = _write_evidenced_memory(
+        db, project_id, session_id, "fixture: what the observer first recorded", 4
+    )
+    db.commit()
+    before = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+
+    # Control for the premise: nothing supersedes this row, so migration 5's
+    # superseded-row guard is not what refuses the UPDATEs below.
+    assert not is_superseded(db, memory_id)
+    for clause, params in (
+        ("statement = ?", ("fixture: a statement rewritten in place",)),
+        ("origin = ?", ("attacker",)),
+        ("project_id = ?", (project_id,)),
+        ("session_id = ?", (None,)),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(f"UPDATE memories SET {clause} WHERE id = ?", (*params, memory_id))
+
+    assert db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone() == before
+
+    # Positive control: the row is still reachable and correctable.
+    db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?", ("2005-05-05T00:00:00.000Z", memory_id)
+    )
+    successor_id = supersede_memory(
+        db,
+        predecessor_id=memory_id,
+        statement="fixture: what the observer recorded instead",
+        origin="observer",
+        tier=4,
+        evidence=[_seed_anchor(db, session_id)],
+    )
+    db.commit()
+    assert successor_of(db, memory_id) == successor_id
+
+
 # =============================================================================
 # Task 2.4 — supersession as a derived view, never a stored flag
 # =============================================================================
@@ -988,13 +1329,21 @@ def test_supersede_preserves_original_row(db):
     after = db.execute("SELECT * FROM memories WHERE id = ?", (predecessor_id,)).fetchone()
     assert after == before
 
-    # Positive control 1: the successor is not superseded, so it is still
-    # writable — the guard tracks the supersedes edge, it is not a freeze on
-    # the whole table.
-    db.execute("UPDATE memories SET origin = ? WHERE id = ?", ("observer-amended", successor_id))
+    # Positive control 1: the guard under test tracks the supersedes edge
+    # rather than freezing the table. `created_at` is the one column
+    # migration 8's live-row rule leaves alone, which is what makes it
+    # discriminate the two rows: the predecessor's is refused because it is
+    # superseded, and the identical UPDATE lands on the successor, which
+    # nothing supersedes.
+    amended_at = "2001-01-01T00:00:00.000Z"
+    with pytest.raises(sqlite3.IntegrityError, match="see its successor"):
+        db.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?", (amended_at, predecessor_id)
+        )
+    db.execute("UPDATE memories SET created_at = ? WHERE id = ?", (amended_at, successor_id))
     assert (
-        db.execute("SELECT origin FROM memories WHERE id = ?", (successor_id,)).fetchone()[0]
-        == "observer-amended"
+        db.execute("SELECT created_at FROM memories WHERE id = ?", (successor_id,)).fetchone()[0]
+        == amended_at
     )
 
     # Positive control 2: the connection still accepts an ordinary write.
@@ -1028,36 +1377,41 @@ def test_lower_tier_cannot_supersede_higher_tier(db):
     )
     db.commit()
 
-    with pytest.raises(sqlite3.IntegrityError, match="lower-confidence tier"):
-        db.execute(
-            "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                project_id,
-                session_id,
-                "fixture: the observer guessed hourly rotation was meant",
-                "observer",
-                TIER_OBSERVER_INFERENCE,
-                user_instruction_id,
-            ),
-        )
+    with _reserved_memory_id(db, session_id) as rival_id:
+        with pytest.raises(sqlite3.IntegrityError, match="lower-confidence tier"):
+            db.execute(
+                "INSERT INTO memories"
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rival_id,
+                    project_id,
+                    session_id,
+                    "fixture: the observer guessed hourly rotation was meant",
+                    "observer",
+                    TIER_OBSERVER_INFERENCE,
+                    user_instruction_id,
+                ),
+            )
 
     assert db.execute("SELECT COUNT(*) FROM superseded_memories").fetchone()[0] == 0
 
     # Positive control: the same tier-4 row is perfectly writable as its own
     # memory; only the supersession link was refused.
-    unlinked_id = db.execute(
-        "INSERT INTO memories(project_id, session_id, statement, origin, tier) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (
-            project_id,
-            session_id,
-            "fixture: the observer guessed hourly rotation was meant",
-            "observer",
-            TIER_OBSERVER_INFERENCE,
-        ),
-    ).lastrowid
-    assert unlinked_id is not None
+    with _reserved_memory_id(db, session_id) as unlinked_id:
+        db.execute(
+            "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                unlinked_id,
+                project_id,
+                session_id,
+                "fixture: the observer guessed hourly rotation was meant",
+                "observer",
+                TIER_OBSERVER_INFERENCE,
+            ),
+        )
+    assert db.execute("SELECT COUNT(*) FROM memories WHERE id = ?", (unlinked_id,)).fetchone()
 
 
 @pytest.mark.inv5
@@ -1126,31 +1480,45 @@ def test_supersedes_naming_no_existing_memory_raises_without_the_foreign_keys_pr
         assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0
 
         project_id, session_id = _seed_project_and_session(raw)
-        with pytest.raises(sqlite3.IntegrityError, match="must name an existing memory"):
-            raw.execute(
-                "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    project_id,
-                    session_id,
-                    "fixture: a successor pointing at a memory that never existed",
-                    "attacker",
-                    TIER_OBSERVER_INFERENCE,
-                    999_999,
-                ),
-            )
+        with _reserved_memory_id(raw, session_id) as dangling_id:
+            with pytest.raises(sqlite3.IntegrityError, match="must name an existing memory"):
+                raw.execute(
+                    "INSERT INTO memories"
+                    "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        dangling_id,
+                        project_id,
+                        session_id,
+                        "fixture: a successor pointing at a memory that never existed",
+                        "attacker",
+                        TIER_OBSERVER_INFERENCE,
+                        999_999,
+                    ),
+                )
 
         # Positive control: unlinked insert, then a genuine supersession.
-        predecessor_id = raw.execute(
-            "INSERT INTO memories(project_id, session_id, statement, origin, tier) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (project_id, session_id, "fixture: a real predecessor", "observer", 4),
-        ).lastrowid
-        successor_id = raw.execute(
-            "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (project_id, session_id, "fixture: a real successor", "observer", 4, predecessor_id),
-        ).lastrowid
+        with _reserved_memory_id(raw, session_id) as predecessor_id:
+            raw.execute(
+                "INSERT INTO memories(id, project_id, session_id, statement, origin, tier) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (predecessor_id, project_id, session_id, "fixture: a real predecessor", "obs", 4),
+            )
+        with _reserved_memory_id(raw, session_id) as successor_id:
+            raw.execute(
+                "INSERT INTO memories"
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    successor_id,
+                    project_id,
+                    session_id,
+                    "fixture: a real successor",
+                    "observer",
+                    4,
+                    predecessor_id,
+                ),
+            )
         assert successor_id != predecessor_id
         raw.commit()
     finally:
@@ -1186,19 +1554,22 @@ def test_a_second_successor_for_the_same_predecessor_raises_on_the_supersedes_un
     )
     db.commit()
 
-    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
-        db.execute(
-            "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                project_id,
-                session_id,
-                "fixture: a rival correction of the same conclusion",
-                "observer",
-                4,
-                predecessor_id,
-            ),
-        )
+    with _reserved_memory_id(db, session_id) as rival_id:
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            db.execute(
+                "INSERT INTO memories"
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rival_id,
+                    project_id,
+                    session_id,
+                    "fixture: a rival correction of the same conclusion",
+                    "observer",
+                    4,
+                    predecessor_id,
+                ),
+            )
 
     # Positive control: a successor for a different predecessor still lands.
     second_successor_id = supersede_memory(
@@ -1253,34 +1624,35 @@ def test_supersedes_uniqueness_is_a_real_unique_index_and_not_only_a_trigger(tmp
         )
         conn.commit()
 
-        rival_correction = (
-            project_id,
-            session_id,
-            "fixture: a rival correction",
-            "observer",
-            4,
-            predecessor_id,
-        )
-
-        # With both layers present, the trigger answers first.
-        with pytest.raises(sqlite3.IntegrityError, match="at most one successor"):
-            conn.execute(
-                "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rival_correction,
+        # One reservation serves both attempts: neither insert lands, so the
+        # id stays free and its evidence row is cleaned up on the way out.
+        with _reserved_memory_id(conn, session_id) as rival_id:
+            rival_correction = (
+                rival_id,
+                project_id,
+                session_id,
+                "fixture: a rival correction",
+                "observer",
+                4,
+                predecessor_id,
+            )
+            insert_rival = (
+                "INSERT INTO memories"
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
 
-        # With the trigger gone, the index alone still refuses it — in
-        # SQLite's own words, which no trigger in this schema produces.
-        conn.execute("DROP TRIGGER memories_one_successor_guard")
-        with pytest.raises(
-            sqlite3.IntegrityError, match=r"UNIQUE constraint failed: memories\.supersedes"
-        ):
-            conn.execute(
-                "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rival_correction,
-            )
+            # With both layers present, the trigger answers first.
+            with pytest.raises(sqlite3.IntegrityError, match="at most one successor"):
+                conn.execute(insert_rival, rival_correction)
+
+            # With the trigger gone, the index alone still refuses it — in
+            # SQLite's own words, which no trigger in this schema produces.
+            conn.execute("DROP TRIGGER memories_one_successor_guard")
+            with pytest.raises(
+                sqlite3.IntegrityError, match=r"UNIQUE constraint failed: memories\.supersedes"
+            ):
+                conn.execute(insert_rival, rival_correction)
     finally:
         conn.close()
 
@@ -1353,6 +1725,7 @@ def test_insert_or_replace_on_an_existing_memory_id_raises_so_supersedes_is_the_
     # Positive control: `INSERT OR REPLACE` itself is not banned — only the
     # collision is — so a non-colliding id still writes.
     fresh_id = memory_id + 10_000
+    _seed_evidence_for(db, session_id, fresh_id)
     db.execute(
         "INSERT OR REPLACE INTO memories(id, project_id, session_id, statement, origin, tier) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -1394,20 +1767,25 @@ def test_insert_or_replace_cannot_destroy_a_successor_by_colliding_on_supersedes
     db.commit()
     count_before = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
 
-    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
-        db.execute(
-            "INSERT OR REPLACE INTO memories"
-            "(project_id, session_id, statement, origin, tier, supersedes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                project_id,
-                session_id,
-                "fixture: a correction that would evict the incumbent",
-                "attacker",
-                4,
-                predecessor_id,
-            ),
-        )
+    # The id is stated (and its evidence pre-written) only because migration
+    # 8 requires it; it does not collide with anything, so the `supersedes`
+    # unique index is still the only conflict this REPLACE has to resolve.
+    with _reserved_memory_id(db, session_id) as evicting_id:
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            db.execute(
+                "INSERT OR REPLACE INTO memories"
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evicting_id,
+                    project_id,
+                    session_id,
+                    "fixture: a correction that would evict the incumbent",
+                    "attacker",
+                    4,
+                    predecessor_id,
+                ),
+            )
 
     assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == count_before
     assert (
@@ -1417,19 +1795,21 @@ def test_insert_or_replace_cannot_destroy_a_successor_by_colliding_on_supersedes
 
     # Positive control: the same statement shape against an unclaimed
     # predecessor writes normally.
-    db.execute(
-        "INSERT OR REPLACE INTO memories"
-        "(project_id, session_id, statement, origin, tier, supersedes) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            project_id,
-            session_id,
-            "fixture: a first correction of the unrelated conclusion",
-            "observer",
-            4,
-            other_predecessor_id,
-        ),
-    )
+    with _reserved_memory_id(db, session_id) as unrelated_correction_id:
+        db.execute(
+            "INSERT OR REPLACE INTO memories"
+            "(id, project_id, session_id, statement, origin, tier, supersedes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                unrelated_correction_id,
+                project_id,
+                session_id,
+                "fixture: a first correction of the unrelated conclusion",
+                "observer",
+                4,
+                other_predecessor_id,
+            ),
+        )
     assert is_superseded(db, other_predecessor_id)
 
 
@@ -1478,11 +1858,22 @@ def test_update_or_replace_cannot_destroy_a_superseded_row_through_a_rowid_rewri
         == 1
     )
 
-    # Positive control: the bystander is still an ordinary, writable row.
-    db.execute("UPDATE memories SET origin = ? WHERE id = ?", ("observer-amended", bystander_id))
+    # Positive control: the bystander is an ordinary live row, and the
+    # refusals above are the identity guard rather than a dead connection.
+    # Since migration 8 the columns it froze are refused by their own rule —
+    # a different message — while `created_at`, which no rule covers on a
+    # live row, still writes.
+    with pytest.raises(sqlite3.IntegrityError, match="supersede, never rewrite"):
+        db.execute(
+            "UPDATE memories SET origin = ? WHERE id = ?", ("observer-amended", bystander_id)
+        )
+    db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ("2003-03-03T00:00:00.000Z", bystander_id),
+    )
     assert (
-        db.execute("SELECT origin FROM memories WHERE id = ?", (bystander_id,)).fetchone()[0]
-        == "observer-amended"
+        db.execute("SELECT created_at FROM memories WHERE id = ?", (bystander_id,)).fetchone()[0]
+        == "2003-03-03T00:00:00.000Z"
     )
 
 
@@ -1600,7 +1991,9 @@ def test_supersede_guards_are_added_by_migration_5_not_migration_1(tmp_path):
         assert "superseded_memories" not in views
 
         project_id, session_id = _seed_project_and_session(conn)
-        memory_id = _write_evidenced_memory(
+        # Parent-first: at version 4 the evidence foreign key is immediate,
+        # so `write_memory`'s child-first order cannot run against this store.
+        memory_id = _seed_evidenced_memory_pre_v8(
             conn, project_id, session_id, "fixture: a pre-migration-5 observer inference", 4
         )
         conn.commit()
@@ -1675,31 +2068,28 @@ def test_supersede_guards_are_added_by_migration_5_not_migration_1(tmp_path):
         ]
 
         # A second successor for that same predecessor is refused here too.
-        second_correction = (
-            project_id,
-            session_id,
-            "fixture: a rival correction after migration 5",
-            "observer",
-            TIER_USER_INSTRUCTION,
-            memory_id,
-        )
-        with pytest.raises(sqlite3.IntegrityError, match="at most one successor"):
-            conn.execute(
-                "INSERT INTO memories"
-                "(project_id, session_id, statement, origin, tier, supersedes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                second_correction,
+        with _reserved_memory_id(conn, session_id) as rival_id:
+            second_correction = (
+                rival_id,
+                project_id,
+                session_id,
+                "fixture: a rival correction after migration 5",
+                "observer",
+                TIER_USER_INSTRUCTION,
+                memory_id,
             )
-        # ...and the refusal survives losing the trigger, because migration 5
-        # gave this upgraded store the real partial unique index as well.
-        conn.execute("DROP TRIGGER memories_one_successor_guard")
-        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
-            conn.execute(
+            insert_rival = (
                 "INSERT INTO memories"
-                "(project_id, session_id, statement, origin, tier, supersedes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                second_correction,
+                "(id, project_id, session_id, statement, origin, tier, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
+            with pytest.raises(sqlite3.IntegrityError, match="at most one successor"):
+                conn.execute(insert_rival, second_correction)
+            # ...and the refusal survives losing the trigger, because migration 5
+            # gave this upgraded store the real partial unique index as well.
+            conn.execute("DROP TRIGGER memories_one_successor_guard")
+            with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+                conn.execute(insert_rival, second_correction)
     finally:
         conn.close()
 
@@ -1726,7 +2116,7 @@ def test_migration_5_rolls_back_a_store_that_already_has_two_rows_that_supersede
     conn = connect(db_path)
     try:
         project_id, session_id = _seed_project_and_session(conn)
-        predecessor_id = _write_evidenced_memory(
+        predecessor_id = _seed_evidenced_memory_pre_v8(
             conn, project_id, session_id, "fixture: a doubly-corrected conclusion", 4
         )
         for label in ("first", "second"):
@@ -1763,14 +2153,18 @@ def test_migration_5_rolls_back_a_store_that_already_has_two_rows_that_supersede
     clean = connect(clean_path)
     try:
         project_id, session_id = _seed_project_and_session(clean)
-        predecessor_id = _write_evidenced_memory(
+        predecessor_id = _seed_evidenced_memory_pre_v8(
             clean, project_id, session_id, "fixture: a singly-corrected conclusion", 4
         )
-        clean.execute(
+        # This store does migrate all the way to the latest version below, so
+        # its successor needs evidence too: migration 8 refuses to grandfather
+        # a memory that has none, whichever version wrote it.
+        correction_id = clean.execute(
             "INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (project_id, session_id, "fixture: its one correction", "observer", 4, predecessor_id),
-        )
+        ).lastrowid
+        _seed_evidence_for(clean, session_id, correction_id)
         clean.commit()
     finally:
         clean.close()
@@ -1913,10 +2307,19 @@ def test_update_or_replace_cannot_destroy_a_successor_by_rewriting_supersedes_on
     assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == count_before
     assert successor_of(db, predecessor_id) == successor_id
 
-    # Positive control: a non-identity, non-link column on the same row is
-    # still writable.
-    db.execute("UPDATE memories SET origin = ? WHERE id = ?", ("observer-amended", bystander_id))
+    # Positive control: the refusal above is the `supersedes` rule, not a
+    # dead connection. Since migration 8 `origin` is refused as well, but by
+    # a different rule with a different message, and `created_at` — covered
+    # by neither on a live row — still writes.
+    with pytest.raises(sqlite3.IntegrityError, match="supersede, never rewrite"):
+        db.execute(
+            "UPDATE memories SET origin = ? WHERE id = ?", ("observer-amended", bystander_id)
+        )
+    db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ("2004-04-04T00:00:00.000Z", bystander_id),
+    )
     assert (
-        db.execute("SELECT origin FROM memories WHERE id = ?", (bystander_id,)).fetchone()[0]
-        == "observer-amended"
+        db.execute("SELECT created_at FROM memories WHERE id = ?", (bystander_id,)).fetchone()[0]
+        == "2004-04-04T00:00:00.000Z"
     )

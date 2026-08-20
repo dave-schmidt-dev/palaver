@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import ctypes
+import errno
 import json
 import os
 import plistlib
@@ -1396,6 +1397,7 @@ def test_a_second_daemon_refuses_to_start_while_the_first_still_serves(short_tmp
         )
         assert second.returncode != 0, "a second daemon started alongside the first"
         assert "DaemonAlreadyRunningError" in second.stdout
+        assert f"holder pid {first.pid}" in second.stdout
         assert first.poll() is None, "the first daemon died, so this proved nothing"
     finally:
         first.kill()
@@ -1420,6 +1422,47 @@ def test_the_writer_role_is_released_when_the_first_daemon_exits(short_tmp):
     )
     assert second.returncode == 0, f"the role never came back: {second.stdout}{second.stderr}"
     assert "HELD" in second.stdout
+
+
+def test_a_deep_store_reports_its_running_lock_holder_without_a_socket(short_tmp):
+    """F_GETLK observes the liveness marker without taking any lock itself."""
+    db_path = short_tmp / ("deep-" * 20) / "palaver.db"
+    assert (
+        len(os.fsencode(writer_socket.lock_path_for(db_path)))
+        > writer_socket.MAX_SOCKET_PATH_BYTES
+    )
+    holder = _holder(db_path)
+    try:
+        for _ in range(20):
+            assert writer_socket.daemon_running(db_path) is True
+            second = subprocess.run(
+                [sys.executable, "-c", _HOLDER, str(db_path), "0.1"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert second.returncode != 0
+            assert f"holder pid {holder.pid}" in second.stdout
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_deep_store_liveness_logs_the_actual_lock_error(short_tmp, monkeypatch, caplog):
+    """A failed liveness probe reports the OS error, not the path-length cause."""
+    db_path = short_tmp / "palaver.db"
+
+    def too_long(_path):
+        raise writer_socket.SocketPathTooLongError("too long")
+
+    def denied(*_args, **_kwargs):
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(writer_socket, "socket_path_for", too_long)
+    monkeypatch.setattr(writer_socket.os, "open", denied)
+
+    assert writer_socket.daemon_running(db_path) is None
+    assert "permission denied" in caplog.text
 
 
 def test_a_stale_socket_node_is_unlinked_and_replaced_under_the_held_lock(short_tmp):

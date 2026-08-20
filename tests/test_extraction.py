@@ -221,9 +221,7 @@ def test_recapitalized_statement_is_not_tier_one(tmp_path):
 def test_real_quote_wrong_statement_is_not_tier_one(tmp_path):
     """A verbatim quote carrying a statement the model wrote itself is tier-4.
 
-    Input shape harvested from spike run 2's baseline arm over fixture B
-    (`spikes/2026-08-14-e4b-extraction/out_B_base.txt`, Gemma 3n E4B q4_0,
-    2026-08-14, run header `v2_B.txt [BASELINE]`). That run returned six
+    Input shape harvested from the archived baseline experiment. That run returned six
     `user_decisions`; the spike's substring check reported 6 of 6 quotes
     REAL, and three of the six nonetheless carried a `statement` the model
     had composed rather than quoted — including one whose quote was a bare

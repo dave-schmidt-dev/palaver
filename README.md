@@ -4,7 +4,7 @@ A local-first observer, memory, and situational-awareness system for people runn
 
 **Status:** iTerm2 shows a deterministic, session-owned companion pane above each supported agent pane. That surface is fully deterministic and depends on no model.
 
-The observer -- and with it extraction and memory -- is **dormant as of 2026-08-18**. It requires a local llama-server on `127.0.0.1:8090`; with that server down it retried without backoff, spending ~0.5 core and ~3 GB of RSS to record 56,452 consecutive failed model runs and zero events, memories, or transcript chunks. Its launch agent is stopped and disabled rather than removed:
+The observer -- and with it extraction and memory -- is **dormant as of 2026-08-18**. It requires a local llama-server on `127.0.0.1:8090`; its launch agent is stopped and disabled rather than removed until that model path is deliberately re-enabled:
 
 ```sh
 launchctl enable gui/$(id -u)/com.zerodelta.palaver.observe    # revisit later
@@ -72,8 +72,8 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 - **Runtime:** `llama-server` (llama.cpp) with a small local model (Gemma-4 E4B, QAT-Q4_0) on a dedicated localhost port. Multi-session hot memory uses server slots (`-np`) with `--slot-save-path` for persistence; save/restore is measured at 16,732 tokens saved in 33 ms and restored in 21 ms.
 - **Identity:** Codex projects use the canonical working directory plus a stable collision-resistant suffix; Claude Code preserves its existing cwd-key identity. A pane-local session pin is available for deliberate rename/move recovery. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
 - **Memory is append-only.** Correction creates a new superseding row; nothing is deleted or mutated in place. Provenance ordering is enforced by database constraint, not by prompt text — an observer inference cannot supersede an explicit user instruction.
-- **UI:** each agent pane gets its own shallow companion pane above it, showing that session's deterministic activity summary, goal, tasks, and open questions. A local LLM is optional compression, not the source of status.
-- **Pane layout:** labeled sections in a fixed gutter — `REQUEST`, `NOW`, `TASKS`, `ASK`, `COMMAND`, `DETAIL`. Every section with content earns one row before any earns a second, then spare rows go to the lists and `NOW` absorbs the remainder, so a two-row pane still shows the request and a ten-row pane fills. Activity rows are colored by the producer's evidence kind (red for a failure, dim for tool traffic, default weight for the agent's own prose); the renderer never reads display text to pick a color.
+- **UI:** each agent pane gets its own shallow companion pane above it, showing that session's deterministic activity summary, goal, open questions, and recent activity. A local LLM is optional compression, not the source of status.
+- **Pane layout:** labeled sections in a fixed gutter — `REQUEST`, `NOW`, `ASK`, `COMMAND`, `DETAIL`. Every section with content earns one row before any earns a second, then spare rows go to the lists and `NOW` absorbs the remainder, so a two-row pane still shows the request and a ten-row pane fills. Activity rows fold each completed tool call and result into one row, and are colored by the producer's evidence kind (red for a failure, dim for tool traffic, default weight for the agent's own prose); the renderer never reads display text to pick a color.
 - **Self-observation:** Palaver records the *fact* of a query from the server side and does not feed its own output back through the observer.
 
 ## Sensitivity
@@ -83,6 +83,8 @@ Palaver's database aggregates the full, unredacted content of every observed ses
 Test fixtures are transcripts, so the corpus is sanitized under an **allowlist**: a record ships only if it matches a structural shape carrying no free text, or its free-text payload was replaced with prose written for the fixture. `palaver fixture-lint` enforces this and fails on any record it cannot classify.
 
 It checks *every* file under `tests/fixtures/`, not every `.jsonl`. Discovery was a `*.jsonl` glob until 2026-08-15, which left seven committed files unopened — among them a golden output holding verbatim `HUMAN:`/`AGENT:` lines. An extension no checker claims is now a rejection rather than a skip, so a fixture cannot arrive in a new format and be counted as passing.
+
+Before changing fixtures, run provenance lint against every local source corpus that could have supplied their prose: `uv run palaver fixture-lint --provenance-source <source-root>`. This is a manual release gate because the real source corpora are private and absent from CI; an absent requested source is a non-zero error, never a pass.
 
 ## Open questions
 

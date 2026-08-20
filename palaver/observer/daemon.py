@@ -69,7 +69,7 @@ from palaver.extract.client import ModelClient
 from palaver.extract.normalize import normalize_path
 from palaver.extract.persist import persist_extraction
 from palaver.ingest.adapters.base import DEFAULT_SINCE, Adapter, SessionRef
-from palaver.ingest.cursors import CursorStore
+from palaver.ingest.cursors import CursorStore, FailureBackoffStore
 from palaver.observer.scheduler import SessionWork, TickPlan, plan_tick
 from palaver.observer.signals import REFINEMENT_PAYLOAD_KEYS, extraction_from_model_payload
 from palaver.project_identity import (
@@ -92,6 +92,12 @@ EXTRACTION_PURPOSE = "observer-extraction"
 #: (33 ms / 21 ms) is affordable at a 30-60 s tick; 30 s is the responsive
 #: end of that range.
 DEFAULT_INTERVAL = 30.0
+
+# A failed local model should not turn a 30-second sweep into a permanent
+# retry loop. The ceiling still revisits a session often enough to recover
+# without a daemon restart.
+INITIAL_FAILURE_BACKOFF_SECONDS = 30.0
+MAX_FAILURE_BACKOFF_SECONDS = 15 * 60.0
 
 
 def extraction_schema() -> dict:
@@ -188,6 +194,7 @@ class TickResult:
     plan: TickPlan
     extracted: tuple[str, ...]
     failed: tuple[tuple[str, str], ...]
+    deferred: tuple[str, ...] = ()
 
 
 def _get_or_create_project(conn: sqlite3.Connection, name: str, path: str) -> int:
@@ -356,6 +363,7 @@ class ObserverDaemon:
         all: bool = False,
         connect_fn: Callable[[str | Path], sqlite3.Connection] = connect,
         migrate_fn: Callable[[str | Path], int] = migrate,
+        backoff_store: FailureBackoffStore | None = None,
     ) -> None:
         """Configure the daemon. No file is opened until `start()`.
 
@@ -375,6 +383,8 @@ class ObserverDaemon:
                 test can observe exactly how many connections exist.
             migrate_fn: Brings the store to the current schema version. Runs
                 once, in `start()`, before the write connection is opened.
+            backoff_store: Durable per-session retry state. Defaults beside
+                cursors so an explicit cursor root moves all observer state.
         """
         self.db_path = Path(db_path)
         self.adapters = tuple(adapters)
@@ -385,6 +395,7 @@ class ObserverDaemon:
         self.all = all
         self._connect_fn = connect_fn
         self._migrate_fn = migrate_fn
+        self.backoff = FailureBackoffStore(cursors.root) if backoff_store is None else backoff_store
         self._conn: sqlite3.Connection | None = None
         self._ticks = 0
 
@@ -458,16 +469,36 @@ class ObserverDaemon:
 
         extracted: list[str] = []
         failed: list[tuple[str, str]] = []
+        deferred: list[str] = []
+        now_epoch = (datetime.now().timestamp() if now is None else now.timestamp())
         for work in plan.scheduled:
             key = work.ref.session_key
+            retry_at = self.backoff.retry_at(key, source=work.ref.source)
+            if retry_at is not None and now_epoch < retry_at:
+                deferred.append(key)
+                self.on_status(
+                    f"tick {tick}: backing off {key} for {retry_at - now_epoch:.0f}s after failure"
+                )
+                continue
             self.on_status(f"tick {tick}: extracting {key}")
             try:
                 self.extractor(work, conn=conn, on_status=self.on_status)
             except Exception as exc:  # noqa: BLE001 - one session must not stop the loop
                 failed.append((key, f"{type(exc).__name__}: {exc}"))
-                self.on_status(f"tick {tick}: extraction failed for {key}: {exc}")
+                retry_at = self.backoff.record_failure(
+                    key,
+                    source=work.ref.source,
+                    now=now_epoch,
+                    initial_seconds=INITIAL_FAILURE_BACKOFF_SECONDS,
+                    maximum_seconds=MAX_FAILURE_BACKOFF_SECONDS,
+                )
+                self.on_status(
+                    f"tick {tick}: extraction failed for {key}: {exc}; "
+                    f"retrying in {retry_at - now_epoch:.0f}s"
+                )
                 continue
             self.cursors.save(key, work.cursor_after, source=work.ref.source)
+            self.backoff.clear(key, source=work.ref.source)
             extracted.append(key)
 
         return TickResult(
@@ -475,6 +506,7 @@ class ObserverDaemon:
             plan=plan,
             extracted=tuple(extracted),
             failed=tuple(failed),
+            deferred=tuple(deferred),
         )
 
     def run(
@@ -529,6 +561,8 @@ class ObserverDaemon:
 
 __all__ = [
     "DEFAULT_INTERVAL",
+    "INITIAL_FAILURE_BACKOFF_SECONDS",
+    "MAX_FAILURE_BACKOFF_SECONDS",
     "DEFAULT_MODEL",
     "DaemonNotStartedError",
     "EXTRACTION_INSTRUCTION",

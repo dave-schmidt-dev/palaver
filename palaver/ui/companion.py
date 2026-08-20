@@ -499,6 +499,21 @@ class CompanionController:
         return new_id
 
     @staticmethod
+    def _tab_for(app: Any, tab: Any, session_id: str | None = None) -> Any | None:
+        """Locate the live tab matching `tab`, surviving app refreshes."""
+        tab_id = getattr(tab, "tab_id", None)
+        for candidate in getattr(app, "terminal_windows", None) or ():
+            for item in getattr(candidate, "tabs", None) or ():
+                if tab_id is not None and getattr(item, "tab_id", None) == tab_id:
+                    return item
+                if session_id is not None and any(
+                    getattr(s, "session_id", None) == session_id
+                    for s in getattr(item, "sessions", ()) or ()
+                ):
+                    return item
+        return tab
+
+    @staticmethod
     def _window_for(app: Any, tab: Any, session: Any) -> Any | None:
         """Locate the window owning `tab`, preferring the session's own link."""
         window = getattr(session, "window", None)
@@ -555,7 +570,7 @@ class CompanionController:
             companion: The session `async_split_pane` returned.
         """
         iterm2 = import_iterm2()
-        tab = agent.tab
+        tab = self._tab_for(app, agent.tab, agent.session_id)
         panes: dict[str, Any] = {}
         summary = observed = None
         for attempt in range(LAYOUT_SETTLE_ATTEMPTS):
@@ -565,6 +580,7 @@ class CompanionController:
                 await app.async_refresh()
             except Exception:
                 self._on_status(f"could not refresh layout before sizing {agent.session_id}")
+            tab = self._tab_for(app, agent.tab, agent.session_id)
             panes = {item.session_id: item for item in getattr(tab, "sessions", None) or ()}
             summary = panes.get(companion.session_id)
             observed = panes.get(agent.session_id)
@@ -620,7 +636,11 @@ class CompanionController:
         # A ten-row summary plus at least one agent row is the only local
         # precondition. iTerm owns all other layout constraints and may still
         # refuse the split, which is handled as a per-pane failure below.
-        if agent.session.grid_size.height < SUMMARY_ROWS + MIN_AGENT_ROWS:
+        session_getter = getattr(app, "get_session_by_id", None)
+        live_session = (
+            session_getter(agent.session_id) if session_getter else None
+        ) or agent.session
+        if live_session.grid_size.height < SUMMARY_ROWS + MIN_AGENT_ROWS:
             return None
         state_path = opaque_state_path(self.state_dir, agent.session_id)
         companion = None
@@ -629,23 +649,24 @@ class CompanionController:
             await asyncio.to_thread(self._write_initial_state, state_path, detected, joined)
             command = companion_command(state_path)
             profile = self._profile_builder(command)
-            companion = await agent.session.async_split_pane(
+            companion = await live_session.async_split_pane(
                 vertical=False, before=True, profile_customizations=profile
             )
             self._pending.add(companion.session_id)
             await companion.async_set_variable(ROLE_VARIABLE, COMPANION_ROLE)
             await companion.async_set_variable(AGENT_SESSION_VARIABLE, agent.session_id)
-            await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, companion.session_id)
-            await agent.session.async_set_variable(DISABLED_VARIABLE, False)
+            await live_session.async_set_variable(COMPANION_SESSION_VARIABLE, companion.session_id)
+            await live_session.async_set_variable(DISABLED_VARIABLE, False)
             await self._size_companion(app, agent, companion)
 
             # Splitting activates the new pane. Restore only when it is still
             # active in this same tab; never steal focus after the user moved.
+            active_tab = self._tab_for(app, agent.tab, agent.session_id)
             if (
-                agent.tab.current_session is not None
-                and agent.tab.current_session.session_id == companion.session_id
+                active_tab.current_session is not None
+                and active_tab.current_session.session_id == companion.session_id
             ):
-                await agent.session.async_activate(select_tab=False, order_window_front=False)
+                await live_session.async_activate(select_tab=False, order_window_front=False)
             self._restart_attempts.pop(agent.session_id, None)
             self._retry_after.pop(agent.session_id, None)
             return CompanionPair(agent.session_id, companion.session_id, state_path)
@@ -657,7 +678,7 @@ class CompanionController:
                 except Exception:
                     pass
             try:
-                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                await live_session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
             except Exception:
                 pass
             try:
@@ -674,13 +695,14 @@ class CompanionController:
                 except Exception:
                     pass
             try:
-                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                await live_session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
             except Exception:
                 pass
             try:
                 state_path.unlink(missing_ok=True)
             except OSError:
                 self._on_status(f"could not remove partial companion state for {agent.session_id}")
+            self._on_status(f"failed to initialize companion for {agent.session_id}")
             return None
         finally:
             if companion is not None:

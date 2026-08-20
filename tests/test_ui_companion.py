@@ -983,7 +983,7 @@ def test_agent_mutations_are_bounded_to_split_link_and_conditional_focus():
     assert "agent.session.async_send_text" not in source
     assert "agent.session.async_close" not in source
     assert "agent.session.async_set_profile_properties" not in source
-    assert source.count("agent.session.async_activate(") == 1
+    assert source.count(".async_activate(") == 1
     assert "select_tab=False" in source and "order_window_front=False" in source
 
 
@@ -997,3 +997,57 @@ def test_operation_trace_never_closes_or_sends_text_to_agent(tmp_path, monkeypat
     assert agent.close_calls == []
     assert agent.sent_text == []
     assert summary.close_calls == [{"force": True}]
+
+
+def test_rebuilt_tab_instance_after_split_is_located_and_sized(tmp_path, monkeypatch):
+    """When an app refresh replaces the Tab object with a distinct instance, sizing locates it."""
+    stub_iterm(monkeypatch)
+    app, agent, summary = paired_app()
+    original_tab = app.tab
+
+    class DistinctRebuiltTab(FakeTab):
+        def __init__(self, tab_id, sessions):
+            super().__init__(sessions)
+            self.tab_id = tab_id
+
+    def rebuild_tab_distinct():
+        if agent.split_calls:
+            new_tab = DistinctRebuiltTab(original_tab.tab_id, [agent, summary])
+            app.tab = new_tab
+            app.window.tabs = [new_tab]
+
+    app.refresh_hook = rebuild_tab_distinct
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary",)
+    assert app.tab.layout_updates == 1
+    assert summary.preferred_size == (100, companion.SUMMARY_ROWS)
+    assert agent.preferred_size == (100, 20)
+
+
+def test_create_reacquires_live_session_before_splitting(tmp_path, monkeypatch):
+    """A stale inventory session is never mutated after the app exposes its replacement."""
+    stub_iterm(monkeypatch)
+    stale_agent = FakeSession("agent", height=30)
+    stale_tab = FakeTab([stale_agent])
+    live_agent = FakeSession("agent", height=30)
+    summary = FakeSession("summary", job_pid=20)
+    live_agent.split_result = summary
+    live_tab = FakeTab([live_agent])
+    app = FakeApp(live_tab)
+    metadata = SessionMetadata(
+        session=stale_agent,
+        tab=stale_tab,
+        pane=PaneVariables("agent", 10, "codex", "/tmp"),
+    )
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(
+        ctl._create(app, metadata, SupportedPaneProcess("agent", 10, "codex", Path("/tmp")), None)
+    )
+
+    assert result is not None
+    assert stale_agent.split_calls == []
+    assert len(live_agent.split_calls) == 1

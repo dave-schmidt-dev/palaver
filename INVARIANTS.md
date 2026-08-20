@@ -139,6 +139,8 @@ rationale: Tier-1 provenance means "the user said this", and it is the tier ever
   `isMeta` flag plus a prefix table fixed it (all 11 injected lines correctly classified across three
   fixtures). Harness records OF human actions — `[Request interrupted by user]` — are retained as
   tier-3 observed events; they are evidence, they are just not quotable as instructions.
+  Codex has no equivalent structural marker. Its prefix classifier is therefore permanently capped
+  at tier-4; measurements remain diagnostic and can never promote Codex-sourced content.
 
 ### INV-9 — Observed-session content never leaves this machine
 area: ["palaver/**/*.py", "pyproject.toml", "tests/fixtures/**"]

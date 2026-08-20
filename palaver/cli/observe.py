@@ -25,7 +25,6 @@ is derived from a real observed session (INV-9).
 from __future__ import annotations
 
 import sys
-import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -42,16 +41,12 @@ NAME = "observe"
 
 HELP = "watch every discovered session and extract the ones that changed"
 
-#: Default store location. Outside the repository for the same reason
-#: `palaver.cli.replay.DEFAULT_DB_PATH` is: a default that writes inside a
-#: checkout turns a stray invocation into a dirty tree. Task 5.0's launchd
-#: agent passes an explicit `--db`, which is where the real store gets a
-#: permanent home; nothing here should be treated as that home.
-DEFAULT_DB_PATH = Path(tempfile.gettempdir()) / "palaver-observe" / "observe.db"
-
-#: Default cursor root, kept beside the store so the two stay consistent
-#: when either is thrown away.
-DEFAULT_CURSOR_ROOT = Path(tempfile.gettempdir()) / "palaver-observe" / "cursors"
+#: Durable project-local observer state. `.state` is already gitignored and
+#: is the convention used by the companion, so a default launch accumulates
+#: useful memory without making a checkout dirty in version control.
+DEFAULT_STATE_ROOT = Path.cwd() / ".state" / "observer"
+DEFAULT_DB_PATH = DEFAULT_STATE_ROOT / "observe.db"
+DEFAULT_CURSOR_ROOT = DEFAULT_STATE_ROOT / "cursors"
 
 
 def add_arguments(parser) -> None:
@@ -140,7 +135,8 @@ def render_tick(result: TickResult) -> str:
         f"tick {result.tick}: discovered={result.plan.discovered} "
         f"changed={len(result.plan.scheduled)} "
         f"extracted={len(result.extracted)} "
-        f"failed={len(result.failed)}\n"
+        f"failed={len(result.failed)} "
+        f"deferred={len(result.deferred)}\n"
     )
 
 

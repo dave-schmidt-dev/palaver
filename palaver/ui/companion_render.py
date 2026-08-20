@@ -172,7 +172,6 @@ def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ..
     return {
         "REQUEST": _nonempty(state.request),
         "NOW": _activity_items(state),
-        "TASKS": _nonempty(*state.tasks),
         "ASK": _nonempty(*state.questions, color=AMBER),
         # Both reducers populate `command_result` only from a failure, so this
         # row is never a neutral outcome.
@@ -183,13 +182,13 @@ def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ..
 
 # Every section with content earns its first row in this order, so a two-line
 # pane still shows the request and a four-line one still reaches the question.
-_ROW_ORDER = ("REQUEST", "NOW", "ASK", "TASKS", "COMMAND", "DETAIL")
+_ROW_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
 # Spare rows then go to the sections that hold lists, smallest appetite first,
 # and NOW absorbs whatever is left because it is the only open-ended one.
-_GROWTH_ORDER = ("ASK", "TASKS", "NOW")
-_GROWTH_CAPS = {"ASK": 2, "TASKS": 3, "NOW": MAX_ITEMS}
+_GROWTH_ORDER = ("ASK", "NOW")
+_GROWTH_CAPS = {"ASK": 2, "NOW": MAX_ITEMS}
 # Reading order down the pane, which is deliberately not the order above.
-_DISPLAY_ORDER = ("REQUEST", "NOW", "TASKS", "ASK", "COMMAND", "DETAIL")
+_DISPLAY_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
 # The widest label plus the gutter that lines every section's items up.
 _LABEL_WIDTH = 9
 
@@ -248,7 +247,7 @@ _STATUS_COLORS = {
     "ERROR": RED,
     "UNKNOWN": RED,
 }
-_CONTENT_LABELS = {"REQUEST", "NOW", "ASK", "COMMAND", "TASKS", "DETAIL"}
+_CONTENT_LABELS = {"REQUEST", "NOW", "ASK", "COMMAND", "DETAIL"}
 
 
 def _style_line(line: str, color: str = "") -> str:

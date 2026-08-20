@@ -22,6 +22,7 @@ from palaver.summary.model import (
     SummarySnapshot,
     TaskItem,
     append_recent,
+    fold_recent_result,
     sanitize_text,
 )
 
@@ -203,7 +204,6 @@ def reduce_claude_events(
                         pending.pop(tool_id, None)
                     text = _result_text(block)
                     failed = bool(block.get("is_error"))
-                    prefix = "Tool error" if failed else "Tool result"
                     snapshot = replace(
                         snapshot,
                         command_result=(
@@ -211,10 +211,9 @@ def reduce_claude_events(
                             if block.get("is_error")
                             else Claim(None, Provenance.STRUCTURAL, "tool_result", tool_id)
                         ),
-                        recent=append_recent(
+                        recent=fold_recent_result(
                             snapshot.recent,
-                            f"{prefix}: {text}",
-                            Provenance.EXACT,
+                            text,
                             "tool_error" if failed else "tool_result",
                             tool_id if isinstance(tool_id, str) else None,
                         ),

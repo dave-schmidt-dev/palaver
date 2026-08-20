@@ -23,6 +23,13 @@ already-migrated store (this project has none yet, but the next one won't
 get a second chance) permanently missing both columns. Migration 7 adds
 `query_events` and `query_event_memories`, recording which memories an MCP
 client actually retrieved (see `palaver/mcp/query_events.py`, task 6.4).
+Migration 8 moves INV-6's "every memory carries evidence" floor out of
+`palaver/memory/write.py` and into the database: `memory_evidence`'s child
+foreign key becomes deferrable so evidence can be written before its parent,
+and a `BEFORE INSERT` trigger on `memories` refuses any row that no evidence
+already names. The same migration makes a *live* memory's `statement`,
+`origin`, `project_id`, and `session_id` unrewritable, closing the last raw
+`UPDATE` path INV-4 left open.
 
 FTS5's `content=` option names exactly one source table, view, or virtual
 table — a single external-content index cannot span three tables, and a
@@ -464,6 +471,128 @@ _V7_STATEMENTS = (
     "CREATE INDEX query_events_by_created_at ON query_events(created_at)",
 )
 
+# INV-4/INV-6, P1 remediation TD-1: the two rules `write_memory` already
+# followed in Python move to the storage boundary, where the next process to
+# open its own connection cannot step around them. Additive throughout — no
+# earlier migration is edited, and `memories` itself is never rebuilt, because
+# a rebuild is the DROP TABLE that INV-4 exists to forbid.
+#
+# **Live-row mutation.** Migration 5 made a *superseded* row immutable and
+# migration 3 froze `tier`; a live row's `statement`, `origin`, `project_id`,
+# and `session_id` were still rewritable by any raw `UPDATE`. Rewriting a
+# memory's text in place is exactly the history-destroying edit supersession
+# exists to replace, so `memories_live_row_immutable` refuses all four.
+#
+# **Evidence at insertion.** The floor was a `ValueError` in `write_memory`,
+# which the next module to open its own connection walks straight past. Moving
+# it into the database means the parent row must be able to see its children
+# at INSERT time, so the write order inverts: evidence first, naming an id
+# reserved for a `memories` row that does not exist yet, then the parent. That
+# requires the child FK to be `DEFERRABLE INITIALLY DEFERRED` — hence the
+# rebuild of `memory_evidence` below, which keeps the one-to-many `memory_id`
+# shape and copies every existing row forward, ids included, because
+# `resolve_evidence` takes a `memory_evidence.id` and a renumbering rebuild
+# would silently invalidate every anchor a caller already holds.
+#
+# Three rejected alternatives, each rejected for a specific incompatibility
+# rather than on taste:
+#
+#   * A circular FK (`memories.primary_evidence_id` <-> `memory_evidence`)
+#     cannot express "at least one child" at all — it proves one named child
+#     exists, and privileges it among what can legitimately be several.
+#   * A primary-anchor redesign abandons the one-to-many `memory_id` column
+#     that supersession (migration 5) and `resolve_evidence` are built on.
+#   * Commit-time-only enforcement — the deferred FK alone — raises at
+#     `conn.commit()`, after `write_memory` has already returned an id. The
+#     charter gate test requires the *write call itself* to fail.
+#
+# So the deferred FK is the enabler, never the enforcement. Enforcement is
+# `memories_requires_evidence`, a BEFORE INSERT trigger: triggers fire
+# regardless of `PRAGMA foreign_keys`, which is per connection and therefore
+# not a guarantee at all (the same reasoning as migration 5's
+# `memories_supersedes_must_exist`).
+#
+# The trigger also rejects an insert that lets SQLite pick the id. Measured on
+# SQLite 3.53: in a BEFORE INSERT trigger, `NEW.id` for an unspecified INTEGER
+# PRIMARY KEY is **-1**, not NULL and not the rowid the row will receive — so
+# a bare `NOT EXISTS (... memory_id = NEW.id)` would be satisfiable by an
+# evidence row planted at `memory_id = -1`, which with foreign keys off nothing
+# else would catch. `NEW.id IS NULL OR NEW.id < 1` closes that and makes the
+# pre-reserved id mandatory rather than conventional.
+_V8_STATEMENTS = (
+    # Inventory before enforcing: a store that already violates INV-6 is
+    # reported, not grandfathered. The scratch table is a carrier for the
+    # message — one offending row makes the INSERT fire the trigger, and the
+    # migration runner then restores its verified pre-DDL backup, so nothing
+    # here survives either outcome. A CHECK constraint would abort just as
+    # loudly but could only say "CHECK constraint failed".
+    "CREATE TABLE memories_missing_evidence (memory_id INTEGER PRIMARY KEY)",
+    """
+    CREATE TRIGGER memories_missing_evidence_guard
+    BEFORE INSERT ON memories_missing_evidence
+    BEGIN
+        SELECT RAISE(ABORT,
+            'migration 8: a memories row has no evidence link; INV-6 forbids grandfathering it');
+    END
+    """,
+    """
+    INSERT INTO memories_missing_evidence(memory_id)
+    SELECT m.id FROM memories AS m
+    WHERE NOT EXISTS (SELECT 1 FROM memory_evidence AS e WHERE e.memory_id = m.id)
+    """,
+    "DROP TRIGGER memories_missing_evidence_guard",
+    "DROP TABLE memories_missing_evidence",
+    # The rebuild. Only `memory_evidence` is rebuilt — never `memories` —
+    # and every column, CHECK, and id is carried across unchanged apart from
+    # the FK becoming deferrable.
+    f"""
+    CREATE TABLE memory_evidence_v8 (
+        id INTEGER PRIMARY KEY,
+        memory_id INTEGER NOT NULL
+            REFERENCES memories(id) DEFERRABLE INITIALLY DEFERRED,
+        transcript_chunk_id INTEGER REFERENCES transcript_chunks(id),
+        event_id INTEGER REFERENCES events(id),
+        start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+        end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+        created_at TEXT NOT NULL {_CREATED_AT_DEFAULT},
+        CHECK (transcript_chunk_id IS NOT NULL OR event_id IS NOT NULL)
+    )
+    """,
+    """
+    INSERT INTO memory_evidence_v8(
+        id, memory_id, transcript_chunk_id, event_id, start_offset, end_offset, created_at
+    )
+    SELECT id, memory_id, transcript_chunk_id, event_id, start_offset, end_offset, created_at
+    FROM memory_evidence
+    """,
+    "DROP TABLE memory_evidence",
+    "ALTER TABLE memory_evidence_v8 RENAME TO memory_evidence",
+    # Scoped to the four columns a live row could still lose: `tier` is
+    # migration 3's and `id`/`supersedes` are migration 5's, so restating them
+    # here would only give two triggers the chance to disagree. `created_at`
+    # is left out deliberately — it records when the row was written, carries
+    # no claim about the world, and the staged-migration tests need one
+    # writable column to prove these guards are scoped rather than a freeze.
+    """
+    CREATE TRIGGER memories_live_row_immutable
+    BEFORE UPDATE OF statement, origin, project_id, session_id ON memories
+    BEGIN
+        SELECT RAISE(ABORT,
+            'this memories column is immutable; supersede, never rewrite (INV-4)');
+    END
+    """,
+    """
+    CREATE TRIGGER memories_requires_evidence
+    BEFORE INSERT ON memories
+    WHEN NEW.id IS NULL OR NEW.id < 1
+      OR NOT EXISTS (SELECT 1 FROM memory_evidence WHERE memory_id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT,
+            'a memory needs evidence written first against an explicit id (INV-6)');
+    END
+    """,
+)
+
 SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -518,6 +647,15 @@ SCHEMA_MIGRATIONS: tuple[Migration, ...] = (
             "actually retrieved (task 6.4, palaver/mcp/query_events.py)"
         ),
         statements=_V7_STATEMENTS,
+    ),
+    Migration(
+        version=8,
+        description=(
+            "memory_evidence rebuilt with a deferred child FK, plus the triggers that "
+            "make a live memories row unrewritable and reject a memory with no evidence "
+            "at insert time (INV-4/INV-6, P1 remediation TD-1)"
+        ),
+        statements=_V8_STATEMENTS,
     ),
 )
 

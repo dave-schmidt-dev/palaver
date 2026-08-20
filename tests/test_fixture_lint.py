@@ -1187,6 +1187,31 @@ def test_readme_narrative_prose_is_not_phrasebook_checked(tmp_path):
     assert fixture_lint.lint_tree(tmp_path).rejections == ()
 
 
+def test_explicit_provenance_check_rejects_verbatim_source_prose(tmp_path):
+    fixture_root = tmp_path / "fixtures"
+    _write_corpus_file(
+        fixture_root,
+        "fixture.jsonl",
+        '{"type":"fixture","message":"This line was copied from a source session."}\n',
+    )
+    source = _write_corpus_file(
+        tmp_path / "source", "session.jsonl", "This line was copied from a source session.\n"
+    )
+
+    rejections = fixture_lint.lint_provenance(fixture_root, (source,))
+
+    assert [rejection.rule for rejection in rejections] == [fixture_lint.RULE_SOURCE_PROVENANCE]
+
+
+def test_explicit_provenance_check_requires_existing_source(tmp_path):
+    _write_corpus_file(tmp_path, "README.md", "This paragraph was written for the corpus.\n")
+
+    assert (
+        main(["fixture-lint", str(tmp_path), "--provenance-source", str(tmp_path / "missing")])
+        == 2
+    )
+
+
 def test_a_code_span_that_wraps_a_line_is_parsed_as_one_span(tmp_path):
     """Regression: the per-line split inverted odd/even after a wrapped span.
 

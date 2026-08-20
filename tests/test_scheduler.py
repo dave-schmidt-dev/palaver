@@ -273,6 +273,13 @@ def _cli_args(tmp_path: Path, sample_root: Path, **overrides) -> SimpleNamespace
     return SimpleNamespace(**args)
 
 
+def test_observe_defaults_use_the_project_local_durable_state_directory():
+    """The daemon's accumulated memory must not disappear with `/tmp`."""
+    expected = Path.cwd() / ".state" / "observer"
+    assert observe_cli.DEFAULT_DB_PATH == expected / "observe.db"
+    assert observe_cli.DEFAULT_CURSOR_ROOT == expected / "cursors"
+
+
 def test_observe_default_and_explicit_roots_select_only_fixture_sources(monkeypatch, tmp_path):
     """Default construction names both sources; one fixture root scopes to one."""
     constructed = []
@@ -507,14 +514,14 @@ def test_observer_tick_emits_status(tmp_path, capsys):
     assert captured.err != "", "the default status channel emitted nothing"
     assert captured.out == "", "the status channel wrote to stdout"
     assert out.getvalue().startswith("tick 1:")
-    assert "changed=0 extracted=0 failed=0" in out.getvalue()
+    assert "changed=0 extracted=0 failed=0 deferred=0" in out.getvalue()
 
 
 # --- at-least-once: a failed extraction is retried ---------------------------
 
 
-def test_failed_extraction_leaves_the_cursor_for_the_next_tick(tmp_path):
-    """A raising extractor does not consume the cursor, so the next tick retries.
+def test_failed_extraction_leaves_the_cursor_and_uses_durable_backoff(tmp_path):
+    """A failure retries later, and restart does not erase that backoff.
 
     The swap to a succeeding extractor at the end is the positive control:
     without it, "the cursor did not advance" would also pass on a daemon
@@ -535,16 +542,27 @@ def test_failed_extraction_leaves_the_cursor_for_the_next_tick(tmp_path):
 
         second = daemon.tick(now=NOW)
         assert len(second.plan.scheduled) == 1
-        assert failing.calls == [key, key]
+        assert second.deferred == (key,)
+        assert failing.calls == [key]
+
+        # A new daemon shares the durable cursor/backoff root, so a restart
+        # cannot turn a down model into a hot loop.
+        daemon.close()
+        daemon = _daemon(tmp_path, sample_root, failing)
+        daemon.start()
+        deferred_after_restart = daemon.tick(now=NOW)
+        assert deferred_after_restart.deferred == (key,)
+        assert failing.calls == [key]
 
         # Positive control: the cursor does advance once extraction succeeds.
         succeeding = RecordingExtractor()
         daemon.extractor = succeeding
-        third = daemon.tick(now=NOW)
+        third = daemon.tick(now=NOW + timedelta(seconds=30))
         assert third.extracted == (key,)
         assert cursors.load(key).offset > 0
 
         fourth = daemon.tick(now=NOW)
+        daemon.close()
 
     assert fourth.plan.scheduled == ()
     assert succeeding.calls == [key]

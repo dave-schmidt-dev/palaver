@@ -97,7 +97,13 @@ AGENT_PID = 63354
 def _table(rows=CLAUDE_TREE):
     """Build a process table from `(pid, ppid, command)` rows."""
     return {
-        pid: ProcessInfo(pid=pid, ppid=ppid, name=process_name(command), command=command)
+        pid: ProcessInfo(
+            pid=pid,
+            ppid=ppid,
+            name=process_name(command),
+            command=command,
+            start_time="Fri Aug 15 12:00:00 2026",
+        )
         for pid, ppid, command in rows
     }
 
@@ -394,6 +400,40 @@ def test_codex_ambiguity_narrowing_asks_about_the_agent_pid_not_the_job_pid(tmp_
     assert joined.pid == 500
     assert joined.session_key == live.stem
     assert asked_pids == [500], "narrowing must ask about the agent pid, not jobPid"
+
+
+def test_codex_pid_reuse_refuses_descriptor_narrowing(tmp_path):
+    """A fresh process row for the same pid must not select its open files."""
+    cwd = tmp_path / "codex-project"
+    cwd.mkdir()
+    root = tmp_path / "codex-sessions"
+    table = _table(((77201, 62921, "codex"), (62921, 1, "-zsh")))
+    variables = PaneVariables("codex-pane", 77201, "codex", str(cwd))
+    live = _codex_rollout(root, cwd, "rollout-live")
+    _codex_rollout(root, cwd, "rollout-exited")
+    reused = dict(table)
+    old = reused[77201]
+    reused[77201] = ProcessInfo(
+        pid=old.pid,
+        ppid=old.ppid,
+        name=old.name,
+        command=old.command,
+        start_time="Fri Aug 15 12:01:00 2026",
+    )
+
+    joined = join_pane(
+        variables,
+        table=table,
+        cwd_reader=lambda _pid: cwd,
+        store_roots={CODEX_SOURCE: root},
+        now=NOW,
+        process_table_reader=lambda: reused,
+        open_files_reader=lambda _pid: frozenset({live.resolve()}),
+    )
+
+    assert joined is not None
+    assert joined.session_key is None
+    assert joined.store_path is None
 
 
 def test_codex_join_excludes_identity_marked_subagents(tmp_path):

@@ -266,22 +266,15 @@ def test_decision_is_tier_four_when_no_measurement_record_exists(tmp_path):
     )
 
 
-def test_cap_lifts_against_a_passing_measurement(tmp_path):
-    """Positive control: the cap is capable of lifting.
-
-    Every other cap test asserts a refusal. This one proves those refusals
-    are decisions rather than a hardcoded constant — remove it and
-    `cap_codex_tier` could `return TIER_OBSERVER_INFERENCE` unconditionally
-    with a fully green suite.
-    """
+def test_cap_remains_against_a_passing_measurement(tmp_path):
+    """A diagnostic measurement cannot weaken Codex's permanent safety cap."""
     passing = _passing_measurement(tmp_path)
-    assert codex_tier_cap_lifted(measurement_path=passing) is True
+    assert codex_tier_cap_lifted(measurement_path=passing) is False
     assert cap_codex_tier(TIER_USER_INSTRUCTION, measurement_path=passing) == (
-        TIER_USER_INSTRUCTION
+        TIER_OBSERVER_INFERENCE
     )
-    assert require_codex_tier(TIER_USER_INSTRUCTION, measurement_path=passing) == (
-        TIER_USER_INSTRUCTION
-    )
+    with pytest.raises(CodexTierCapError):
+        require_codex_tier(TIER_USER_INSTRUCTION, measurement_path=passing)
 
 
 @pytest.mark.parametrize(
@@ -329,7 +322,7 @@ def test_requesting_tier_one_for_a_codex_source_raises(tmp_path):
     message = str(excinfo.value)
     assert "tier 1" in message
     assert "user_instruction" in message
-    assert str(REQUIRED_LABELLED_RECORDS) in message
+    assert "permanent" in message
 
 
 @pytest.mark.parametrize(

@@ -278,6 +278,7 @@ def _snapshot(index: int, *, updated: float | None = None, request: str | None =
         command_result=f"command-{index}",
         detail=f"connection-{index}",
         recent=(f"activity-{index}",),
+        recent_kinds=("tool_result",),
         tasks=(f"task-{index}",),
         questions=(f"question-{index}",),
     )

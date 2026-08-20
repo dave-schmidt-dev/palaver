@@ -27,30 +27,37 @@ attacks that trigger with a raw `sqlite3` connection, never calling into
 this module, to prove the guarantee does not depend on going through
 `write_memory` at all.
 
-**INV-6 — every memory carries at least one evidence anchor, enforced here.**
-Task 2.1 deliberately left this unenforced: the anchor shape a floor would
-have had to check — a copied `quote` string — was scheduled to be replaced
-by task 2.2 (`palaver/memory/evidence.py`) with `start_offset`/`end_offset`
-span anchors into `transcript_chunks` or `events`, so enforcing against the
-old shape would only have been redone against the new one. That
-replacement has landed: `write_memory` now takes `EvidenceAnchor` rows (see
-`palaver.memory.evidence`) and raises `ValueError` before issuing any
-`INSERT` if called with none. This is a Python-level check, not a database
-trigger like INV-5's. A database-layer design was considered and rejected,
-not skipped for lack of one: give `memories` a `primary_evidence_id
-INTEGER NOT NULL REFERENCES memory_evidence(id)`, written after inserting
-that memory's first evidence row, so a caller with no evidence fails
-immediately on `NOT NULL`/the FK — no commit deferral needed. Rejected
-because it restructures `memory_evidence` away from the 1-many `memory_id`
-shape task 2.4's supersession work is built on, and it privileges one
-evidence row as "primary" among what can legitimately be several. A second
-variant — reserving the memory's id, inserting evidence first with a
-`DEFERRABLE INITIALLY DEFERRED` FK back to it — avoids that restructuring,
-but only raises at `conn.commit()`, after `write_memory` has already
-returned, which cannot satisfy the charter gate test's requirement that
-*the write call itself* raises (`test_memory_without_evidence_is_rejected`).
-The Python-level check above is deliberately the one design that satisfies
-that requirement without the first variant's schema cost.
+**INV-6 — every memory carries at least one evidence anchor, enforced in the
+database.** This paragraph previously explained why the floor was a
+Python-level `ValueError` here and *not* a database rule; that reasoning is
+corrected rather than left standing, because schema migration 8 now carries
+the rule. The `ValueError` stays — it names the invariant in the caller's
+own language, before any SQL runs — but it is no longer the only thing
+between a fabricated memory and the disk. The migration's
+`memories_requires_evidence` trigger refuses any `memories` insert that no
+`memory_evidence` row already names, and a trigger fires whatever process,
+language, or `PRAGMA foreign_keys` setting issued the statement.
+
+That inverts this function's write order. The parent row has to be able to
+see its children at `INSERT` time, so evidence is written **first**, against
+an id reserved for a `memories` row that does not exist yet, and the parent
+row is inserted last with that id stated explicitly. Two things make that
+legal and safe:
+
+* Migration 8 rebuilds `memory_evidence`'s `memory_id` foreign key as
+  `DEFERRABLE INITIALLY DEFERRED`, so a child may name a parent that has not
+  been written yet — checked at commit, by which point the parent exists.
+  The deferred FK is only what makes child-first *possible*; it is not the
+  enforcement, since it would raise at `conn.commit()`, long after this
+  function returned an id. Commit-time-only enforcement was rejected for
+  exactly that reason, as were a circular `primary_evidence_id` FK and a
+  primary-anchor redesign, both of which abandon the one-to-many `memory_id`
+  shape supersession and `resolve_evidence` are built on.
+* The id is reserved as `MAX(id) + 1` under a write lock this function takes
+  if the caller is not already holding one. `memories` is append-only (INV-4)
+  and `memories_id_never_reused` blocks reuse, so the maximum only ever
+  climbs; the lock is what stops two writers reserving the same id and the
+  loser's evidence rows being left pointing at a row it never got to write.
 """
 
 from __future__ import annotations
@@ -81,7 +88,7 @@ def write_memory(
 
     Args:
         conn: Open connection to a database migrated to at least schema
-            version 4.
+            version 8.
         project_id: `projects.id` this memory belongs to.
         statement: The memory's text.
         origin: Free-text description of what produced this memory, e.g.
@@ -108,14 +115,17 @@ def write_memory(
             "evidence link is indistinguishable from a fabrication"
         )
 
-    cursor = conn.execute(
-        """
-        INSERT INTO memories(project_id, session_id, statement, origin, tier, supersedes)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (project_id, session_id, statement, origin, tier, supersedes),
-    )
-    memory_id = cursor.lastrowid
+    # Reserve the id under a write lock. `BEGIN IMMEDIATE` is skipped when the
+    # caller already holds a transaction — nesting one is an error, and the
+    # transaction they hold serializes this reservation just as well. Callers
+    # commonly do hold one: they have just inserted the transcript rows this
+    # evidence anchors into.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    memory_id = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM memories").fetchone()[0]
+
+    # Child-first: these rows name a `memories` row that does not exist yet,
+    # which migration 8's deferred foreign key permits inside a transaction.
     for item in evidence:
         conn.execute(
             """
@@ -132,4 +142,15 @@ def write_memory(
                 item.end_offset,
             ),
         )
+
+    # `id` is stated rather than left to SQLite: `memories_requires_evidence`
+    # runs BEFORE INSERT, where an unspecified INTEGER PRIMARY KEY reads as -1
+    # and could never match the evidence written above.
+    conn.execute(
+        """
+        INSERT INTO memories(id, project_id, session_id, statement, origin, tier, supersedes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, project_id, session_id, statement, origin, tier, supersedes),
+    )
     return memory_id

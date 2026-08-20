@@ -484,6 +484,8 @@ class LegMetrics:
 class EvalReport:
     fixture_ids: tuple[str, ...]
     per_leg: dict[str, LegMetrics] = field(default_factory=dict)
+    run_count: int = 1
+    spread_per_leg: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 def score_leg(

@@ -106,6 +106,16 @@ MAX_SOCKET_PATH_BYTES = 103
 #: needs a refusal it can report, not a stall.
 DEFAULT_TIMEOUT = 5.0
 
+# macOS `struct flock`, used only for a queryable liveness marker beside the
+# authoritative BSD `flock`. Record locks release when *any* descriptor for
+# the file closes, so `single_writer` owns exactly one descriptor for this
+# path and no helper opens another.
+_F_RDLCK = 1
+_F_UNLCK = 2
+_F_WRLCK = 3
+_F_GETLK = 7
+_F_SETLK = 8
+
 StatusFn = Callable[[str], None]
 
 
@@ -131,6 +141,31 @@ class DaemonUnavailableError(RuntimeError):
 
 class UnsupportedOperationError(ValueError):
     """A request naming an operation the write path does not perform."""
+
+
+class _Flock(ctypes.Structure):
+    """macOS `struct flock`, including the holder pid returned by F_GETLK."""
+
+    _fields_ = (
+        ("l_start", ctypes.c_int64),
+        ("l_len", ctypes.c_int64),
+        ("l_pid", ctypes.c_int32),
+        ("l_type", ctypes.c_int16),
+        ("l_whence", ctypes.c_int16),
+    )
+
+
+def _set_record_lock(fd: int, lock_type: int) -> None:
+    """Set the lock-file's zero-byte liveness marker without reopening it."""
+    lock = _Flock(l_start=0, l_len=1, l_pid=0, l_type=lock_type, l_whence=os.SEEK_SET)
+    fcntl.fcntl(fd, _F_SETLK, bytes(lock))
+
+
+def _lock_holder_pid(lock_fd: int) -> int | None:
+    """Return the pid holding the queryable marker, without acquiring a lock."""
+    requested = _Flock(l_start=0, l_len=1, l_pid=0, l_type=_F_WRLCK, l_whence=os.SEEK_SET)
+    lock = _Flock.from_buffer_copy(fcntl.fcntl(lock_fd, _F_GETLK, bytes(requested)))
+    return lock.l_pid if lock.l_type != _F_UNLCK and lock.l_pid > 0 else None
 
 
 class _Statfs(ctypes.Structure):
@@ -231,6 +266,11 @@ def require_local_filesystem(path: Path) -> str:
 def lock_path_for(db_path: Path) -> Path:
     """The lock file that guards `db_path`'s writer role."""
     return db_path.parent / "palaver.lock"
+
+
+def liveness_lock_path_for(db_path: Path) -> Path:
+    """The queryable record-lock marker paired with the writer lock."""
+    return db_path.parent / "palaver.liveness.lock"
 
 
 def socket_path_for(db_path: Path) -> Path:
@@ -346,6 +386,7 @@ def single_writer(
     say(f"data directory {directory} is {fstype}; flock is trustworthy here")
 
     lock_path = lock_path_for(db_path)
+    liveness_path = liveness_lock_path_for(db_path)
 
     # Degrade here, do not refuse. The lock is what makes this the only
     # writer, and a lock path has no length limit; the socket only adds
@@ -365,16 +406,38 @@ def single_writer(
     # nobody's business. `O_CREAT` without `O_TRUNC` so a concurrent holder's
     # descriptor is never disturbed by this open.
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    liveness_fd: int | None = None
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            try:
+                liveness_fd = os.open(liveness_path, os.O_RDWR)
+            except OSError:
+                holder_pid = None
+            else:
+                try:
+                    holder_pid = _lock_holder_pid(liveness_fd)
+                finally:
+                    os.close(liveness_fd)
+                    liveness_fd = None
+            holder = f" (holder pid {holder_pid})" if holder_pid is not None else ""
             raise DaemonAlreadyRunningError(
-                f"another palaver observe holds {lock_path}. Exactly one daemon may "
+                f"another palaver observe holds {lock_path}{holder}. Exactly one daemon may "
                 "write the store; this one is stopping rather than becoming a second "
                 "writer. Stop the running daemon first, or point --db elsewhere."
             ) from exc
         say(f"took the exclusive writer lock on {lock_path}")
+        liveness_fd = os.open(liveness_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            _set_record_lock(liveness_fd, _F_WRLCK)
+        except OSError as exc:
+            os.close(liveness_fd)
+            liveness_fd = None
+            raise DaemonAlreadyRunningError(
+                f"could not publish the queryable liveness lock for {lock_path}; "
+                "this daemon stops rather than reporting an unknown writer state."
+            ) from exc
 
         if socket_path is None:
             # Said at WARNING volume, not debug: the daemon runs, extracts,
@@ -415,6 +478,10 @@ def single_writer(
             with contextlib.suppress(FileNotFoundError):
                 socket_path.unlink()
     finally:
+        if liveness_fd is not None:
+            with contextlib.suppress(OSError):
+                _set_record_lock(liveness_fd, _F_UNLCK)
+            os.close(liveness_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
 
@@ -427,13 +494,10 @@ def daemon_running(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool |
     same timestamps — and a reader with no way to tell the difference will
     take a stale answer for a current one, which is INV-7's failure exactly.
 
-    Three answers, not two, because a daemon at a path too deep for
-    `sun_path` runs perfectly well while serving no socket to probe. Under
-    the older design that combination could not exist — such a daemon
-    refused to start — so `False` was the whole truth. Now it is reachable,
-    and answering `False` there would report a *running* daemon as stopped:
-    a confident wrong answer, which is the one thing INV-7 forbids. "I
-    cannot tell" is not a confident wrong answer.
+    A store too deep for `sun_path` has no request socket, but its writer
+    still publishes a POSIX record lock beside the authoritative `flock`.
+    `F_GETLK` asks the kernel for that holder without acquiring any lock, so
+    this probe cannot make a concurrently starting daemon falsely refuse.
 
     A *read* must never fail because of this probe, so nothing here raises;
     the conditions that would are the daemon's to report at startup, where
@@ -445,14 +509,28 @@ def daemon_running(db_path: Path, *, timeout: float = DEFAULT_TIMEOUT) -> bool |
         timeout: Seconds to allow the connect.
 
     Returns:
-        True if a listener answered, False if the socket is absent or
-        refuses, and None if this store has no probeable socket at all.
+        True if a listener answered or the queryable lock is held, False if
+        no listener and no lock holder exist, and None when the liveness
+        marker itself cannot be queried.
     """
     try:
         socket_path = socket_path_for(db_path)
-    except SocketPathTooLongError as exc:
-        log.warning("cannot probe for a daemon: %s", exc)
-        return None
+    except SocketPathTooLongError:
+        lock_path = liveness_lock_path_for(db_path)
+        try:
+            lock_fd = os.open(lock_path, os.O_RDWR)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            log.warning("cannot open liveness lock for deep store: %s", error)
+            return None
+        try:
+            return _lock_holder_pid(lock_fd) is not None
+        except OSError as error:
+            log.warning("cannot query liveness lock for deep store: %s", error)
+            return None
+        finally:
+            os.close(lock_fd)
     try:
         return _probe(socket_path, timeout)
     except OSError:

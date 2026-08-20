@@ -722,11 +722,36 @@ def test_render_report_includes_every_metric_and_both_legs():
         assert label in rendered
     assert "E4B" in rendered
     assert "E2B" in rendered
+    assert "spread (max - min)" not in rendered
 
 
 def test_render_summary_reports_fixture_and_leg_count():
     report = EvalReport(fixture_ids=("a", "b", "c"), per_leg={})
-    assert eval_cli.render_summary(report) == "eval complete: 3 fixtures, 2 legs (E4B, E2B)\n"
+    assert eval_cli.render_summary(report) == "eval complete: 3 fixtures, 2 legs, 1 runs\n"
+
+
+def test_aggregate_reports_includes_mean_and_observed_spread():
+    first = EvalReport(
+        fixture_ids=("a",),
+        per_leg={
+            "E4B": LegMetrics(1, 1, 1, 1, 0, 1, 2, 0),
+            "E2B": LegMetrics(0, 0, 0, 0, 1, 0, 0, 0),
+        },
+    )
+    second = EvalReport(
+        fixture_ids=("a",),
+        per_leg={
+            "E4B": LegMetrics(0, 1, 1, 1, 0, 1, 0, 0),
+            "E2B": LegMetrics(1, 0, 0, 0, 0, 0, 2, 1),
+        },
+    )
+
+    report = eval_cli.aggregate_reports([first, second])
+
+    assert report.run_count == 2
+    assert report.per_leg["E4B"].question_detection_accuracy == 0.5
+    assert report.spread_per_leg["E4B"]["question_detection_accuracy"] == 1
+    assert "spread (max - min)" in eval_cli.render_report(report)
 
 
 class _FakeArgs:

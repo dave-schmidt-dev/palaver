@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, TextIO
 
@@ -61,6 +62,12 @@ def add_arguments(parser) -> None:
         help="print the per-metric table for both model legs (default: a one-line summary)",
     )
     parser.add_argument(
+        "--runs",
+        type=int,
+        default=3,
+        help="independent runs to average and report spread for (default: 3)",
+    )
+    parser.add_argument(
         "--fixtures-dir",
         type=Path,
         default=None,
@@ -89,11 +96,18 @@ def add_arguments(parser) -> None:
 def render_report(report: EvalReport) -> str:
     """Render a per-metric table for both legs — `--report`'s output."""
     header = f"{'metric':<28}{'E4B':>12}{'E2B':>12}"
-    lines = [header, "-" * len(header)]
+    lines = [f"runs: {report.run_count}", header, "-" * len(header)]
     for field_name, label in _METRIC_LABELS:
         e4b_value = _format_metric(report.per_leg["E4B"], field_name)
         e2b_value = _format_metric(report.per_leg["E2B"], field_name)
         lines.append(f"{label:<28}{e4b_value:>12}{e2b_value:>12}")
+    if report.spread_per_leg:
+        lines.append("")
+        lines.append("spread (max - min)")
+        for field_name, label in _METRIC_LABELS:
+            e4b = report.spread_per_leg["E4B"][field_name]
+            e2b = report.spread_per_leg["E2B"][field_name]
+            lines.append(f"{label:<28}{e4b:>12.2f}{e2b:>12.2f}")
     lines.append("")
     for leg_name in ("E4B", "E2B"):
         metrics = report.per_leg[leg_name]
@@ -111,7 +125,39 @@ def _format_metric(metrics: LegMetrics, field_name: str) -> str:
 
 def render_summary(report: EvalReport) -> str:
     """Render the default (non `--report`) one-line summary."""
-    return f"eval complete: {len(report.fixture_ids)} fixtures, 2 legs (E4B, E2B)\n"
+    return f"eval complete: {len(report.fixture_ids)} fixtures, 2 legs, {report.run_count} runs\n"
+
+
+def aggregate_reports(reports: list[EvalReport]) -> EvalReport:
+    """Average repeated reports and retain each metric's observed spread."""
+    if not reports:
+        raise ValueError("at least one eval report is required")
+    per_leg: dict[str, LegMetrics] = {}
+    spread_per_leg: dict[str, dict[str, float]] = {}
+    for leg_name in ("E4B", "E2B"):
+        metrics = [report.per_leg[leg_name] for report in reports]
+        values = {
+            field: [getattr(metric, field) for metric in metrics]
+            for field, _label in _METRIC_LABELS
+        }
+        first = metrics[0]
+        per_leg[leg_name] = replace(
+            first,
+            **{field: sum(numbers) / len(numbers) for field, numbers in values.items()},
+            decisions_extracted=round(
+                sum(metric.decisions_extracted for metric in metrics) / len(metrics)
+            ),
+            false_decisions=round(sum(metric.false_decisions for metric in metrics) / len(metrics)),
+        )
+        spread_per_leg[leg_name] = {
+            field: max(numbers) - min(numbers) for field, numbers in values.items()
+        }
+    return EvalReport(
+        fixture_ids=reports[0].fixture_ids,
+        per_leg=per_leg,
+        run_count=len(reports),
+        spread_per_leg=spread_per_leg,
+    )
 
 
 def _stderr_status(message: str) -> None:
@@ -140,6 +186,10 @@ def run(
     """
     out = sys.stdout if out is None else out
     on_status = _stderr_status if on_status is None else on_status
+    runs = getattr(args, "runs", 3)
+    if runs < 2:
+        print("palaver eval: --runs must be at least 2 for reportable metrics", file=sys.stderr)
+        return 2
     db_path = DEFAULT_DB_PATH if args.db is None else args.db
 
     try:
@@ -161,13 +211,19 @@ def run(
                 E2B_LEG, health_timeout=args.health_timeout, on_status=on_status
             ):
                 e2b_client = ModelClient(conn, host=E2B_LEG.host, port=E2B_LEG.port)
-                report = run_eval(
-                    labels,
-                    fixtures_dir,
-                    e4b_client=e4b_client,
-                    e2b_client=e2b_client,
-                    on_status=on_status,
-                )
+                reports = []
+                for run_number in range(1, runs + 1):
+                    on_status(f"eval run {run_number}/{runs}")
+                    reports.append(
+                        run_eval(
+                            labels,
+                            fixtures_dir,
+                            e4b_client=e4b_client,
+                            e2b_client=e2b_client,
+                            on_status=on_status,
+                        )
+                    )
+                report = aggregate_reports(reports)
         except (OSError, TimeoutError, FileNotFoundError, ModelClientError) as exc:
             print(f"palaver eval: {exc}", file=sys.stderr)
             return 1

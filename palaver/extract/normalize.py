@@ -4,9 +4,7 @@ Raw Claude Code JSONL is dense with bytes the model never needs to see: full
 tool-input JSON, multi-kilobyte tool results, `thinking` blocks, bookkeeping
 records (`attachment`, `last-prompt`, `ai-title`, `mode`, `bridge-session`,
 `summary`). This module reduces a session store to the turns that carry
-meaning — roughly 900 KB of JSONL to roughly 47 KB of transcript, measured in
-the project's spike (`spikes/2026-08-14-e4b-extraction/normalize.py`) and
-reproduced here by `tests/test_normalize.py`'s synthesized-input test.
+meaning, reproduced here by `tests/test_normalize.py`'s synthesized-input test.
 
 **Channel tags come from INV-8's classification, never from text sniffing.**
 This is the one rule this module exists to enforce and the reason it is not

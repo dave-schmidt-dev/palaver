@@ -179,6 +179,7 @@ class ProcessInfo:
     ppid: int
     name: str
     command: str
+    start_time: str | None = None
 
 
 #: A process table keyed by pid, as `read_process_table` returns.
@@ -373,7 +374,7 @@ def read_process_table() -> ProcessTable:
     """
     try:
         completed = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,ppid=,command="],
+            ["/bin/ps", "-axo", "pid=,ppid=,lstart=,command="],
             capture_output=True,
             text=True,
             check=False,
@@ -387,7 +388,7 @@ def read_process_table() -> ProcessTable:
 
 
 def parse_process_table(output: str) -> ProcessTable:
-    """Parse `ps -axo pid=,ppid=,command=` output into a `ProcessTable`.
+    """Parse `ps -axo pid=,ppid=,lstart=,command=` into a `ProcessTable`.
 
     Split from `read_process_table` so the parsing is testable without a
     subprocess, and so a test can build a table for a process tree that does
@@ -406,12 +407,28 @@ def parse_process_table(output: str) -> ProcessTable:
         parts = line.strip().split(None, 2)
         if len(parts) < 3:
             continue
-        raw_pid, raw_ppid, command = parts
+        raw_pid, raw_ppid, remainder = parts
         try:
             pid, ppid = int(raw_pid), int(raw_ppid)
         except ValueError:
             continue
-        table[pid] = ProcessInfo(pid=pid, ppid=ppid, name=process_name(command), command=command)
+        # `lstart` is a fixed-width 24-character ctime value on macOS.
+        # Accept the historical three-column fixture shape as well; those
+        # rows simply cannot be used to prove a pid was not reused.
+        start_time = None
+        command = remainder
+        if len(remainder) > 25 and remainder[24].isspace():
+            candidate = remainder[:24]
+            if candidate[3:4].isspace() and candidate[7:8].isspace():
+                start_time = candidate
+                command = remainder[25:].strip()
+        table[pid] = ProcessInfo(
+            pid=pid,
+            ppid=ppid,
+            name=process_name(command),
+            command=command,
+            start_time=start_time,
+        )
     return table
 
 
@@ -735,7 +752,15 @@ def _codex_store_candidates(
             identity = adapter.read_identity(path)
         except OSError, ValueError, TypeError:
             continue
-        if identity is None or identity.is_subagent or identity.cwd is None:
+        # An identity may be temporarily unavailable while Codex flushes its
+        # first record. Do not drop it and let descriptor narrowing select an
+        # older candidate: the only safe answer is to refuse this tick.
+        if identity is None:
+            result: tuple[Path, ...] = ()
+            if cache is not None:
+                cache[cache_key] = result
+            return result
+        if identity.is_subagent or identity.cwd is None:
             continue
         if Path(identity.cwd).resolve(strict=False) != cwd.resolve(strict=False):
             continue
@@ -760,15 +785,9 @@ def _agent_open_store_paths(pid: int) -> frozenset[Path]:
     that narrows the existing candidate set to exactly one is trusted by the
     caller.
 
-    Residual race, accepted rather than closed: `pid` is a `ps` snapshot taken
-    moments earlier, and if that process has since exited and the pid been
-    reused by an unrelated process, this reads that process's descriptors
-    instead. Structurally the same class of staleness `join_pane`'s own
-    `job_name` check (fact 2) exists to catch for `jobPid`, just not caught
-    here the same way, because a pid does not carry its own identity to
-    re-check against. Bounded by `JOIN_SECONDS`: a wrong narrowing from either
-    this or the reuse race corrects itself at the next join attempt rather
-    than sticking.
+    `join_pane` verifies the process identity again immediately before it
+    calls this function. A reused pid is therefore left ambiguous instead of
+    being allowed to narrow candidates using an unrelated process's files.
 
     Args:
         pid: The agent's own pid, resolved by `agent_ancestor`.
@@ -798,6 +817,29 @@ def _agent_open_store_paths(pid: int) -> frozenset[Path]:
         for line in completed.stdout.splitlines()
         if line.startswith("n/")
     )
+
+
+def _same_process_identity(expected: ProcessInfo, actual: ProcessInfo | None) -> bool:
+    """Return whether a fresh process row still names the same process.
+
+    PID reuse is the only way the descriptor scan can become evidence about
+    a different process after the ancestry walk. `lstart` distinguishes the
+    otherwise identical pid/command case; a caller without that field must
+    refuse narrowing rather than pretend the weaker comparison proves it.
+    """
+    return actual is not None and (
+        expected.pid,
+        expected.ppid,
+        expected.name,
+        expected.command,
+        expected.start_time,
+    ) == (
+        actual.pid,
+        actual.ppid,
+        actual.name,
+        actual.command,
+        actual.start_time,
+    ) and expected.start_time is not None
 
 
 def _pinned_store_path(root: Path, pin: PanePin) -> Path | None:
@@ -836,6 +878,7 @@ def join_pane(
     candidate_cache: MutableMapping[tuple[str, str, str], tuple[Path, ...]] | None = None,
     registry_root: Path | None = None,
     open_files_reader: Callable[[int], frozenset[Path]] = _agent_open_store_paths,
+    process_table_reader: Callable[[], ProcessTable] | None = None,
 ) -> PaneJoin | None:
     """Resolve a pane to its agent process and project, or refuse.
 
@@ -885,6 +928,11 @@ def join_pane(
         open_files_reader: Callable taking a pid and returning the resolved
             paths it holds open, used to narrow an ambiguous Codex candidate
             set. Injectable for the same reason as `cwd_reader`.
+        process_table_reader: Fresh process-table reader used immediately
+            before descriptor narrowing. A changed pid identity leaves the
+            candidate set ambiguous instead of using another process's file
+            descriptors. Tests that provide a static `table` may provide the
+            matching static reader too.
 
     Returns:
         A `PaneJoin`, or `None` if any check above fails.
@@ -944,10 +992,16 @@ def join_pane(
             # sessions run here within the hour, not one -- most are from
             # processes that have since exited. Narrow to the one(s) the
             # live agent pid still holds open; a stale rollout cannot be.
-            open_paths = open_files_reader(agent.pid)
-            narrowed = tuple(path for path in codex_paths if path in open_paths)
-            if len(narrowed) == 1:
-                codex_paths = narrowed
+            fresh_table = (
+                (process_table if table is not None else read_process_table())
+                if process_table_reader is None
+                else process_table_reader()
+            )
+            if _same_process_identity(agent, fresh_table.get(agent.pid)):
+                open_paths = open_files_reader(agent.pid)
+                narrowed = tuple(path for path in codex_paths if path in open_paths)
+                if len(narrowed) == 1:
+                    codex_paths = narrowed
         candidates = tuple(path.stem for path in codex_paths)
         project_key = project_key_for_cwd(cwd)
         store_path = codex_paths[0] if len(codex_paths) == 1 else None

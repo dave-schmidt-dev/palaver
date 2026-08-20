@@ -498,20 +498,20 @@ def load_measurement(path: Path | None = None) -> RoleClassMeasurement | None:
 
 
 def codex_tier_cap_lifted(*, measurement_path: Path | None = None) -> bool:
-    """Whether the Codex tier-4 cap has been lifted by a passing measurement.
+    """Return whether the Codex tier-4 cap can be lifted.
 
     Args:
         measurement_path: Measurement file to consult. Defaults to
             `MEASUREMENT_PATH`.
 
     Returns:
-        True only when a well-formed measurement satisfies every condition in
-        `RoleClassMeasurement.lifts_tier_cap`. There is deliberately no other
-        code path that returns True — not the file's presence, not an
-        environment variable, not a caller-supplied override.
+        Always false. Codex exposes no structural equivalent of Claude Code's
+        ``isMeta`` marker, so its prefix classifier is never strong enough to
+        mint tier-1 through tier-3 durable claims. Measurements remain useful
+        diagnostics but cannot weaken this fail-closed boundary.
     """
-    measurement = load_measurement(measurement_path)
-    return measurement is not None and measurement.lifts_tier_cap
+    del measurement_path
+    return False
 
 
 def cap_codex_tier(tier: int, *, measurement_path: Path | None = None) -> int:
@@ -523,10 +523,10 @@ def cap_codex_tier(tier: int, *, measurement_path: Path | None = None) -> int:
             `MEASUREMENT_PATH`.
 
     Returns:
-        `tier` unchanged when the cap is lifted, or when `tier` is already at
-        or below the cap's confidence. Otherwise `TIER_OBSERVER_INFERENCE`
-        (4). Tiers are numbered highest-confidence-first, so the demotion is
-        a `max`, and a tier-5 speculation is never *promoted* to 4.
+        `tier` unchanged when it is already at or below the cap's confidence.
+        Otherwise `TIER_OBSERVER_INFERENCE` (4). Tiers are numbered
+        highest-confidence-first, so the demotion is a `max`, and a tier-5
+        speculation is never *promoted* to 4.
     """
     if codex_tier_cap_lifted(measurement_path=measurement_path):
         return tier
@@ -554,9 +554,7 @@ def require_codex_tier(tier: int, *, measurement_path: Path | None = None) -> in
         raise CodexTierCapError(
             f"Codex-sourced decisions are capped at tier {capped} "
             f"({tier_name(capped)}); tier {tier} ({tier_name(tier)}) was requested. "
-            f"The cap lifts only when codex_role_class is measured over at least "
-            f"{REQUIRED_LABELLED_RECORDS} labelled records at zero "
-            f"harness-classified-as-user errors."
+            "The cap is permanent because Codex has no structural human-content marker."
         )
     return tier
 

@@ -177,6 +177,28 @@ def append_recent(
     return result[-RECENT_ACTIVITY_LIMIT:]
 
 
+def fold_recent_result(
+    current: tuple[RecentActivity, ...], text: object, kind: str, evidence_id: str | None
+) -> tuple[RecentActivity, ...]:
+    """Fold a completed tool result into its matching recorded invocation."""
+    rendered = sanitize_text(text)
+    if evidence_id is not None:
+        for index in range(len(current) - 1, -1, -1):
+            item = current[index]
+            if item.evidence_id == evidence_id and item.evidence_kind in {
+                "tool_use",
+                "function_call",
+            }:
+                replacement = RecentActivity(
+                    f"{item.text}: {rendered}" if rendered else item.text,
+                    item.provenance,
+                    kind,
+                    evidence_id,
+                )
+                return (*current[:index], replacement, *current[index + 1 :])
+    return append_recent(current, rendered, Provenance.EXACT, kind, evidence_id)
+
+
 def append_unknown_reason(current: tuple[str, ...], reason: str) -> tuple[str, ...]:
     """Append one deduplicated diagnostic while keeping snapshot state bounded."""
     if reason in current:

@@ -18,9 +18,8 @@ a human instruction is admitted at `TIER_OBSERVER_INFERENCE` instead —
 tier-4 is the fail-closed direction, and demotion is always the outcome, not
 rejection, because the evidence is real even when the attribution is not.
 
-**Substring presence is necessary and not sufficient, measured.** Spike run
-2's baseline arm over fixture B (`spikes/2026-08-14-e4b-extraction/out_B_base.txt`,
-Gemma 3n E4B q4_0, 2026-08-14) returned six `user_decisions` whose quotes all
+**Substring presence is necessary and not sufficient, measured.** The archived
+baseline experiment returned six `user_decisions` whose quotes all
 passed the spike's substring check — the check reported 6 of 6 REAL — while
 three of the six carried a `statement` the model had written itself: a
 third-person summary of what the quote showed, a paraphrase of it, and a

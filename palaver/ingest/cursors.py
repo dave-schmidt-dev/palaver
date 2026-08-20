@@ -115,3 +115,72 @@ class CursorStore:
             encoding="utf-8",
         )
         os.replace(tmp_path, path)
+
+
+class FailureBackoffStore:
+    """Persist retry timing beside cursors for the observer's one writer.
+
+    This intentionally shares the cursor root: both describe what the
+    observer has yet to finish for one source/session, and an explicit
+    ``--cursors`` move must move both. The single-writer daemon is the only
+    caller, so no cross-process merge protocol is needed.
+    """
+
+    _FILENAME = "failure-backoff.json"
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / self._FILENAME
+
+    @staticmethod
+    def _key(source: str, session_key: str) -> str:
+        return f"{source}\0{session_key}"
+
+    def _load(self) -> dict[str, dict[str, float | int | str]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save(self, entries: dict[str, dict[str, float | int | str]]) -> None:
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, self.path)
+
+    def retry_at(self, session_key: str, *, source: str) -> float | None:
+        entry = self._load().get(self._key(source, session_key))
+        value = None if entry is None else entry.get("retry_at")
+        return float(value) if isinstance(value, int | float) else None
+
+    def record_failure(
+        self,
+        session_key: str,
+        *,
+        source: str,
+        now: float,
+        initial_seconds: float,
+        maximum_seconds: float,
+    ) -> float:
+        entries = self._load()
+        key = self._key(source, session_key)
+        previous = entries.get(key, {})
+        attempts = int(previous.get("attempts", 0)) + 1
+        delay = min(initial_seconds * (2 ** (attempts - 1)), maximum_seconds)
+        retry_at = now + delay
+        entries[key] = {
+            "source": source,
+            "session_key": session_key,
+            "attempts": attempts,
+            "retry_at": retry_at,
+        }
+        self._save(entries)
+        return retry_at
+
+    def clear(self, session_key: str, *, source: str) -> None:
+        entries = self._load()
+        if entries.pop(self._key(source, session_key), None) is not None:
+            self._save(entries)

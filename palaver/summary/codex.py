@@ -17,6 +17,7 @@ from palaver.summary.model import (
     TaskItem,
     append_recent,
     append_unknown_reason,
+    fold_recent_result,
     sanitize_text,
 )
 
@@ -202,10 +203,9 @@ def reduce_codex_events(
             output = payload.get("output")
             snapshot = replace(
                 snapshot,
-                recent=append_recent(
+                recent=fold_recent_result(
                     snapshot.recent,
-                    f"Tool result: {output or ''}",
-                    Provenance.EXACT,
+                    output or "",
                     "function_call_output",
                     call_id if isinstance(call_id, str) else None,
                 ),

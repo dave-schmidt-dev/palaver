@@ -92,9 +92,9 @@ def test_golden_frame_80_by_6_shows_every_section_once():
         "PALAVER  WORKING  Alpha Project · codex                                         \r\n"
         "REQUEST  ship companion panes                                                   \r\n"
         "NOW      updated plan                                                           \r\n"
-        "TASKS    render                                                                 \r\n"
         "ASK      deploy now?                                                            \r\n"
-        "COMMAND  tests are passing                                                      "
+        "COMMAND  tests are passing                                                      \r\n"
+        "DETAIL   exact pane joined                                                      "
     )
 
 
@@ -104,11 +104,11 @@ def test_golden_frame_80_by_10_grows_lists_under_one_label():
         "REQUEST  ship companion panes                                                   \r\n"
         "NOW      updated plan                                                           \r\n"
         "         parsed tool result                                                     \r\n"
-        "TASKS    render                                                                 \r\n"
-        "         verify                                                                 \r\n"
         "ASK      deploy now?                                                            \r\n"
         "COMMAND  tests are passing                                                      \r\n"
         "DETAIL   exact pane joined                                                      \r\n"
+        "                                                                                \r\n"
+        "                                                                                \r\n"
         "                                                                                "
     )
 
@@ -118,7 +118,7 @@ def test_spare_rows_go_to_recent_activity_newest_first():
     rows = _frame_text(busy, 40, 10).split("\r\n")
     assert rows[2].startswith("NOW      ")
     assert [row[_LABEL_WIDTH:].strip() for row in rows[2:5]] == ["step 7", "step 6", "step 5"]
-    assert [row.split()[0] for row in rows[5:]] == ["TASKS", "verify", "ASK", "COMMAND", "DETAIL"]
+    assert [row.split()[0] for row in rows[5:]] == ["step", "step", "ASK", "COMMAND", "DETAIL"]
     taller = _frame_text(busy, 40, 12).split("\r\n")
     assert [row[_LABEL_WIDTH:].strip() for row in taller[2:7]] == [
         f"step {n}" for n in (7, 6, 5, 4, 3)

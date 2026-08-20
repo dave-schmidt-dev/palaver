@@ -123,6 +123,7 @@ RULE_UNKNOWN_FILE_TYPE = "unknown-file-type"
 #: `RULE_UNALLOWLISTED_TEXT`; kept separate so a rejection names which surface
 #: it came from.
 RULE_UNALLOWLISTED_SPAN = "unallowlisted-span"
+RULE_SOURCE_PROVENANCE = "source-provenance"
 
 #: Text of any kind carrying a marker only a real session store produces — a
 #: bare UUID, an opaque `toolu_`/`msg_` id, an absolute home path, an email
@@ -1667,6 +1668,58 @@ def lint_tree(
     )
 
 
+def lint_provenance(root: Path, source_roots: tuple[Path, ...]) -> tuple[Rejection, ...]:
+    """Reject fixture text copied verbatim from explicitly supplied source stores.
+
+    This intentionally has no implicit default: a normal lint must never open
+    a real transcript store, while a requested provenance check must not pass
+    merely because its comparison corpus is absent.
+    """
+    source_files: list[Path] = []
+    for source_root in source_roots:
+        if not source_root.exists():
+            raise FileNotFoundError(source_root)
+        source_files.extend(
+            [source_root]
+            if source_root.is_file()
+            else sorted(path for path in source_root.rglob("*") if path.is_file())
+        )
+    source_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in source_files
+    )
+    rejections: list[Rejection] = []
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        raw = path.read_text(encoding="utf-8")
+        spans: list[tuple[int, str]] = []
+        if path.suffix in RECORD_SUFFIXES:
+            for line_number, line in enumerate(raw.splitlines(), start=1):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                spans.extend((_line_of(raw, text), text) for text, _where in _walk_strings(record))
+        elif path.suffix in DATA_SUFFIXES:
+            try:
+                document = json.loads(raw)
+            except json.JSONDecodeError:
+                document = None
+            if document is not None:
+                spans.extend(
+                    (_line_of(raw, text), text) for text, _where in _walk_strings(document)
+                )
+        else:
+            spans.extend(enumerate(raw.splitlines(), start=1))
+        for line_number, text in spans:
+            text = text.strip()
+            if len(text) >= 20 and text in source_text:
+                rejections.append(
+                    Rejection(
+                        path, line_number, RULE_SOURCE_PROVENANCE, "verbatim source-store text"
+                    )
+                )
+    return tuple(rejections)
+
+
 def render_report(report: LintReport) -> str:
     """Render a `LintReport` as the command's stdout output."""
     lines = [
@@ -1709,6 +1762,13 @@ def add_arguments(parser) -> None:
         type=Path,
         help="fixture corpus directory (or a single .jsonl fixture) to check",
     )
+    parser.add_argument(
+        "--provenance-source",
+        type=Path,
+        action="append",
+        default=[],
+        help="source file or directory to compare for verbatim copied prose (opt-in)",
+    )
 
 
 def _stderr_status(message: str) -> None:
@@ -1745,6 +1805,20 @@ def run(
         return 2
 
     report = lint_tree(root, on_status=on_status)
+    sources = tuple(args.provenance_source)
+    if sources:
+        try:
+            provenance = lint_provenance(root, sources)
+        except FileNotFoundError as exc:
+            print(f"palaver fixture-lint: provenance source unavailable: {exc}", file=sys.stderr)
+            return 2
+        report = LintReport(
+            root=report.root,
+            files=report.files,
+            records=report.records,
+            strings=report.strings,
+            rejections=(*report.rejections, *provenance),
+        )
     if report.files == 0:
         print(f"palaver fixture-lint: no files under {root}", file=sys.stderr)
         return 2
