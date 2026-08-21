@@ -794,16 +794,19 @@ class CompanionController:
             if pair is None:
                 # A delayed notification for the pre-restart GUID is harmless.
                 return
-            if session_id in inventory:
-                # The PTY ended but its pane remains visible; it was not torn down.
-                return
             self._pairs.pop(session_id, None)
+            agent = inventory.get(session_id)
+            if agent is not None:
+                # A supported agent process can end while its iTerm pane stays
+                # open at a shell prompt. Detach Palaver without disabling or
+                # otherwise controlling that user-owned pane.
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
             companion = inventory.get(pair.companion_id)
-            if companion is not None and companion.is_companion:
-                # Pair membership proves this is the exact companion. Agent
-                # session ids are never passed to async_close.
-                self._manager_closing.add(pair.companion_id)
-                await companion.session.async_close(force=True)
+            if companion is not None:
+                # Pair membership selects the companion and the exact role
+                # marker is still required before any close. Agent session ids
+                # are never passed to async_close.
+                await self._close_owned(companion)
             try:
                 pair.state_path.unlink(missing_ok=True)
             except OSError:

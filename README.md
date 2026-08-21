@@ -158,7 +158,9 @@ writes private atomic state files that the terminal renderer displays. Long
 values wrap at terminal-cell boundaries, including wide characters and
 overlong words; only Palaver-owned headers, labels, and statuses receive ANSI
 color. User-provided values are rendered as plain text. Input typed into a
-companion is discarded and never forwarded.
+companion is discarded and never forwarded. When the supported agent process
+exits, Palaver closes its exactly marked companion, removes the companion state,
+and leaves the agent pane open and enabled at its resulting shell prompt.
 
 Claude Code panes join through `~/.claude/sessions/<pid>.json`, the registry
 the CLI keeps for each of its own live processes. That record names the pid's

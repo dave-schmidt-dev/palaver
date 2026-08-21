@@ -777,6 +777,45 @@ def test_agent_teardown_closes_only_its_exact_registered_companion(tmp_path):
     assert agent.close_calls == []
 
 
+def test_agent_process_end_closes_companion_while_leaving_agent_pane_enabled(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    state_path = tmp_path / "state.json"
+    state_path.write_text("state", encoding="utf-8")
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", state_path)}
+
+    asyncio.run(ctl.handle_termination(app, "agent"))
+
+    assert ctl.pairs == {}
+    assert summary.close_calls == [{"force": True}]
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert not state_path.exists()
+    assert agent.close_calls == []
+    assert agent.sent_text == []
+
+
+def test_agent_process_end_never_closes_an_unmarked_paired_pane(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    state_path = tmp_path / "state.json"
+    state_path.write_text("state", encoding="utf-8")
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", state_path)}
+
+    asyncio.run(ctl.handle_termination(app, "agent"))
+
+    assert summary.close_calls == []
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert not state_path.exists()
+    assert agent.close_calls == []
+
+
 def test_exited_companion_restart_rebinds_new_guid_without_layout_mutation(tmp_path):
     now = [0.0]
     app, agent, summary = paired_app()
