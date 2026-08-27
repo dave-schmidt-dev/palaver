@@ -207,7 +207,7 @@ def _section_items(
 
     request = (
         tuple((line, "") for line in _wrap_words(state.request, request_width))
-        if request_width > 0
+        if request_width > 0 and state.request is not None
         else _nonempty(state.request)
     )
     return {

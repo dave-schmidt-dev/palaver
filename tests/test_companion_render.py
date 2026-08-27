@@ -141,6 +141,14 @@ def test_request_wraps_wide_characters_and_an_overlong_word_at_cell_boundaries()
     assert all(cell_width(row) == 16 for row in rows)
 
 
+def test_missing_request_is_omitted_without_crashing():
+    state = _state(request=None)
+
+    rows = _frame_text(state, 40, 4).split("\r\n")
+
+    assert all(not row.startswith("REQUEST") for row in rows)
+
+
 def test_request_keeps_every_section_first_row_and_marks_omitted_wrap_lines():
     state = _state(request="one two three four five six seven eight nine ten eleven twelve")
     rows = _frame_text(state, 30, 6).split("\r\n")
