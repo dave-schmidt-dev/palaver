@@ -126,6 +126,40 @@ def _take_cells(value: str, width: int) -> tuple[str, str]:
     return value, ""
 
 
+def _wrap_words(value: str, width: int) -> tuple[str, ...]:
+    """Wrap sanitized text to terminal cells, splitting overlong words."""
+
+    if width <= 0:
+        return ()
+    words = sanitize(value).split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        chunks: list[str] = []
+        remainder = word
+        while remainder:
+            chunk, remainder = _take_cells(remainder, width)
+            if not chunk:
+                chunk, remainder = remainder[:1], remainder[1:]
+            chunks.append(chunk)
+        if len(chunks) > 1:
+            if current:
+                lines.append(current)
+                current = ""
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
+            continue
+        candidate = word if not current else f"{current} {word}"
+        if not current or cell_width(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return tuple(lines)
+
+
 def _nonempty(*values: str | None, color: str = "") -> tuple[tuple[str, str], ...]:
     """Keep only the values that would put something on screen."""
 
@@ -160,7 +194,9 @@ def _activity_items(state: CompanionState) -> tuple[tuple[str, str], ...]:
     )
 
 
-def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ...]]:
+def _section_items(
+    state: CompanionState, request_width: int
+) -> dict[str, tuple[tuple[str, str], ...]]:
     """Return each labeled section's items, in the order they should be read.
 
     ``recent`` is stored oldest-first and is reversed here so NOW's first row
@@ -169,8 +205,13 @@ def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ..
     of the history the label refers to.
     """
 
+    request = (
+        tuple((line, "") for line in _wrap_words(state.request, request_width))
+        if request_width > 0
+        else _nonempty(state.request)
+    )
     return {
-        "REQUEST": _nonempty(state.request),
+        "REQUEST": request,
         "NOW": _activity_items(state),
         "ASK": _nonempty(*state.questions, color=AMBER),
         # Both reducers populate `command_result` only from a failure, so this
@@ -183,10 +224,11 @@ def _section_items(state: CompanionState) -> dict[str, tuple[tuple[str, str], ..
 # Every section with content earns its first row in this order, so a two-line
 # pane still shows the request and a four-line one still reaches the question.
 _ROW_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
-# Spare rows then go to the sections that hold lists, smallest appetite first,
-# and NOW absorbs whatever is left because it is the only open-ended one.
-_GROWTH_ORDER = ("ASK", "NOW")
-_GROWTH_CAPS = {"ASK": 2, "NOW": MAX_ITEMS}
+# Spare rows first complete REQUEST's wrapped lines, then grow ASK, and NOW
+# absorbs whatever is left. This retains every populated section's first-row
+# guarantee while letting the primary request use the rest of the pane.
+_GROWTH_ORDER = ("REQUEST", "ASK", "NOW")
+_GROWTH_CAPS = {"REQUEST": None, "ASK": 2, "NOW": MAX_ITEMS}
 # Reading order down the pane, which is deliberately not the order above.
 _DISPLAY_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
 # The widest label plus the gutter that lines every section's items up.
@@ -209,7 +251,12 @@ def _allocate_rows(items: Mapping[str, Sequence[object]], rows: int) -> dict[str
             break
         if not counts[label]:
             continue
-        allowed = min(counts[label] + remaining, len(items[label]), _GROWTH_CAPS[label])
+        cap = _GROWTH_CAPS[label]
+        allowed = min(
+            counts[label] + remaining,
+            len(items[label]),
+            len(items[label]) if cap is None else cap,
+        )
         remaining -= allowed - counts[label]
         counts[label] = allowed
     return counts
@@ -218,10 +265,10 @@ def _allocate_rows(items: Mapping[str, Sequence[object]], rows: int) -> dict[str
 def _content_lines(state: CompanionState, width: int, rows: int) -> list[tuple[str, str]]:
     """Lay the sections out as one clipped row per item under a single label."""
 
-    items = _section_items(state)
-    counts = _allocate_rows(items, rows)
     gutter = min(_LABEL_WIDTH, max(1, width))
     value_width = width - gutter
+    items = _section_items(state, value_width)
+    counts = _allocate_rows(items, rows)
     lines: list[tuple[str, str]] = []
     for label in _DISPLAY_ORDER:
         for index, (value, color) in enumerate(items[label][: counts[label]]):
@@ -229,7 +276,14 @@ def _content_lines(state: CompanionState, width: int, rows: int) -> list[tuple[s
             if value_width <= 0:
                 lines.append((prefix, ""))
             else:
-                lines.append((prefix + clip_cells(value, value_width), color))
+                omitted_request_lines = label == "REQUEST" and counts[label] < len(items[label])
+                is_last_visible_request_line = index == counts[label] - 1
+                rendered = (
+                    clip_cells(f"{value}…", value_width)
+                    if omitted_request_lines and is_last_visible_request_line
+                    else clip_cells(value, value_width)
+                )
+                lines.append((prefix + rendered, color))
     return lines
 
 

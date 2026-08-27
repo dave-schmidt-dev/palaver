@@ -54,6 +54,7 @@ from palaver.ingest.adapters.codex import (
     order_records,
     record_ordinal,
     require_codex_tier,
+    strip_codex_image_attachment_markers,
 )
 from palaver.ingest.cursors import Cursor
 from palaver.memory.tiers import (
@@ -251,6 +252,17 @@ def test_message_text_concatenates_only_recognized_text_blocks():
 def test_message_text_of_a_non_message_record_is_empty():
     assert message_text(_event("task_complete", last_agent_message=None)) == ""
     assert message_text(_function_call()) == ""
+
+
+def test_strip_codex_image_attachment_marker_leaves_only_genuine_prose():
+    marker = '<image name=[Image #1] path="/var/folders/fixture/image.png">'
+    assert strip_codex_image_attachment_markers(f"inspect this {marker} carefully") == (
+        "inspect this  carefully"
+    )
+    # The double-quoted image-number shape is intentional. Do not turn an
+    # arbitrary user-authored XML-looking string into transport metadata.
+    similar = "<image name=[Image #one] path='/tmp/not-a-codex-marker.png'>"
+    assert strip_codex_image_attachment_markers(similar) == similar
 
 
 # --- the tier cap -----------------------------------------------------------

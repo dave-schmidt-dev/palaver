@@ -154,10 +154,11 @@ skipped and iTerm's own even split stands. Verifying this needs a real
 terminal: `PALAVER_RUN_LIVE_COMPANION_TEST=1 pytest tests/test_companion_live.py`
 creates a disposable window and asserts the frame never moves. It pairs panes
 with reciprocal iTerm variables, restores them after renderer restarts, and
-writes private atomic state files that the terminal renderer displays. Long
+writes private atomic state files that the terminal renderer displays. REQUEST
 values wrap at terminal-cell boundaries, including wide characters and
-overlong words; only Palaver-owned headers, labels, and statuses receive ANSI
-color. User-provided values are rendered as plain text. Input typed into a
+overlong words; other section values clip to their allocated row. Only
+Palaver-owned headers, labels, and statuses receive ANSI color. User-provided
+values are rendered as plain text. Input typed into a
 companion is discarded and never forwarded. When the supported agent process
 exits, Palaver closes its exactly marked companion, removes the companion state,
 and leaves the agent pane open and enabled at its resulting shell prompt.

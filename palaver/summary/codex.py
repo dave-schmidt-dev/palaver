@@ -7,7 +7,11 @@ from dataclasses import replace
 
 from palaver.ingest.adapters.base import Event
 from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN
-from palaver.ingest.adapters.codex import codex_role_class, message_text
+from palaver.ingest.adapters.codex import (
+    codex_role_class,
+    message_text,
+    strip_codex_image_attachment_markers,
+)
 from palaver.summary.model import (
     MAX_COLLECTION_ITEMS,
     Claim,
@@ -149,11 +153,26 @@ def reduce_codex_events(
                     ),
                 )
             elif codex_role_class(record) == CHANNEL_HUMAN:
+                request_text = strip_codex_image_attachment_markers(text)
+                request = Claim.exact(request_text, "human_message")
+                if request.provenance is Provenance.UNKNOWN and request_text != text:
+                    # A message made entirely of attachment transport metadata
+                    # is still a new human turn, but it cannot replace the last
+                    # usable request or leak its temporary path into NOW.
+                    snapshot = replace(
+                        snapshot,
+                        command_result=Claim(None, Provenance.STRUCTURAL, "human_message"),
+                        turn=Claim.structural("Agent turn open", "human_message"),
+                    )
+                    continue
                 snapshot = replace(
                     snapshot,
-                    request=Claim.exact(text, "human_message"),
+                    request=request,
                     recent=append_recent(
-                        snapshot.recent, f"Human: {text}", Provenance.EXACT, "human_message"
+                        snapshot.recent,
+                        f"Human: {request_text}",
+                        Provenance.EXACT,
+                        "human_message",
                     ),
                     turn=Claim.structural("Agent turn open", "human_message"),
                 )

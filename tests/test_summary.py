@@ -169,6 +169,45 @@ def test_claude_continuation_summary_after_compaction_never_becomes_request():
     assert not any(continuation in item.text for item in snapshot.recent)
 
 
+def test_codex_image_attachment_only_preserves_request_and_clears_stale_failure():
+    attachment = '<image name=[Image #1] path="/var/folders/fixture/Screenshot.png">'
+    snapshot = reduce_events(
+        "codex",
+        "fixture-codex",
+        (
+            _codex_message("user", "retain this usable request"),
+            _codex("event_msg", {"type": "exec_command_end", "exit_code": 7}, "error"),
+            _codex_message("user", attachment),
+        ),
+    )
+
+    assert snapshot.request.text == "retain this usable request"
+    assert snapshot.command_result.text is None
+    assert snapshot.turn.text == "Agent turn open"
+    assert [item.text for item in snapshot.recent] == [
+        "Human: retain this usable request",
+        "Command exited 7 this turn",
+    ]
+    assert all(
+        "<image" not in item.text and "/var/folders" not in item.text
+        for item in snapshot.recent
+    )
+
+
+def test_codex_image_attachment_is_removed_without_losing_mixed_request_prose():
+    attachment = '<image name=[Image #12] path="/var/folders/fixture/Screenshot.png">'
+    snapshot = reduce_events(
+        "codex",
+        "fixture-codex",
+        (_codex_message("user", f"fix this view {attachment} before release"),),
+    )
+
+    assert snapshot.request.text == "fix this view before release"
+    assert snapshot.recent[-1].text == "Human: fix this view before release"
+    assert "<image" not in snapshot.recent[-1].text
+    assert "/var/folders" not in snapshot.recent[-1].text
+
+
 def test_claude_latest_genuine_request_excludes_injection_and_agent_prose():
     snapshot = reduce_events(
         "claude-code",

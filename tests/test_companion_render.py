@@ -75,7 +75,7 @@ def _strip_ansi(value: str | bytes) -> str | bytes:
 
 
 def test_golden_frame_20_by_2_prioritizes_request():
-    assert _frame_text(_state(), 20, 2) == ("PALAVER  WORKING  A…\r\nREQUEST  ship compa…")
+    assert _frame_text(_state(), 20, 2) == ("PALAVER  WORKING  A…\r\nREQUEST  ship…      ")
 
 
 def test_golden_frame_40_by_4_uses_latest_activity_and_question():
@@ -122,6 +122,57 @@ def test_spare_rows_go_to_recent_activity_newest_first():
     taller = _frame_text(busy, 40, 12).split("\r\n")
     assert [row[_LABEL_WIDTH:].strip() for row in taller[2:7]] == [
         f"step {n}" for n in (7, 6, 5, 4, 3)
+    ]
+
+
+def test_request_wraps_wide_characters_and_an_overlong_word_at_cell_boundaries():
+    state = _state(
+        request="界界 longtoken",
+        recent=(),
+        questions=(),
+        command_result=None,
+        detail=None,
+    )
+    rows = _frame_text(state, 16, 4).split("\r\n")
+
+    assert rows[1] == "REQUEST  界界   "
+    assert rows[2] == "         longtok"
+    assert rows[3] == "         en     "
+    assert all(cell_width(row) == 16 for row in rows)
+
+
+def test_request_keeps_every_section_first_row_and_marks_omitted_wrap_lines():
+    state = _state(request="one two three four five six seven eight nine ten eleven twelve")
+    rows = _frame_text(state, 30, 6).split("\r\n")
+
+    assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
+        "REQUEST",
+        "NOW",
+        "ASK",
+        "COMMAND",
+        "DETAIL",
+    ]
+    assert rows[1].rstrip().endswith("…")
+
+
+def test_spare_rows_complete_request_before_ask_then_now():
+    state = _state(
+        request="one two three four five six seven eight nine ten eleven",
+        recent=("old activity", "new activity"),
+        questions=("first question", "second question"),
+    )
+    rows = _frame_text(state, 30, 10).split("\r\n")
+
+    assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
+        "REQUEST",
+        "",
+        "",
+        "NOW",
+        "",
+        "ASK",
+        "",
+        "COMMAND",
+        "DETAIL",
     ]
 
 
@@ -229,12 +280,12 @@ def test_control_and_ansi_sequences_are_removed_not_rendered():
     assert b"[31m" not in frame
 
 
-def test_payload_clips_to_cells_and_only_owned_tokens_are_colored():
+def test_request_omission_marks_the_visible_line_and_only_owned_tokens_are_colored():
     state = _state(request="first 界 second third", status="done", project="user text")
     frame = render_frame(state, 16, 5, now=101).decode()
     plain = _strip_ansi(frame)
     rows = plain.split("\r\n")
-    assert rows[1] == "REQUEST  first …"
+    assert rows[1] == "REQUEST  first… "
     assert all(cell_width(row) == 16 for row in rows)
     assert b"\x1b[36mPALAVER" in frame.encode()
     assert b"\x1b[32mDONE" in frame.encode()

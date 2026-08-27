@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,6 +136,13 @@ KIND_SESSION_META = "session_meta"
 #: no text, which is the fail-closed direction (unrecognized content cannot
 #: dilute a prefix match at position zero).
 TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text"})
+
+# Codex serializes an attached image into the otherwise human-authored text
+# stream. This shape is transport metadata, not a user request. Keep the
+# match deliberately narrow: nearby angle-bracket text remains user content.
+CODEX_IMAGE_ATTACHMENT_MARKER = re.compile(
+    r'<image name=\[Image #\d+\] path="[^"\r\n]*">'
+)
 
 #: The only role whose content can ever be the human channel. Every other
 #: role — and every record with no role at all — is harness by construction.
@@ -348,6 +356,17 @@ def message_text(record: dict) -> str:
         for block in content
         if isinstance(block, dict) and block.get("type") in TEXT_BLOCK_TYPES
     )
+
+
+def strip_codex_image_attachment_markers(text: str) -> str:
+    """Remove only Codex's literal image-attachment transport markers.
+
+    The marker is embedded in a user-role message alongside any genuine prose.
+    Keeping this source-specific shape here lets the summary reducer retain
+    that prose without surfacing the temporary attachment path.
+    """
+
+    return CODEX_IMAGE_ATTACHMENT_MARKER.sub("", text)
 
 
 def codex_role_class(record: dict) -> str:
