@@ -150,6 +150,25 @@ def test_claude_shell_escape_records_never_become_the_request():
     assert not any("bash-" in item.text for item in snapshot.recent)
 
 
+def test_claude_continuation_summary_after_compaction_never_becomes_request():
+    continuation = (
+        "This session is being continued from a previous conversation that ran out of context. "
+        "The summary below is harness-generated."
+    )
+    snapshot = reduce_events(
+        "claude-code",
+        "fixture/session",
+        (
+            _claude_user("retain this usable request"),
+            _claude({"type": "system", "subtype": "compact_boundary"}, "compaction"),
+            _claude_user(continuation),
+        ),
+    )
+
+    assert snapshot.request.text == "retain this usable request"
+    assert not any(continuation in item.text for item in snapshot.recent)
+
+
 def test_claude_latest_genuine_request_excludes_injection_and_agent_prose():
     snapshot = reduce_events(
         "claude-code",
