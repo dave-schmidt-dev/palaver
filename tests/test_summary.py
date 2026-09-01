@@ -8,7 +8,7 @@ from pathlib import Path
 from palaver.ingest.adapters.base import Event
 from palaver.observer.signals import Status, derive_status
 from palaver.summary import Provenance, SummaryReducer, reduce_events
-from palaver.summary.model import DISPLAY_TEXT_LIMIT, sanitize_text
+from palaver.summary.model import DISPLAY_TEXT_LIMIT, latest_high_signal_activity, sanitize_text
 from palaver.ui.companion_update import signals_from_snapshot
 
 
@@ -68,6 +68,41 @@ def test_tool_call_and_result_share_one_recent_activity_row():
 
     assert len(snapshot.recent) == 1
     assert snapshot.recent[0].text == "Tool Bash: pytest: passed"
+    assert latest_high_signal_activity(snapshot) == ()
+
+
+def test_high_signal_activity_keeps_latest_question_or_agent_message_not_tool_traffic():
+    question = _codex_call(
+        "request_user_input", "question-1", {"questions": [{"question": "Use current pane?"}]}
+    )
+    asked = reduce_events(
+        "codex",
+        "fixture-codex",
+        (
+            _codex_message("user", "retain this request"),
+            _codex_call("functions.exec", "tool-1", {}),
+            question,
+        ),
+    )
+    selected = latest_high_signal_activity(asked)
+    assert asked.request.text == "retain this request"
+    assert [(item.text, item.evidence_kind) for item in selected] == [
+        ("Question: Use current pane?", "question")
+    ]
+
+    replied = reduce_events(
+        "codex",
+        "fixture-codex",
+        (
+            _codex_message("user", "retain this request"),
+            _codex_call("functions.exec", "tool-1", {}),
+            question,
+            _codex_message("assistant", "I can make that change."),
+        ),
+    )
+    assert [(item.text, item.evidence_kind) for item in latest_high_signal_activity(replied)] == [
+        ("Agent: I can make that change.", "agent_message")
+    ]
 
 
 def test_codex_call_and_result_share_one_recent_activity_row():

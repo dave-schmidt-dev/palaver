@@ -118,6 +118,40 @@ def test_malformed_complete_record_forces_unknown_state(tmp_path, monkeypatch):
     assert "malformed" in state.detail
 
 
+def test_normal_state_keeps_request_and_filters_tool_only_activity(tmp_path, monkeypatch):
+    adapter = Adapter(
+        [
+            TailResult(
+                (
+                    _event("keep this request"),
+                    Event(
+                        "session",
+                        "function_call",
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "name": "functions.exec",
+                                "call_id": "tool-1",
+                                "arguments": "{}",
+                            },
+                        },
+                    ),
+                ),
+                Cursor(10),
+            )
+        ]
+    )
+    monkeypatch.setattr(companion_update, "_adapter", lambda *_args: adapter)
+    updater, app, pairs, writes, _clock = _fixture(tmp_path, adapter)
+
+    asyncio.run(updater.refresh_once(app, pairs))
+    state = writes[-1][1]
+    assert state.request == "keep this request"
+    assert state.recent == ()
+    assert state.recent_kinds == ()
+
+
 def test_current_tail_advance_clears_cached_quiet_refinement(tmp_path, monkeypatch):
     adapter = Adapter([TailResult((_ended_event(),), Cursor(10))])
     monkeypatch.setattr(companion_update, "_adapter", lambda *_args: adapter)

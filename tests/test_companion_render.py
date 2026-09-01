@@ -87,6 +87,127 @@ def test_golden_frame_40_by_4_uses_latest_activity_and_question():
     )
 
 
+def test_five_row_frame_wraps_request_and_latest_agent_update():
+    state = _state(
+        request="human request needs a second line",
+        recent=("agent update needs a second line",),
+        questions=(),
+        command_result=None,
+        detail=None,
+    )
+
+    assert _frame_text(state, 30, 5) == (
+        "PALAVER  WORKING  Alpha Proje…\r\n"
+        "REQUEST  human request needs a\r\n"
+        "         second line          \r\n"
+        "NOW      agent update needs a \r\n"
+        "         second line          "
+    )
+
+
+def test_five_row_frame_keeps_two_by_two_primary_lines_over_lower_sections():
+    state = _state(
+        request="human request needs a second line",
+        recent=("agent update needs a second line",),
+        questions=("need a decision?",),
+        command_result="command failed",
+        detail=None,
+    )
+
+    rows = _frame_text(state, 30, 5).split("\r\n")
+    assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
+        "REQUEST",
+        "",
+        "NOW",
+        "",
+    ]
+    assert "ASK" not in "\n".join(rows)
+    assert "COMMAND" not in "\n".join(rows)
+
+
+def test_six_row_frame_does_not_drop_primary_lines():
+    state = _state(
+        request="human request needs a second line",
+        recent=("agent update needs a second line",),
+        questions=("need a decision?",),
+        command_result="command failed",
+        detail=None,
+    )
+
+    compact = _frame_text(state, 30, 5).split("\r\n")
+    taller = _frame_text(state, 30, 6).split("\r\n")
+    assert taller[:5] == compact
+    assert taller[5].startswith("ASK      ")
+
+
+def test_taller_seeded_frame_expands_request_before_lower_sections():
+    state = _state(
+        request="human request needs a second line and more context",
+        recent=("agent update needs a second line",),
+        questions=("need a decision?",),
+        command_result="command failed",
+        detail=None,
+    )
+
+    rows = _frame_text(state, 30, 7).split("\r\n")
+    assert rows[3].startswith("         context")
+    assert rows[4].startswith("NOW      agent update needs a")
+    assert rows[5].startswith("         second line")
+    assert rows[6].startswith("ASK      ")
+
+
+def test_compact_frame_falls_back_to_ask_and_command_when_primary_values_are_short():
+    state = _state(
+        request="short request",
+        recent=("short update",),
+        questions=("need a decision?",),
+        command_result="command failed",
+        detail=None,
+    )
+
+    rows = _frame_text(state, 30, 5).split("\r\n")
+    assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
+        "REQUEST",
+        "NOW",
+        "ASK",
+        "COMMAND",
+    ]
+
+
+def test_compact_frame_keeps_two_now_lines_when_request_is_short():
+    state = _state(
+        request="short request",
+        recent=("agent update needs a second line",),
+        questions=("need a decision?",),
+        command_result="command failed",
+        detail=None,
+    )
+
+    rows = _frame_text(state, 30, 5).split("\r\n")
+    assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
+        "REQUEST",
+        "NOW",
+        "",
+        "ASK",
+    ]
+    assert rows[2].startswith("NOW      agent update needs a")
+    assert rows[3].startswith("         second line")
+
+
+def test_taller_frame_keeps_two_wrapped_now_lines_without_a_request():
+    state = _state(
+        request=None,
+        recent=("agent update has enough words for a second line",),
+        questions=(),
+        command_result=None,
+        detail=None,
+    )
+
+    rows = _frame_text(state, 30, 10).split("\r\n")
+    assert rows[1].startswith("NOW      agent update has")
+    assert rows[2].startswith("         enough words for")
+
+
 def test_golden_frame_80_by_6_shows_every_section_once():
     assert _frame_text(_state(), 80, 6) == (
         "PALAVER  WORKING  Alpha Project · codex                                         \r\n"
@@ -98,31 +219,29 @@ def test_golden_frame_80_by_6_shows_every_section_once():
     )
 
 
-def test_golden_frame_80_by_10_grows_lists_under_one_label():
+def test_golden_frame_80_by_10_keeps_sections_and_pads_frame():
     assert _frame_text(_state(), 80, 10) == (
         "PALAVER  WORKING  Alpha Project · codex                                         \r\n"
         "REQUEST  ship companion panes                                                   \r\n"
         "NOW      updated plan                                                           \r\n"
-        "         parsed tool result                                                     \r\n"
         "ASK      deploy now?                                                            \r\n"
         "COMMAND  tests are passing                                                      \r\n"
         "DETAIL   exact pane joined                                                      \r\n"
+        "                                                                                \r\n"
         "                                                                                \r\n"
         "                                                                                \r\n"
         "                                                                                "
     )
 
 
-def test_spare_rows_go_to_recent_activity_newest_first():
+def test_now_shows_latest_high_signal_activity():
     busy = _state(recent=tuple(f"step {index}" for index in range(MAX_ITEMS)))
     rows = _frame_text(busy, 40, 10).split("\r\n")
     assert rows[2].startswith("NOW      ")
-    assert [row[_LABEL_WIDTH:].strip() for row in rows[2:5]] == ["step 7", "step 6", "step 5"]
-    assert [row.split()[0] for row in rows[5:]] == ["step", "step", "ASK", "COMMAND", "DETAIL"]
+    assert [row[_LABEL_WIDTH:].strip() for row in rows[2:3]] == ["step 7"]
+    assert [row.split()[0] for row in rows[3:] if row.split()] == ["ASK", "COMMAND", "DETAIL"]
     taller = _frame_text(busy, 40, 12).split("\r\n")
-    assert [row[_LABEL_WIDTH:].strip() for row in taller[2:7]] == [
-        f"step {n}" for n in (7, 6, 5, 4, 3)
-    ]
+    assert [row[_LABEL_WIDTH:].strip() for row in taller[2:3]] == ["step 7"]
 
 
 def test_request_wraps_wide_characters_and_an_overlong_word_at_cell_boundaries():
@@ -149,21 +268,21 @@ def test_missing_request_is_omitted_without_crashing():
     assert all(not row.startswith("REQUEST") for row in rows)
 
 
-def test_request_keeps_every_section_first_row_and_marks_omitted_wrap_lines():
+def test_request_primary_rows_precede_high_signal_now_and_lower_sections():
     state = _state(request="one two three four five six seven eight nine ten eleven twelve")
     rows = _frame_text(state, 30, 6).split("\r\n")
 
     assert [row[:_LABEL_WIDTH].strip() for row in rows[1:]] == [
         "REQUEST",
+        "",
         "NOW",
         "ASK",
         "COMMAND",
-        "DETAIL",
     ]
-    assert rows[1].rstrip().endswith("…")
+    assert rows[2].rstrip().endswith("…")
 
 
-def test_spare_rows_complete_request_before_ask_then_now():
+def test_spare_rows_follow_request_then_now_then_ask():
     state = _state(
         request="one two three four five six seven eight nine ten eleven",
         recent=("old activity", "new activity"),
@@ -176,12 +295,19 @@ def test_spare_rows_complete_request_before_ask_then_now():
         "",
         "",
         "NOW",
-        "",
         "ASK",
         "",
         "COMMAND",
         "DETAIL",
+        "",
     ]
+
+
+def test_narrow_frame_omits_request_and_now_values_consistently():
+    state = _state(recent=("agent update",), recent_kinds=("agent_message",))
+    frame = _frame_text(state, 1, 4)
+    assert "REQUEST" not in frame
+    assert "NOW" not in frame
 
 
 def test_a_question_and_a_command_result_no_longer_compete_for_one_row():
@@ -213,25 +339,53 @@ def test_activity_rows_are_colored_by_the_producers_evidence_kind():
     uncolored = (companion_render.RED, companion_render.MUTED, companion_render.AMBER)
     assert "Agent: pushed" in rows[2]
     assert not any(escape in rows[2] for escape in uncolored)
-    assert f"{companion_render.RED}Tool error: E501{companion_render.RESET}" in rows[3]
-    assert f"{companion_render.MUTED}Tool Bash: ruff check .{companion_render.RESET}" in rows[4]
+    assert all("Tool error: E501" not in row for row in rows)
+    assert all("Tool Bash: ruff check ." not in row for row in rows)
+
+
+def test_now_suppresses_tool_only_legacy_state_but_keeps_failure_and_question():
+    tool_only = _state(
+        recent=("Tool Bash: ruff check .", "Tool result: passed"),
+        recent_kinds=("tool_use", "tool_result"),
+        questions=(),
+    )
+    assert "NOW" not in _frame_text(tool_only, 80, 6)
+
+    signal = _state(
+        recent=("Tool Bash: ruff check .", "Command exited 1 this turn", "Question: Retry?"),
+        recent_kinds=("tool_use", "exec_command_end", "question"),
+        questions=(),
+    )
+    frame = _frame_text(signal, 80, 6)
+    assert "NOW      Question: Retry?" in frame
+    assert "Command exited 1 this turn" not in frame
+
+
+def test_now_shows_a_command_failure_without_other_high_signal_activity():
+    state = _state(
+        recent=("Command exited 1 this turn",),
+        recent_kinds=("exec_command_end",),
+        questions=(),
+    )
+    frame = _frame_text(state, 80, 6)
+    assert "NOW      Command exited 1 this turn" in frame
 
 
 def test_a_color_never_bleeds_into_the_label_column():
-    state = _state(recent=("Tool result: ok",), recent_kinds=("tool_result",))
+    state = _state(recent=("Question: retry?",), recent_kinds=("question",))
     rows = render_frame(state, 60, 4, now=101).decode().split("\r\n")
-    activity = next(row for row in rows if "Tool result: ok" in row)
-    label, _, rest = activity.partition("Tool result")
-    assert label.endswith(f"{companion_render.MUTED}")
-    assert companion_render.MUTED not in label[: label.index(companion_render.MUTED)]
-    assert rest.startswith(f": ok{companion_render.RESET}")
+    activity = next(row for row in rows if "Question: retry?" in row)
+    label, _, rest = activity.partition("Question")
+    assert label.endswith(companion_render.AMBER)
+    assert companion_render.AMBER not in label[: label.index(companion_render.AMBER)]
+    assert rest.startswith(f": retry?{companion_render.RESET}")
 
 
-def test_an_unknown_evidence_kind_is_left_uncolored_rather_than_guessed():
+def test_an_unknown_evidence_kind_is_suppressed_from_normal_now():
     state = _state(recent=("Something new",), recent_kinds=("kind_from_a_future_release",))
     frame = render_frame(state, 60, 4, now=101).decode()
-    activity = next(row for row in frame.split("\r\n") if "Something new" in row)
-    assert activity.endswith("Something new" + " " * (60 - _LABEL_WIDTH - len("Something new")))
+    assert "NOW" not in _strip_ansi(frame)
+    assert "Something new" not in frame
 
 
 def test_the_command_row_is_red_because_it_only_ever_holds_a_failure():
@@ -293,7 +447,8 @@ def test_request_omission_marks_the_visible_line_and_only_owned_tokens_are_color
     frame = render_frame(state, 16, 5, now=101).decode()
     plain = _strip_ansi(frame)
     rows = plain.split("\r\n")
-    assert rows[1] == "REQUEST  first… "
+    assert rows[1] == "REQUEST  first  "
+    assert rows[2] == "         界…    "
     assert all(cell_width(row) == 16 for row in rows)
     assert b"\x1b[36mPALAVER" in frame.encode()
     assert b"\x1b[32mDONE" in frame.encode()

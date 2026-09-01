@@ -46,7 +46,7 @@ COMPANION_SESSION_VARIABLE = "user.palaver_companion_session"
 DISABLED_VARIABLE = "user.palaver_companion_disabled"
 COMPANION_ROLE = "companion-v1"
 
-SUMMARY_ROWS = 10
+SUMMARY_ROWS = 5
 MIN_AGENT_ROWS = 1
 LAYOUT_SETTLE_ATTEMPTS = 3
 LAYOUT_SETTLE_DELAY = 0.05
@@ -633,7 +633,7 @@ class CompanionController:
         detected: SupportedPaneProcess,
         joined: PaneJoin | None,
     ) -> CompanionPair | None:
-        # A ten-row summary plus at least one agent row is the only local
+        # A five-row summary plus at least one agent row is the only local
         # precondition. iTerm owns all other layout constraints and may still
         # refuse the split, which is handled as a per-pane failure below.
         session_getter = getattr(app, "get_session_by_id", None)

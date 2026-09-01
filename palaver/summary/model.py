@@ -199,6 +199,44 @@ def fold_recent_result(
     return append_recent(current, rendered, Provenance.EXACT, kind, evidence_id)
 
 
+_HIGH_SIGNAL_KINDS = frozenset(
+    {
+        "agent_message",
+        "tool_error",
+        "error",
+        "exec_command_end",
+        "patch_apply_end",
+        "compaction",
+        "turn_boundary",
+    }
+)
+
+
+def latest_high_signal_activity(snapshot: SummarySnapshot) -> tuple[RecentActivity, ...]:
+    """Return the one normal-view activity item worth showing in ``NOW``.
+
+    Tool traffic remains available to deterministic reducers, but it is not
+    normal companion content. Open questions are represented by their
+    structured claims instead of exposing the request tool invocation.
+    """
+    questions_by_evidence = {
+        claim.evidence_id: claim.text
+        for claim in snapshot.questions.items
+        if claim.evidence_id is not None and claim.text
+    }
+    for item in reversed(snapshot.recent):
+        question = questions_by_evidence.get(item.evidence_id)
+        if question is not None:
+            return (
+                RecentActivity(
+                    f"Question: {question}", item.provenance, "question", item.evidence_id
+                ),
+            )
+        if item.evidence_kind in _HIGH_SIGNAL_KINDS:
+            return (item,)
+    return ()
+
+
 def append_unknown_reason(current: tuple[str, ...], reason: str) -> tuple[str, ...]:
     """Append one deduplicated diagnostic while keeping snapshot state bounded."""
     if reason in current:

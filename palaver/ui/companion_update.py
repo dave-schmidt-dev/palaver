@@ -14,6 +14,7 @@ from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.ingest.cursors import Cursor
 from palaver.observer.signals import Liveness, Signals, Tri, apply_liveness, derive_status
 from palaver.summary import Provenance, SummaryReducer, SummarySnapshot
+from palaver.summary.model import latest_high_signal_activity
 from palaver.ui.companion import CompanionPair, ReadMetadata
 from palaver.ui.companion_state import MAX_ITEMS, CompanionState, JoinState, atomic_write_state
 from palaver.ui.pane_join import (
@@ -65,6 +66,7 @@ def _semantic(state: CompanionState) -> tuple[object, ...]:
 
 def _state(snapshot: SummarySnapshot, *, project: str, status: str, now: float) -> CompanionState:
     detail = snapshot.unknown_reasons[-1] if snapshot.unknown_reasons else None
+    activity = latest_high_signal_activity(snapshot)
     return CompanionState(
         producer_updated_at=now,
         project=project,
@@ -74,8 +76,8 @@ def _state(snapshot: SummarySnapshot, *, project: str, status: str, now: float) 
         request=snapshot.request.text,
         command_result=snapshot.command_result.text,
         detail=detail,
-        recent=tuple(item.text for item in snapshot.recent),
-        recent_kinds=tuple(item.evidence_kind for item in snapshot.recent),
+        recent=tuple(item.text for item in activity),
+        recent_kinds=tuple(item.evidence_kind for item in activity),
         tasks=tuple(f"{item.status}: {item.text}" for item in snapshot.tasks.items)[-MAX_ITEMS:],
         questions=tuple(item.text for item in snapshot.questions.items if item.text)[-MAX_ITEMS:],
     )

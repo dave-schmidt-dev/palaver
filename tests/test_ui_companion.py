@@ -281,7 +281,7 @@ def test_supported_process_gets_unjoined_companion_above_it(tmp_path, monkeypatc
     assert summary.vars[ROLE_VARIABLE] == COMPANION_ROLE
     assert summary.vars[AGENT_SESSION_VARIABLE] == "agent"
     assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
-    assert summary.preferred_size == (100, 10)
+    assert summary.preferred_size == (100, 5)
     assert "palaver.ui.companion_render" in agent.split_calls[0]["profile_customizations"]
 
 
@@ -308,8 +308,8 @@ def test_created_companion_is_sized_without_changing_tab_geometry(tmp_path, monk
     result = asyncio.run(ctl.reconcile(app))
 
     assert result.created == ("summary",)
-    assert summary.preferred_size == (100, 10)
-    assert agent.preferred_size == (100, 20)
+    assert summary.preferred_size == (100, 5)
+    assert agent.preferred_size == (100, 25)
     assert neighbour.preferred_size == (100, 30)
     assert app.tab.layout_updates == 1
     requested = [agent.preferred_size, summary.preferred_size, neighbour.preferred_size]
@@ -444,7 +444,7 @@ def test_a_split_that_lands_late_is_sized_on_a_later_refresh(tmp_path, monkeypat
     assert result.created == ("summary",)
     assert app.tab.layout_updates == 1
     assert summary.preferred_size == (100, companion.SUMMARY_ROWS)
-    assert agent.preferred_size == (100, 20)
+    assert agent.preferred_size == (100, 25)
 
 
 def test_default_state_transport_marks_an_unresolved_join_unjoined(tmp_path):
@@ -555,7 +555,7 @@ def test_one_sided_pair_cleanup_leaves_no_orphan_state(tmp_path):
 
 
 def test_small_agent_is_refused_without_split(tmp_path):
-    app, agent, _summary = paired_app(height=10)
+    app, agent, _summary = paired_app(height=5)
     ctl, writes = controller(tmp_path)
     result = asyncio.run(ctl.reconcile(app))
     assert result.refused == ("agent",)
@@ -710,6 +710,29 @@ def test_explicit_disable_closes_companion_and_enable_clears_suppression(tmp_pat
     assert asyncio.run(ctl.set_enabled(app, "agent", enabled=True))
     assert agent.vars[DISABLED_VARIABLE] is False
     assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+
+
+def test_disabled_companion_stays_absent_across_reconciliation(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars.update(
+        {
+            DISABLED_VARIABLE: True,
+            COMPANION_SESSION_VARIABLE: "summary",
+        }
+    )
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    ctl, _ = controller(tmp_path)
+
+    result = asyncio.run(ctl.reconcile(app))
+    assert result.pairs == ()
+    assert result.created == ()
+    assert summary.close_calls == [{"force": True}]
+
+    app.tab.sessions.remove(summary)
+    later = asyncio.run(ctl.reconcile(app))
+    assert later.created == ()
+    assert agent.split_calls == []
 
 
 def test_stuck_rollover_requires_disable_cleanup_before_enable(tmp_path):
@@ -1063,7 +1086,7 @@ def test_rebuilt_tab_instance_after_split_is_located_and_sized(tmp_path, monkeyp
     assert result.created == ("summary",)
     assert app.tab.layout_updates == 1
     assert summary.preferred_size == (100, companion.SUMMARY_ROWS)
-    assert agent.preferred_size == (100, 20)
+    assert agent.preferred_size == (100, 25)
 
 
 def test_create_reacquires_live_session_before_splitting(tmp_path, monkeypatch):

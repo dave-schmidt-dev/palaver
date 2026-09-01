@@ -73,7 +73,7 @@ Status is computed in Python from deterministic signals — turn boundaries, unr
 - **Identity:** Codex projects use the canonical working directory plus a stable collision-resistant suffix; Claude Code preserves its existing cwd-key identity. A pane-local session pin is available for deliberate rename/move recovery. Two panes on the same project share **project-level** memory but keep **separate session-level** state.
 - **Memory is append-only.** Correction creates a new superseding row; nothing is deleted or mutated in place. Provenance ordering is enforced by database constraint, not by prompt text — an observer inference cannot supersede an explicit user instruction.
 - **UI:** each agent pane gets its own shallow companion pane above it, showing that session's deterministic activity summary, goal, open questions, and recent activity. A local LLM is optional compression, not the source of status.
-- **Pane layout:** labeled sections in a fixed gutter — `REQUEST`, `NOW`, `ASK`, `COMMAND`, `DETAIL`. Every section with content earns one row before any earns a second, then spare rows go to the lists and `NOW` absorbs the remainder, so a two-row pane still shows the request and a ten-row pane fills. Activity rows fold each completed tool call and result into one row, and are colored by the producer's evidence kind (red for a failure, dim for tool traffic, default weight for the agent's own prose); the renderer never reads display text to pick a color.
+- **Pane layout:** labeled sections in a fixed gutter — `REQUEST`, `NOW`, `ASK`, `COMMAND`, `DETAIL`. In the five-row frame, `REQUEST` and `NOW` each receive up to two wrapped lines when both need them; elsewhere spare rows complete `REQUEST`, then `NOW`, then `ASK`. `NOW` has a two-line cap and shows only the latest high-signal agent message, question, command failure, compaction, or turn boundary, never raw tool invocation/result traffic. The renderer uses the producer's evidence kind for color and never reads display text to pick one.
 - **Self-observation:** Palaver records the *fact* of a query from the server side and does not feed its own output back through the observer.
 
 ## Sensitivity
@@ -138,7 +138,7 @@ socket is absent, rather than falling back to the library's loopback TCP
 listener. Authentication uses the `ITERM2_COOKIE` iTerm2 issues; the cookie is a
 credential and is passed only through the environment, never on a command line.
 
-The AutoLaunch process creates and maintains one ten-row companion above each
+The AutoLaunch process creates and maintains one five-row companion above each
 supported agent pane. The height is set once, when the companion is split, and
 is never changed afterwards: an existing pane is reused as-is. **Palaver never
 resizes your window.** iTerm2's only pane-sizing call rewrites the whole tab
@@ -154,9 +154,10 @@ skipped and iTerm's own even split stands. Verifying this needs a real
 terminal: `PALAVER_RUN_LIVE_COMPANION_TEST=1 pytest tests/test_companion_live.py`
 creates a disposable window and asserts the frame never moves. It pairs panes
 with reciprocal iTerm variables, restores them after renderer restarts, and
-writes private atomic state files that the terminal renderer displays. REQUEST
-values wrap at terminal-cell boundaries, including wide characters and
-overlong words; other section values clip to their allocated row. Only
+writes private atomic state files that the terminal renderer displays.
+`REQUEST` and `NOW` values wrap at terminal-cell boundaries, including wide
+characters and overlong words; `NOW` is capped at two rows and other section
+values clip to their allocated row. Only
 Palaver-owned headers, labels, and statuses receive ANSI color. User-provided
 values are rendered as plain text. Input typed into a
 companion is discarded and never forwarded. When the supported agent process
@@ -179,7 +180,8 @@ the one the live agent process still holds open. If several remain open, it
 waits for a second metadata-only observation and joins only when exactly one
 stable candidate advances; zero, multiple, or regressing candidates remain
 unjoined. For an intentional directory rename or move, pin the known rollout
-to the pane without focusing it, and clear the override later:
+to the pane without focusing it, and clear the override later. Use the
+explicit `--session PANE_ID` forms:
 
 ```sh
 uv run palaver ui --session PANE_ID --pin codex SESSION_KEY

@@ -15,7 +15,6 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from palaver.ui.companion_state import (
-    MAX_ITEMS,
     CompanionState,
     CompanionStateError,
     JoinState,
@@ -180,18 +179,31 @@ _ACTIVITY_COLORS = {
     "function_call": MUTED,
     "function_call_output": MUTED,
     "human_message": MUTED,
+    "question": AMBER,
 }
+
+_NORMAL_ACTIVITY_KINDS = frozenset(
+    {
+        "agent_message",
+        "question",
+        "tool_error",
+        "error",
+        "exec_command_end",
+        "patch_apply_end",
+        "compaction",
+        "turn_boundary",
+    }
+)
 
 
 def _activity_items(state: CompanionState) -> tuple[tuple[str, str], ...]:
-    """Pair each activity item with its color, newest first."""
+    """Return the newest normal-view activity without exposing tool traffic."""
 
     paired = zip(state.recent, state.recent_kinds, strict=True)
-    return tuple(
-        (text, _ACTIVITY_COLORS.get(kind, ""))
-        for text, kind in reversed(list(paired))
-        if text and text.strip()
-    )
+    for text, kind in reversed(list(paired)):
+        if text and text.strip() and kind in _NORMAL_ACTIVITY_KINDS:
+            return ((text, _ACTIVITY_COLORS.get(kind, "")),)
+    return ()
 
 
 def _section_items(
@@ -199,20 +211,23 @@ def _section_items(
 ) -> dict[str, tuple[tuple[str, str], ...]]:
     """Return each labeled section's items, in the order they should be read.
 
-    ``recent`` is stored oldest-first and is reversed here so NOW's first row
-    is always the newest activity. That keeps the row honest in a pane only
-    tall enough for one of them, and stops a resize from changing which end
-    of the history the label refers to.
+    ``recent`` is stored oldest-first. NOW takes the newest high-signal item,
+    so a resize cannot reveal lower-signal tool traffic.
     """
 
     request = (
         tuple((line, "") for line in _wrap_words(state.request, request_width))
         if request_width > 0 and state.request is not None
-        else _nonempty(state.request)
+        else ()
+    )
+    now = tuple(
+        (line, color)
+        for value, color in _activity_items(state)
+        for line in (_wrap_words(value, request_width) if request_width > 0 else ())
     )
     return {
         "REQUEST": request,
-        "NOW": _activity_items(state),
+        "NOW": now,
         "ASK": _nonempty(*state.questions, color=AMBER),
         # Both reducers populate `command_result` only from a failure, so this
         # row is never a neutral outcome.
@@ -224,11 +239,10 @@ def _section_items(
 # Every section with content earns its first row in this order, so a two-line
 # pane still shows the request and a four-line one still reaches the question.
 _ROW_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
-# Spare rows first complete REQUEST's wrapped lines, then grow ASK, and NOW
-# absorbs whatever is left. This retains every populated section's first-row
-# guarantee while letting the primary request use the rest of the pane.
-_GROWTH_ORDER = ("REQUEST", "ASK", "NOW")
-_GROWTH_CAPS = {"REQUEST": None, "ASK": 2, "NOW": MAX_ITEMS}
+# Outside the compact five-row frame, spare rows first complete REQUEST and
+# NOW's wrapped lines, then grow ASK.
+_GROWTH_ORDER = ("REQUEST", "NOW", "ASK")
+_GROWTH_CAPS = {"REQUEST": None, "ASK": 2, "NOW": 2}
 # Reading order down the pane, which is deliberately not the order above.
 _DISPLAY_ORDER = ("REQUEST", "NOW", "ASK", "COMMAND", "DETAIL")
 # The widest label plus the gutter that lines every section's items up.
@@ -239,6 +253,61 @@ def _allocate_rows(items: Mapping[str, Sequence[object]], rows: int) -> dict[str
     """Divide the available content rows among the sections that have any."""
 
     counts = dict.fromkeys(items, 0)
+    # Seed primary content before lower-priority sections whenever the frame
+    # has room for two rows of content. This keeps visible primary lines
+    # monotonic as a pane grows.
+    if rows >= 4 and (items["REQUEST"] or items["NOW"]):
+        counts["REQUEST"] = min(2, len(items["REQUEST"]))
+        counts["NOW"] = min(2, len(items["NOW"]))
+        remaining = rows - counts["REQUEST"] - counts["NOW"]
+        both_need_wrapping = len(items["REQUEST"]) >= 2 and len(items["NOW"]) >= 2
+        if rows > 4 and both_need_wrapping:
+            # Taller frames reveal more REQUEST before lower sections. NOW is
+            # capped at two wrapped lines and therefore remains stable.
+            for label in ("REQUEST", "NOW"):
+                if remaining <= 0:
+                    break
+                cap = _GROWTH_CAPS[label]
+                allowed = min(
+                    counts[label] + remaining,
+                    len(items[label]),
+                    len(items[label]) if cap is None else cap,
+                )
+                remaining -= allowed - counts[label]
+                counts[label] = allowed
+        for label in _ROW_ORDER:
+            if remaining <= 0:
+                break
+            if label in {"REQUEST", "NOW"} or not items[label]:
+                continue
+            counts[label] = 1
+            remaining -= 1
+        if not (rows > 4 and both_need_wrapping):
+            # If lower sections do not consume the compact frame, use the
+            # spare rows for the primary values before leaving them blank.
+            for label in ("REQUEST", "NOW"):
+                if remaining <= 0:
+                    break
+                cap = _GROWTH_CAPS[label]
+                allowed = min(
+                    counts[label] + remaining,
+                    len(items[label]),
+                    len(items[label]) if cap is None else cap,
+                )
+                remaining -= allowed - counts[label]
+                counts[label] = allowed
+        for label in ("ASK",):
+            if remaining <= 0 or not counts[label]:
+                break
+            cap = _GROWTH_CAPS[label]
+            allowed = min(
+                counts[label] + remaining,
+                len(items[label]),
+                len(items[label]) if cap is None else cap,
+            )
+            remaining -= allowed - counts[label]
+            counts[label] = allowed
+        return counts
     remaining = max(0, rows)
     for label in _ROW_ORDER:
         if remaining <= 0:
@@ -276,11 +345,11 @@ def _content_lines(state: CompanionState, width: int, rows: int) -> list[tuple[s
             if value_width <= 0:
                 lines.append((prefix, ""))
             else:
-                omitted_request_lines = label == "REQUEST" and counts[label] < len(items[label])
-                is_last_visible_request_line = index == counts[label] - 1
+                omitted_lines = label in {"REQUEST", "NOW"} and counts[label] < len(items[label])
+                is_last_visible_line = index == counts[label] - 1
                 rendered = (
                     clip_cells(f"{value}…", value_width)
-                    if omitted_request_lines and is_last_visible_request_line
+                    if omitted_lines and is_last_visible_line
                     else clip_cells(value, value_width)
                 )
                 lines.append((prefix + rendered, color))
