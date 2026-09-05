@@ -604,6 +604,38 @@ def test_the_shim_spawns_the_interpreter_palaver_is_installed_into():
     assert '"-m", MODULE' in source
 
 
+def test_the_shim_pins_one_interpreter_name_however_install_was_invoked(monkeypatch, tmp_path):
+    """`--install` must render the same bytes from either spelling.
+
+    `sys.executable` is whatever name started the process, and a virtualenv
+    offers both `python` and `python3`, so without normalization one
+    environment has two valid shims and no check can compare the installed
+    file against the rendered one.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python").write_text("", encoding="utf-8")
+    (bin_dir / "python3").symlink_to(bin_dir / "python")
+
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+    from_python3 = render_shim()
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    from_python = render_shim()
+
+    assert from_python3 == from_python
+    assert "PYTHON = " + repr(str(bin_dir / "python")) in from_python
+
+
+def test_an_interpreter_with_no_python_alias_beside_it_is_left_alone(monkeypatch, tmp_path):
+    """Normalizing to a name that does not exist would render a dead shim."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+    assert "PYTHON = " + repr(str(bin_dir / "python3")) in render_shim()
+
+
 def test_the_shim_pins_the_child_to_the_project_local_state_root():
     source = render_shim(project_root=Path("/project/palaver"))
     assert "CWD = '/project/palaver'" in source

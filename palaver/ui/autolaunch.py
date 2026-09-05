@@ -413,6 +413,25 @@ async def main(
     return registry
 
 
+def _canonical_interpreter(executable: Path) -> Path:
+    """Normalize an interpreter path to the `python` name beside it.
+
+    `sys.executable` records the name the interpreter was started under, so
+    `--install` run as `python3` and as `python` would write different shims
+    for one environment and make the installed file irreproducible. Only the
+    name is normalized: resolving the symlink would land on the real
+    interpreter outside the virtualenv and lose everything installed into it.
+
+    Args:
+        executable: Interpreter path to normalize.
+
+    Returns:
+        The sibling `python` when one exists, otherwise `executable` unchanged.
+    """
+    canonical = executable.parent / "python"
+    return canonical if canonical.exists() else executable
+
+
 def render_shim(
     *,
     python_executable: Path | None = None,
@@ -423,8 +442,9 @@ def render_shim(
 
     Args:
         python_executable: Interpreter to spawn, defaulting to the one
-            rendering this. That is the interpreter Palaver is installed
-            into, which is exactly the one that must run it.
+            rendering this, normalized to its `python` name. That is the
+            interpreter Palaver is installed into, which is exactly the one
+            that must run it. An explicit path is used verbatim.
         module: Module to run with `-m`.
         project_root: Working directory for the child.
 
@@ -432,7 +452,11 @@ def render_shim(
         Python source. Written for an old interpreter on purpose — see the
         module docstring — so it uses no syntax newer than 3.6.
     """
-    executable = Path(sys.executable) if python_executable is None else python_executable
+    executable = (
+        _canonical_interpreter(Path(sys.executable))
+        if python_executable is None
+        else python_executable
+    )
     root = Path.cwd() if project_root is None else project_root
     return f'''"""Palaver's iTerm2 AutoLaunch shim. Generated -- do not edit.
 
