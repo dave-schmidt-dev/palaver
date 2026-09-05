@@ -20,9 +20,11 @@ import pytest
 
 from palaver.ui import connection
 from palaver.ui.companion import (
+    AGENT_EXIT_GRACE,
     AGENT_SESSION_VARIABLE,
     COMPANION_ROLE,
     COMPANION_SESSION_VARIABLE,
+    DISABLED_VARIABLE,
     ROLE_VARIABLE,
     SUMMARY_ROWS,
     CompanionController,
@@ -543,6 +545,96 @@ def test_three_test_owned_agents_have_isolated_resilient_companions(tmp_path):
                     await termination_collector
             if termination_monitor is not None:
                 await termination_monitor.__aexit__(None, None, None)
+            if window_id is not None:
+                owned_window = app.get_window_by_id(window_id)
+                if owned_window is not None:
+                    await owned_window.async_close(force=True)
+            if state_dir.exists():
+                for path in state_dir.glob("*.json"):
+                    path.unlink(missing_ok=True)
+
+    _run_live(body)
+
+
+@live_only
+def test_an_agent_that_exits_to_a_shell_prompt_loses_its_companion(tmp_path):
+    """The case iTerm reports no event for.
+
+    `SessionTerminationMonitor` fires when the pane's own command ends. An
+    agent quitting inside a pane that stays at a prompt is invisible to it, so
+    teardown has to come from the pane no longer holding a supported process.
+    Here `/bin/sleep` stands in for the shell that outlives the agent: the pane
+    is never closed, and the detector stops recognizing it.
+    """
+
+    async def body(connection_value):
+        iterm2 = connection.import_iterm2()
+        app = await iterm2.async_get_app(connection_value)
+        window = None
+        window_id = None
+        state_dir = tmp_path / ".state" / "companions"
+        owned_ids: set[str] = set()
+        agent_ids: set[str] = set()
+        status: list[str] = []
+        now = [0.0]
+        try:
+            window = await iterm2.Window.async_create(connection_value, command="/bin/sleep 300")
+            assert window is not None
+            window_id = window.window_id
+            agent = window.current_tab.current_session
+            assert agent is not None
+            agent_ids.add(agent.session_id)
+            owned_ids.update(agent_ids)
+            owned_app = _OwnedApp(app, window, owned_ids)
+            controller = CompanionController(
+                state_dir,
+                read_metadata=make_metadata_reader(connection_value),
+                process_detector=lambda pane, **kwargs: _detector(agent_ids, pane, **kwargs),
+                transcript_joiner=lambda pane, **kwargs: _joiner(agent_ids, pane, **kwargs),
+                process_table_reader=lambda: {},
+                clock=lambda: now[0],
+                on_status=status.append,
+            )
+            created_frame = await window.async_get_frame()
+            await window.async_set_frame(iterm2.Frame(created_frame.origin, iterm2.Size(900, 760)))
+            await _eventually(lambda: _has_at_least_rows(agent, SUMMARY_ROWS * 3))
+
+            result = await controller.reconcile(owned_app)
+            assert len(result.created) == 1
+            owned_ids.update(result.created)
+            pair = controller.pairs[agent.session_id]
+            companion_id = pair.companion_id
+            assert app.get_session_by_id(companion_id) is not None
+
+            # The agent process ends. Its pane does not.
+            agent_ids.discard(agent.session_id)
+            await controller.reconcile(owned_app)
+            assert controller.pairs, "a single missed detection must not end the pair"
+            assert app.get_session_by_id(companion_id) is not None
+
+            now[0] += AGENT_EXIT_GRACE
+            teardown = await controller.reconcile(owned_app)
+            assert teardown.closed == (companion_id,)
+
+            async def companion_gone() -> bool:
+                await owned_app.async_refresh()
+                return app.get_session_by_id(companion_id) is None
+
+            await _eventually(companion_gone)
+            assert controller.pairs == {}
+            assert not pair.state_path.exists()
+            # The pane belongs to the user and must stay eligible for the next
+            # agent started in it.
+            assert app.get_session_by_id(agent.session_id) is not None
+            assert await agent.async_get_variable(COMPANION_SESSION_VARIABLE) in {None, ""}
+            assert await agent.async_get_variable(DISABLED_VARIABLE) is not True
+
+            # A new agent in the same pane pairs again with no explicit enable.
+            agent_ids.add(agent.session_id)
+            again = await controller.reconcile(owned_app)
+            assert len(again.created) == 1
+            owned_ids.update(again.created)
+        finally:
             if window_id is not None:
                 owned_window = app.get_window_by_id(window_id)
                 if owned_window is not None:
