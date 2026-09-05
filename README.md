@@ -163,6 +163,13 @@ values are rendered as plain text. Input typed into a
 companion is discarded and never forwarded. When the supported agent process
 exits, Palaver closes its exactly marked companion, removes the companion state,
 and leaves the agent pane open and enabled at its resulting shell prompt.
+That exit is noticed by probing the paired pane for its agent on each
+reconciliation, not by waiting for an iTerm session-termination event: iTerm
+reports the end of the pane's own command, which is the shell, so an agent
+quitting inside a pane that stays at a prompt raises no event at all. A single
+missed detection is not an exit — `ps` can fail, and an agent restarted
+straight after quitting is one session ending rather than the pair — so
+teardown waits out a short grace period first.
 
 Claude Code panes join through `~/.claude/sessions/<pid>.json`, the registry
 the CLI keeps for each of its own live processes. That record names the pid's

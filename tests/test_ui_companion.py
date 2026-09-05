@@ -469,7 +469,9 @@ def test_marked_companion_is_never_probed_or_split(tmp_path):
     result = asyncio.run(ctl.reconcile(FakeApp(tab)))
 
     assert len(result.pairs) == 1
-    assert seen == []
+    # The agent pane is probed on every pass — that is how an agent that
+    # exited to a shell prompt is noticed at all. The companion never is.
+    assert "summary" not in seen
     assert not agent.split_calls and not summary.split_calls
 
 
@@ -837,6 +839,131 @@ def test_agent_process_end_never_closes_an_unmarked_paired_pane(tmp_path):
     assert agent.vars.get(DISABLED_VARIABLE) is not True
     assert not state_path.exists()
     assert agent.close_calls == []
+
+
+def _ended_agent_pair(tmp_path, now):
+    """A reciprocal pair whose agent pane no longer runs a supported process.
+
+    This is the shape `SessionTerminationMonitor` never reports: `claude`
+    exits, its `zsh` and `login` keep the pane's own command alive, so the
+    only evidence the session ended is that the pane's process tree no longer
+    holds an agent.
+    """
+    agent = FakeSession("agent")
+    summary = FakeSession("summary", job_pid=20)
+    agent.split_result = summary
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    tab = FakeTab([agent, summary])
+    state = companion.opaque_state_path(tmp_path, "agent")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("state", encoding="utf-8")
+    running = [False]
+
+    def detector(variables, **_kwargs):
+        if not running[0]:
+            return None
+        return SupportedPaneProcess(variables.pane_id, 10, "codex", Path("/tmp"))
+
+    ctl, _ = controller(tmp_path, clock=lambda: now[0], detector=detector)
+    return ctl, FakeApp(tab), agent, summary, state, running
+
+
+def test_ended_agent_session_closes_its_companion_after_the_grace_period(tmp_path):
+    now = [0.0]
+    ctl, app, agent, summary, state, _running = _ended_agent_pair(tmp_path, now)
+
+    asyncio.run(ctl.reconcile(app))
+    now[0] += companion.AGENT_EXIT_GRACE
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.closed == ("summary",)
+    assert summary.close_calls == [{"force": True}]
+    assert ctl.pairs == {}
+    assert not state.exists()
+    # The pane itself is the user's, and it must stay eligible: disabling it
+    # here would mean the next agent started in it never got a companion.
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == ""
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+    assert agent.close_calls == []
+    assert agent.sent_text == []
+
+
+def test_a_momentary_missing_agent_process_does_not_close_the_companion(tmp_path):
+    now = [0.0]
+    ctl, app, agent, summary, state, running = _ended_agent_pair(tmp_path, now)
+
+    asyncio.run(ctl.reconcile(app))
+    now[0] += companion.AGENT_EXIT_GRACE - 1.0
+    result = asyncio.run(ctl.reconcile(app))
+    # An empty process table is what a failed `ps` looks like; one of those
+    # inside the grace window must not end the pair.
+    assert summary.close_calls == []
+    assert len(result.pairs) == 1
+
+    running[0] = True
+    now[0] += companion.AGENT_EXIT_GRACE
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert summary.close_calls == []
+    assert len(result.pairs) == 1
+    assert state.exists()
+    assert agent.vars[COMPANION_SESSION_VARIABLE] == "summary"
+
+
+def test_a_new_agent_in_a_torn_down_pane_is_paired_again(tmp_path, monkeypatch):
+    stub_iterm(monkeypatch)
+    now = [0.0]
+    ctl, app, agent, summary, _state, running = _ended_agent_pair(tmp_path, now)
+
+    asyncio.run(ctl.reconcile(app))
+    now[0] += companion.AGENT_EXIT_GRACE
+    asyncio.run(ctl.reconcile(app))
+    app.tab.sessions.remove(summary)
+
+    running[0] = True
+    replacement = FakeSession("summary-2", job_pid=21)
+    agent.split_result = replacement
+    result = asyncio.run(ctl.reconcile(app))
+
+    assert result.created == ("summary-2",)
+    assert agent.vars.get(DISABLED_VARIABLE) is not True
+
+
+def test_a_pending_rollover_never_protects_a_companion_whose_agent_is_gone(tmp_path):
+    summary = FakeSession("summary", job_pid=20)
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    tab = FakeTab([summary])
+    state = companion.opaque_state_path(tmp_path, "agent")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("state", encoding="utf-8")
+    ctl, _ = controller(tmp_path)
+    # Left behind by a renderer restart that the agent pane's close interrupted.
+    ctl._rollover_pending = {"agent": "summary"}
+
+    result = asyncio.run(ctl.reconcile(FakeApp(tab)))
+
+    assert result.closed == ("summary",)
+    assert summary.close_calls == [{"force": True}]
+    assert not state.exists()
+    assert ctl._rollover_pending == {}
+
+
+def test_agent_termination_clears_a_pending_rollover(tmp_path):
+    app, agent, summary = paired_app()
+    app.tab.sessions.append(summary)
+    agent.vars[COMPANION_SESSION_VARIABLE] = "summary"
+    summary.vars.update({ROLE_VARIABLE: COMPANION_ROLE, AGENT_SESSION_VARIABLE: "agent"})
+    state_path = tmp_path / "state.json"
+    state_path.write_text("state", encoding="utf-8")
+    ctl, _ = controller(tmp_path)
+    ctl._pairs = {"agent": companion.CompanionPair("agent", "summary", state_path)}
+    ctl._rollover_pending = {"agent": "summary-old"}
+
+    asyncio.run(ctl.handle_termination(app, "agent"))
+
+    assert ctl._rollover_pending == {}
+    assert summary.close_calls == [{"force": True}]
 
 
 def test_exited_companion_restart_rebinds_new_guid_without_layout_mutation(tmp_path):

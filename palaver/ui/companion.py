@@ -54,6 +54,16 @@ SCROLLBACK_LINES = 100
 INITIAL_RESTART_BACKOFF = 2.0
 MAX_RESTART_BACKOFF = 60.0
 
+#: How long a paired pane may show no supported agent process before its
+#: companion is torn down. `SessionTerminationMonitor` reports only the end of
+#: the pane's own command — `login`, then the shell — so an agent that exits
+#: back to a shell prompt raises no event at all and the pair would otherwise
+#: survive forever showing an unjoined surface. The grace period is what keeps
+#: that teardown from firing on a momentary miss: `ps` can fail and return an
+#: empty table, and `claude -c` immediately after `/exit` is a restart, not an
+#: ended session.
+AGENT_EXIT_GRACE = 12.0
+
 
 def _no_status(_message: str) -> None:
     """Default progress sink."""
@@ -256,6 +266,10 @@ class CompanionController:
         # restarted. Keep the old identity only long enough to reacquire the
         # exact marked pane after App refreshes its layout model.
         self._rollover_pending: dict[str, str] = {}
+        # When a paired pane first showed no supported agent process. Cleared
+        # by any later detection, so only a sustained absence tears the pair
+        # down. See `AGENT_EXIT_GRACE`.
+        self._agent_missing_since: dict[str, float] = {}
 
     @property
     def pairs(self) -> Mapping[str, CompanionPair]:
@@ -304,6 +318,20 @@ class CompanionController:
         pairs: dict[str, CompanionPair] = {}
         restarting: set[str] = set()
         rollover_protected: set[str] = set()
+        # Agents whose companion this pass tore down. The creation loop below
+        # reads the inventory snapshot taken above, in which the agent still
+        # carries its now-cleared companion marker; without this set it would
+        # read that stale marker as a user-closed pane and disable the pane
+        # permanently, so the next agent started there would never be paired.
+        torn_down: set[str] = set()
+        table: ProcessTable | None = None
+
+        async def process_table() -> ProcessTable:
+            nonlocal table
+            if table is None:
+                self._on_status("reading process table for companion reconciliation")
+                table = await asyncio.to_thread(self._read_process_table)
+            return table
 
         # A reciprocal pair is reused without changing its size or focus.
         # `SUMMARY_ROWS` is applied once, at creation. Resizing here would
@@ -326,6 +354,24 @@ class CompanionController:
                     opaque_state_path(self.state_dir, agent_id).unlink(missing_ok=True)
                 except OSError:
                     self._on_status(f"could not remove disabled companion state for {agent_id}")
+                self._forget_agent(agent_id)
+                continue
+            if agent is not None and await self._agent_has_exited(agent, await process_table()):
+                # The agent process is gone but its pane is still a shell
+                # prompt the user owns, so the marker is cleared before the
+                # close and the pane is never disabled: starting another agent
+                # here must pair again without an explicit re-enable.
+                await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, "")
+                for item in owned:
+                    if await self._close_owned(item):
+                        closed.append(item.session_id)
+                try:
+                    opaque_state_path(self.state_dir, agent_id).unlink(missing_ok=True)
+                except OSError:
+                    self._on_status(f"could not remove ended-agent companion state for {agent_id}")
+                self._forget_agent(agent_id)
+                torn_down.add(agent_id)
+                self._on_status(f"closed companion for ended agent session {agent_id}")
                 continue
             reciprocal = [
                 item
@@ -345,6 +391,13 @@ class CompanionController:
                 await agent.session.async_set_variable(COMPANION_SESSION_VARIABLE, item.session_id)
                 self._rollover_pending.pop(agent_id, None)
                 reciprocal = [item]
+            elif pending_old_id is not None and agent is None:
+                # The agent pane closed mid-restart. Nothing clears a pending
+                # rollover once its agent is gone, so protecting the companion
+                # here would exempt it from every later sweep and leave the
+                # pane on screen for good. Drop the pending entry and let the
+                # unpaired cleanup below close it.
+                self._rollover_pending.pop(agent_id, None)
             elif pending_old_id is not None:
                 # Never publish the pre-restart handle to the updater. A later
                 # refresh/reconcile will either observe the new marked GUID or
@@ -421,9 +474,8 @@ class CompanionController:
                                 f"could not remove orphan state for {companion.agent_session}"
                             )
 
-        table: ProcessTable | None = None
         for agent_id, agent in sorted(agents.items()):
-            if agent_id in pairs or agent.disabled:
+            if agent_id in pairs or agent.disabled or agent_id in torn_down:
                 continue
             if not create or (only_agent_id is not None and agent_id != only_agent_id):
                 continue
@@ -439,10 +491,7 @@ class CompanionController:
             if self._clock() < self._retry_after.get(agent_id, 0.0):
                 refused.append(agent_id)
                 continue
-            if table is None:
-                self._on_status("reading process table for companion reconciliation")
-                table = await asyncio.to_thread(self._read_process_table)
-            kwargs: dict[str, Any] = {"table": table}
+            kwargs: dict[str, Any] = {"table": await process_table()}
             if self._cwd_reader is not None:
                 kwargs["cwd_reader"] = self._cwd_reader
             self._on_status(f"probing supported process for pane {agent_id}")
@@ -714,6 +763,33 @@ class CompanionController:
         delay = min(INITIAL_RESTART_BACKOFF * (2 ** (attempts - 1)), MAX_RESTART_BACKOFF)
         self._retry_after[agent_id] = self._clock() + delay
 
+    def _forget_agent(self, agent_id: str) -> None:
+        """Drop every per-agent bookkeeping entry for a pair that is over."""
+        self._pairs.pop(agent_id, None)
+        self._rollover_pending.pop(agent_id, None)
+        self._restart_attempts.pop(agent_id, None)
+        self._retry_after.pop(agent_id, None)
+        self._agent_missing_since.pop(agent_id, None)
+
+    async def _agent_has_exited(self, agent: SessionMetadata, table: ProcessTable) -> bool:
+        """Whether a paired pane has had no supported agent for the grace period.
+
+        A single miss proves nothing: `read_process_table` returns an empty
+        table when `ps` fails, and an agent restarted straight after exiting
+        is one session ending, not the pair ending. Only a first miss that is
+        still a miss `AGENT_EXIT_GRACE` seconds later is treated as an exit.
+        """
+        kwargs: dict[str, Any] = {"table": table}
+        if self._cwd_reader is not None:
+            kwargs["cwd_reader"] = self._cwd_reader
+        detected = await asyncio.to_thread(self._detect, agent.pane, **kwargs)
+        if detected is not None:
+            self._agent_missing_since.pop(agent.session_id, None)
+            return False
+        now = self._clock()
+        first_miss = self._agent_missing_since.setdefault(agent.session_id, now)
+        return now - first_miss >= AGENT_EXIT_GRACE
+
     async def _close_owned(self, companion: SessionMetadata) -> bool:
         """Close only an exact-marker companion, never an observed pane."""
         if not companion.is_companion:
@@ -794,7 +870,10 @@ class CompanionController:
             if pair is None:
                 # A delayed notification for the pre-restart GUID is harmless.
                 return
-            self._pairs.pop(session_id, None)
+            # Every per-agent entry goes, not just the pair: a rollover left
+            # pending here is never cleared again, and it would protect this
+            # companion from the orphan sweep for the rest of the run.
+            self._forget_agent(session_id)
             agent = inventory.get(session_id)
             if agent is not None:
                 # A supported agent process can end while its iTerm pane stays
