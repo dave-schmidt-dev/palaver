@@ -77,3 +77,8 @@ markers = [
     "inv8: INV-8 — injected content never reaches a user-authored channel",
     "inv9: INV-9 — no outbound HTTP client in the Phase 1 import graph, and no inbound listener off loopback",
 ]
+
+[tool.vulture]
+paths = ["palaver", "vulture_whitelist.py"]
+min_confidence = 60
+sort_by_size = true

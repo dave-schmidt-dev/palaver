@@ -43,3 +43,14 @@ repos:
         always_run: true
         require_serial: true
         stages: [pre-push]
+
+  # Whole-project dead-code analysis. Ruff's F family only sees unused imports
+  # and locals; Vulture finds unused functions, classes, and attributes. Paths
+  # come from [tool.vulture] in pyproject.toml. Pinned to 3.14 because older
+  # interpreters cannot parse this codebase.
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.16
+    hooks:
+      - id: vulture
+        language_version: python3.14
+        stages: [pre-commit]
