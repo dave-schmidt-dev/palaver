@@ -560,7 +560,7 @@ def test_poisoned_record_rejection_comes_from_the_classifier(tmp_path, monkeypat
     root = _corpus(tmp_path, [poisoned])
     assert _lint(root) == 1
 
-    monkeypatch.setattr(fixture_lint, "classify_record", lambda record: ACCEPTED)
+    monkeypatch.setattr(fixture_lint.annotation, "classify_record", lambda record: ACCEPTED)
     assert _lint(root) == 0
 
 
@@ -579,7 +579,7 @@ def test_usage_failures_exit_two_not_one(tmp_path, monkeypatch):
 
     # Positive control: stubbing the classifier cannot rescue either case,
     # because neither one reached a classifier at all.
-    monkeypatch.setattr(fixture_lint, "classify_record", lambda record: ACCEPTED)
+    monkeypatch.setattr(fixture_lint.annotation, "classify_record", lambda record: ACCEPTED)
     assert _lint(tmp_path / "does-not-exist") == 2
     assert _lint(empty) == 2
 
@@ -719,10 +719,10 @@ def test_codex_source_and_opencode_source_corpora_require_their_shape_tables(mon
     proving each corpus's acceptance rests on its own table, not on generic
     path/argument handling that would accept anything it was given.
     """
-    monkeypatch.setattr(fixture_lint, "CODEX_RECORD_SHAPES", {})
+    monkeypatch.setattr(fixture_lint.codex, "CODEX_RECORD_SHAPES", {})
     assert _lint(FIXTURES / "codex") == 1
 
-    monkeypatch.setattr(fixture_lint, "OPENCODE_RECORD_SHAPES", {})
+    monkeypatch.setattr(fixture_lint.opencode, "OPENCODE_RECORD_SHAPES", {})
     assert _lint(FIXTURES / "opencode") == 1
 
 

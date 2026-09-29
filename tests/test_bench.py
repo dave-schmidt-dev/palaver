@@ -395,9 +395,9 @@ def test_peak_rss_is_normalized_to_bytes_not_the_platform_unit(monkeypatch):
     on. Comparing a live reading against a live reading would agree with
     whichever unit the module happened to pick, which is the whole bug.
     """
-    monkeypatch.setattr(palaver_bench, "_RSS_IN_BYTES", True)
+    monkeypatch.setattr(palaver_bench.resource_usage, "_RSS_IN_BYTES", True)
     assert palaver_bench.normalize_rss(4096) == 4096
-    monkeypatch.setattr(palaver_bench, "_RSS_IN_BYTES", False)
+    monkeypatch.setattr(palaver_bench.resource_usage, "_RSS_IN_BYTES", False)
     assert palaver_bench.normalize_rss(4096) == 4096 * 1024
 
     monkeypatch.undo()
@@ -867,7 +867,7 @@ def test_growth_reports_page_bytes_as_unavailable_when_dbstat_is_absent(monkeypa
             (session_id,),
         )
         conn.commit()
-        monkeypatch.setattr(palaver_bench, "_page_bytes_by_table", lambda _conn: {})
+        monkeypatch.setattr(palaver_bench.growth, "_page_bytes_by_table", lambda _conn: {})
         usage = measure_tables(conn)
     finally:
         conn.close()

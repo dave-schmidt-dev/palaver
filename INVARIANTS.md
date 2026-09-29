@@ -27,7 +27,7 @@ rationale: Palaver is a
   behind it are tagged.
 
 ### INV-2 — Palaver never writes to, controls, or interrupts an observed agent session
-area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/companion.py"]
+area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/companion/**/*.py"]
 gate_test: tests/test_adapters.py::test_adapters_never_open_source_writable
 gate_test: tests/test_ui_companion.py::test_operation_trace_never_closes_or_sends_text_to_agent
 gate_test: tests/test_ui_companion.py::test_created_companion_is_sized_without_changing_tab_geometry
@@ -115,7 +115,7 @@ rationale: **Amended 2026-08-14 (task 3.3), and the word "raw" was dropped from 
   quote from injected content passes a check it should fail.
 
 ### INV-7 — Status is computed from deterministic signals; the model never sets it
-area: ["palaver/observer/signals.py"]
+area: ["palaver/observer/signals/**/*.py"]
 gate_test: tests/test_signals.py::test_status_is_never_model_supplied
 threshold: 3
 rationale: Measured, not assumed. Spike run 1: E4B extracted 17/17 user decisions correctly but got

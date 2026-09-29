@@ -1458,8 +1458,8 @@ def test_deep_store_liveness_logs_the_actual_lock_error(short_tmp, monkeypatch, 
     def denied(*_args, **_kwargs):
         raise OSError(errno.EACCES, "permission denied")
 
-    monkeypatch.setattr(writer_socket, "socket_path_for", too_long)
-    monkeypatch.setattr(writer_socket.os, "open", denied)
+    monkeypatch.setattr(writer_socket.paths, "socket_path_for", too_long)
+    monkeypatch.setattr(writer_socket.writer.os, "open", denied)
 
     assert writer_socket.daemon_running(db_path) is None
     assert "permission denied" in caplog.text
@@ -1530,7 +1530,7 @@ def test_a_data_directory_on_an_unverified_filesystem_stops_startup(short_tmp, m
     to fail closed.
     """
     db_path = short_tmp / "palaver.db"
-    monkeypatch.setattr(writer_socket, "filesystem_type", lambda _path: "nfs")
+    monkeypatch.setattr(writer_socket.filesystem, "filesystem_type", lambda _path: "nfs")
 
     with pytest.raises(NonLocalFilesystemError, match="nfs"):
         with single_writer(db_path):
@@ -1548,7 +1548,7 @@ def test_the_filesystem_check_is_an_allowlist_not_a_denylist(short_tmp, monkeypa
     written, which is the population most likely to break `flock`.
     """
     db_path = short_tmp / "palaver.db"
-    monkeypatch.setattr(writer_socket, "filesystem_type", lambda _path: "somethingnew")
+    monkeypatch.setattr(writer_socket.filesystem, "filesystem_type", lambda _path: "somethingnew")
     with pytest.raises(NonLocalFilesystemError, match="somethingnew"):
         with single_writer(db_path):
             pass

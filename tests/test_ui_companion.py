@@ -219,7 +219,7 @@ def paired_app(*, height=30, focus_companion=True):
 
 def stub_iterm(monkeypatch):
     monkeypatch.setattr(
-        companion,
+        companion.creation,
         "import_iterm2",
         lambda: types.SimpleNamespace(Size=lambda width, height: (width, height)),
     )
@@ -241,7 +241,7 @@ def test_companion_profile_is_quiet_bounded_and_persistent(monkeypatch):
 
     profile = Profile()
     monkeypatch.setattr(
-        companion,
+        companion.creation,
         "import_iterm2",
         lambda: types.SimpleNamespace(LocalWriteOnlyProfile=lambda: profile),
     )
