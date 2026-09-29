@@ -2,6 +2,7 @@
 #
 # pre-commit is the fast one: ruff over the files this commit touches. It
 # receives filenames, so it says nothing about the rest of the tree.
+# The file-size check also runs on commit and reads the staged index.
 #
 # pre-push is the real gate: ruff over the whole tree, then the whole suite.
 # Both pass `pass_filenames: false` and `always_run: true` deliberately. Left
@@ -18,6 +19,16 @@ default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: local
     hooks:
+      - id: check-file-size
+        name: file size (500-line target, 800-line ceiling)
+        entry: uv run python scripts/check_file_size.py --staged
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        verbose: true
+        stages: [pre-commit]
+
       - id: ruff-check
         name: ruff check (lint + dead-code)
         entry: uv run ruff check

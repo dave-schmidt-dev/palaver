@@ -103,7 +103,10 @@ uv run pre-commit install   # installs both hooks (see below)
 ```
 
 `pre-commit install` wires two stages. On **commit**, ruff runs over the files
-that commit touches — fast, and silent about the rest of the tree. On **push**,
+that commit touches — fast, and silent about the rest of the tree. The commit
+also warns when a staged `.py` or `.sh` file exceeds 500 lines and fails when
+one exceeds 800 lines unless `.file-size-exceptions` lists it with a reason
+(`scripts/check_file_size.py`). On **push**,
 ruff runs over the whole tree and then the full suite runs, which takes about
 two minutes. The push hook is where the fixture-corpus gate lives:
 `palaver fixture-lint` is not a hook of its own, it is a test, so a fixture
