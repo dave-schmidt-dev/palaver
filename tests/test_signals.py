@@ -23,7 +23,6 @@ import pytest
 
 from palaver.extract.client import ModelClientError, ModelTimeoutError
 from palaver.extract.persist import Extraction
-from palaver.observer import signals as signals_module
 from palaver.observer.signals import (
     FORBIDDEN_PAYLOAD_KEYS,
     PHASE1_STATUS_RANGE,
@@ -38,6 +37,7 @@ from palaver.observer.signals import (
     extraction_from_model_payload,
 )
 from palaver.observer.turn_boundary import derive_signals
+from tests import python_source
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
@@ -535,8 +535,7 @@ def test_signals_module_imports_no_network_or_model_client():
     socket. Naming the exact module keeps the tripwire as tight as it was
     before the import existed.
     """
-    source = pathlib.Path(signals_module.__file__).read_text(encoding="utf-8")
-    modules = _imported_modules(source)
+    modules = python_source.imported_modules("palaver/observer/signals")
 
     assert modules == {
         "__future__",
@@ -546,7 +545,7 @@ def test_signals_module_imports_no_network_or_model_client():
         "palaver.extract.persist",
     }
     assert "palaver.extract.client" not in modules
-    assert not _imported_roots(source) & BANNED_IMPORT_ROOTS
+    assert not {module.split(".")[0] for module in modules} & BANNED_IMPORT_ROOTS
 
 
 def test_banned_import_detector_is_not_inert():

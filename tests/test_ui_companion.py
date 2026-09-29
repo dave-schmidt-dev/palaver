@@ -21,6 +21,7 @@ from palaver.ui.companion import (
 )
 from palaver.ui.companion_state import JoinState, read_state
 from palaver.ui.pane_join import PaneVariables, SupportedPaneProcess
+from tests import python_source
 
 
 class FakeSession:
@@ -1168,7 +1169,7 @@ def test_blocking_process_probe_runs_off_event_loop_with_visible_progress(tmp_pa
 
 
 def test_agent_mutations_are_bounded_to_split_link_and_conditional_focus():
-    source = Path(companion.__file__).read_text(encoding="utf-8")
+    source = python_source.module_text("palaver/ui/companion")
     assert "agent.session.async_send_text" not in source
     assert "agent.session.async_close" not in source
     assert "agent.session.async_set_profile_properties" not in source

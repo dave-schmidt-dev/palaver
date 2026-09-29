@@ -65,6 +65,7 @@ from palaver.cli import mcp as mcp_cli
 from palaver.ingest.adapters import opencode_guard
 from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN, CHANNEL_INJECTED, classify_channel
 from palaver.mcp import server as mcp_server
+from tests import python_source
 
 PALAVER_ROOT = Path(palaver.__file__).resolve().parent
 ADAPTERS_DIR = PALAVER_ROOT / "ingest" / "adapters"
@@ -333,8 +334,9 @@ def test_no_outbound_http_clients():
     paths = _phase1_source_paths()
     # Enumeration is part of the contract: an empty sweep would make the
     # all-zero assertion below pass vacuously regardless of what the source
-    # tree contains. `signals.py` is a real, already-landed Phase 1 module.
-    assert any(path.name == "signals.py" for path in paths)
+    # tree contains. `palaver/observer/signals` is a real, already-landed Phase 1
+    # module; every one of its files must be swept, whether it is one file or a package.
+    assert set(python_source.module_files("palaver/observer/signals")) <= set(paths)
 
     counts = count_http_client_references(paths)
     assert counts == {name: 0 for name in FORBIDDEN_HTTP_MODULES}
