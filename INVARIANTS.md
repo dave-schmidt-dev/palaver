@@ -9,7 +9,7 @@
 
 ### INV-1 — Every network call, subprocess, model inference, and stall-prone IO surfaces live progress
 area: ["palaver/**/*.py"]
-gate_test: tests/test_scheduler.py::test_observer_tick_emits_status
+gate_test: tests/test_scheduler_cli.py::test_observer_tick_emits_status
 threshold: 3
 rationale: Palaver is a
   watcher whose whole value is telling a human what is happening; a Palaver operation that itself
@@ -29,8 +29,8 @@ rationale: Palaver is a
 ### INV-2 — Palaver never writes to, controls, or interrupts an observed agent session
 area: ["palaver/ingest/**/*.py", "palaver/observer/**/*.py", "palaver/ui/companion/**/*.py"]
 gate_test: tests/test_adapters.py::test_adapters_never_open_source_writable
-gate_test: tests/test_ui_companion.py::test_operation_trace_never_closes_or_sends_text_to_agent
-gate_test: tests/test_ui_companion.py::test_created_companion_is_sized_without_changing_tab_geometry
+gate_test: tests/test_ui_companion_termination.py::test_operation_trace_never_closes_or_sends_text_to_agent
+gate_test: tests/test_ui_companion_sizing.py::test_created_companion_is_sized_without_changing_tab_geometry
 gate_test: tests/test_companion_live.py::test_three_test_owned_agents_have_isolated_resilient_companions
 threshold: 3
 rationale: The brief's first non-goal is autonomous control of coding agents, and the second is
@@ -58,7 +58,7 @@ rationale: The brief's first non-goal is autonomous control of coding agents, an
 
 ### INV-3 — Third-party session stores are opened read-only through an explicit allowlist
 area: ["palaver/ingest/adapters/**/*.py"]
-gate_test: tests/test_invariants.py::test_opencode_credential_tables_unreachable
+gate_test: tests/test_invariants_opencode.py::test_opencode_credential_tables_unreachable
 threshold: 3
 rationale: `~/.local/share/opencode/opencode.db` contains `account` and `credential` tables holding
   plaintext `access_token` and `refresh_token`. Palaver has no use for either. The OpenCode adapter
@@ -70,7 +70,7 @@ rationale: `~/.local/share/opencode/opencode.db` contains `account` and `credent
 
 ### INV-4 — Memory is append-only: supersession, never deletion or in-place mutation
 area: ["palaver/memory/**/*.py"]
-gate_test: tests/test_memory.py::test_supersede_preserves_original_row
+gate_test: tests/test_memory_supersede_core.py::test_supersede_preserves_original_row
 threshold: 3
 rationale: The brief is explicit — "Do not destroy old memories" — and the reason is recoverability:
   the observer is a 4B model that will be wrong, and an audit trail is the only way to recover from
@@ -81,7 +81,7 @@ rationale: The brief is explicit — "Do not destroy old memories" — and the r
 
 ### INV-5 — Provenance ordering is enforced in the database, not in prompt text
 area: ["palaver/store/schema.py", "palaver/memory/supersede.py"]
-gate_test: tests/test_memory.py::test_lower_tier_cannot_supersede_higher_tier
+gate_test: tests/test_memory_supersede_core.py::test_lower_tier_cannot_supersede_higher_tier
 threshold: 3
 rationale: Tiers, highest first: (1) explicit user instruction or correction, (2) explicit main-agent
   conclusion, (3) observed tool or command result, (4) observer inference, (5) observer speculation.
@@ -93,7 +93,7 @@ rationale: Tiers, highest first: (1) explicit user instruction or correction, (2
 
 ### INV-6 — Every durable memory carries at least one evidence link to stored transcript
 area: ["palaver/memory/**/*.py"]
-gate_test: tests/test_memory.py::test_memory_without_evidence_is_rejected
+gate_test: tests/test_memory_tiers_and_basics.py::test_memory_without_evidence_is_rejected
 threshold: 3
 rationale: **Amended 2026-08-14 (task 3.3), and the word "raw" was dropped from this entry's title
   deliberately.** Two artifacts are stored, and an anchor may name either: `events.payload` holds the
@@ -116,7 +116,7 @@ rationale: **Amended 2026-08-14 (task 3.3), and the word "raw" was dropped from 
 
 ### INV-7 — Status is computed from deterministic signals; the model never sets it
 area: ["palaver/observer/signals/**/*.py"]
-gate_test: tests/test_signals.py::test_status_is_never_model_supplied
+gate_test: tests/test_signals_phase1_range.py::test_status_is_never_model_supplied
 threshold: 3
 rationale: Measured, not assumed. Spike run 1: E4B extracted 17/17 user decisions correctly but got
   `status` wrong on the sessions that mattered, and an explicit ordered rule list in the prompt changed
@@ -129,7 +129,7 @@ rationale: Measured, not assumed. Spike run 1: E4B extracted 17/17 user decision
 
 ### INV-8 — Human-typed input and harness-injected content are distinguished at ingest
 area: ["palaver/extract/normalize.py", "palaver/extract/quote_gate.py", "palaver/ingest/adapters/**/*.py"]
-gate_test: tests/test_extraction.py::test_injected_content_is_not_tier_one
+gate_test: tests/test_extraction_channel_and_write_boundary.py::test_injected_content_is_not_tier_one
 threshold: 3
 rationale: Tier-1 provenance means "the user said this", and it is the tier every other tier defers
   to under INV-5, so a mis-tagged channel corrupts the memory store by construction. This is not
@@ -144,11 +144,11 @@ rationale: Tier-1 provenance means "the user said this", and it is the tier ever
 
 ### INV-9 — Observed-session content never leaves this machine
 area: ["palaver/**/*.py", "pyproject.toml", "tests/fixtures/**"]
-gate_test: tests/test_invariants.py::test_no_outbound_http_clients
-gate_test: tests/test_invariants.py::test_the_http_client_gate_does_not_see_dependencies
-gate_test: tests/test_invariants.py::test_the_runtime_dependency_set_is_an_allowlist
-gate_test: tests/test_fixture_lint.py::test_unclassified_record_fails
-gate_test: tests/test_fixture_lint.py::test_every_file_under_the_committed_corpus_is_read
+gate_test: tests/test_invariants_http_and_loopback.py::test_no_outbound_http_clients
+gate_test: tests/test_invariants_http_and_loopback.py::test_the_http_client_gate_does_not_see_dependencies
+gate_test: tests/test_invariants_http_and_loopback.py::test_the_runtime_dependency_set_is_an_allowlist
+gate_test: tests/test_fixture_lint_records.py::test_unclassified_record_fails
+gate_test: tests/test_fixture_lint_surfaces.py::test_every_file_under_the_committed_corpus_is_read
 threshold: 3
 rationale: The brief's first engineering preference and the reason the whole design tolerates a 4B
   model instead of a frontier one. Palaver's database aggregates the full unredacted content of every
