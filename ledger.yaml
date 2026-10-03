@@ -19,7 +19,7 @@
 # today. Recurrence counting starts fresh from 2026-08-16.
 
 invariants:
-  # `covered` here is asserted, not stamped: tests/test_invariants.py::
+  # `covered` here is asserted, not stamped: tests/test_invariants_charter.py::
   # test_every_gate_test_named_by_the_charter_exists resolves every charter
   # `gate_test:` to a real function definition by AST across all nine.
   INV-1: {gate_test_status: covered}    # covered | missing

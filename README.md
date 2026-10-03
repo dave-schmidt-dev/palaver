@@ -280,7 +280,7 @@ leave a `KeepAlive` job on disk retrying a forbidden bind every ten seconds.
 - Components that touch external surfaces (capture, inference runtime, UI) sit behind interfaces so they can be swapped without rewriting the memory layer.
 - Tests verify real behavior. A gate asserts what a measurement *says*, never merely that the measurement ran.
 - Every invariant in `INVARIANTS.md` gets a negative test that attacks its enforcement layer, not the Python API above it.
-- The charter is itself under test. `tests/test_invariants.py` parses `INVARIANTS.md` and asserts every `gate_test:` resolves to a real function and every `area:` glob matches at least one file on disk. Those fields are read by `harvest`, which maps bug entries to invariants through `area:` — a glob matching nothing produces an invariant that reads as clean because nothing can reach it.
+- The charter is itself under test. `tests/test_invariants_charter.py` parses `INVARIANTS.md` and asserts every `gate_test:` resolves to a real function and every `area:` glob matches at least one file on disk. Those fields are read by `harvest`, which maps bug entries to invariants through `area:` — a glob matching nothing produces an invariant that reads as clean because nothing can reach it.
 - `ledger.yaml` records per-invariant state beside the charter, and the same suite asserts the two name the same set of invariants. The project is `maturity: pre-mvp`, which means recurrence counts are tracked and reported but never gate work; recurrences accrued before 2026-08-15 are baselined out, because the repo is a day old and those entries are development findings against a contract that was never settled rather than regressions against one that was.
 
 ## License
