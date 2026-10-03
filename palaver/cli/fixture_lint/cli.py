@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Callable, TextIO
 
+from palaver.progress import stderr_status
+
 from .surfaces import LintReport
 from .tree import lint_provenance, lint_tree
 
@@ -61,11 +63,6 @@ def add_arguments(parser) -> None:
     )
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def run(
     args,
     *,
@@ -87,7 +84,7 @@ def run(
         when what actually happened was that the path was wrong.
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
 
     root = Path(args.path)
     if not root.exists():

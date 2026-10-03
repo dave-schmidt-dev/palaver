@@ -13,6 +13,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from typing import Any, TextIO
 
+from palaver.progress import stderr_status
 from palaver.ui.autolaunch import STATE_DIR
 from palaver.ui.companion import CompanionController, make_metadata_reader
 from palaver.ui.connection import UiConnectionError, import_iterm2, preflight
@@ -22,10 +23,6 @@ NAME = "ui"
 HELP = "manage an iTerm2 pane's session pin or companion"
 
 SetVariable = Callable[[str, str, Any], Awaitable[None]]
-
-
-def _stderr_status(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
 
 
 def make_variable_writer(connection: Any) -> SetVariable:
@@ -129,7 +126,7 @@ def run(args, *, out: TextIO | None = None) -> int:
             controller = CompanionController(
                 STATE_DIR,
                 read_metadata=make_metadata_reader(connection),
-                on_status=_stderr_status,
+                on_status=stderr_status,
             )
             await controller.reconcile(app, create=False)
             changed = await controller.set_enabled(app, args.session, enabled=enable)

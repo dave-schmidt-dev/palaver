@@ -54,6 +54,7 @@ from xml.sax.saxutils import escape
 
 from palaver.logging_setup import PROJECT_ROOT
 from palaver.mcp import server as mcp_server
+from palaver.progress import stderr_status
 
 NAME = "install-agent"
 HELP = "render and optionally load a launchd user agent for `palaver observe` or `palaver mcp`"
@@ -614,11 +615,6 @@ def add_arguments(parser) -> None:
     )
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def _default_executable() -> Path:
     """Locate the `palaver` console script next to the running interpreter.
 
@@ -665,7 +661,7 @@ def run(
         asked.
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
 
     # Plain attribute access, not `getattr(args, "service", DEFAULT_SERVICE)`.
     # A fallback here would make `run` keep working if `--service` were never

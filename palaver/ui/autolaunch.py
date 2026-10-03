@@ -38,6 +38,7 @@ import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from palaver.progress import stderr_status
 from palaver.ui.companion import CompanionController, make_metadata_reader
 from palaver.ui.companion_update import CompanionUpdater
 from palaver.ui.connection import (
@@ -556,11 +557,6 @@ def install_shim(
     return path
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Build the `python -m palaver.ui.autolaunch` parser."""
     parser = argparse.ArgumentParser(
@@ -627,7 +623,7 @@ def run(argv: list[str] | None = None) -> int:
     registry = SessionRegistry()
 
     async def _attached(connection):
-        await main(connection, registry=registry, on_status=_stderr_status)
+        await main(connection, registry=registry, on_status=stderr_status)
 
     # `retry` so a routine iTerm2 relaunch does not end the surface for good.
     iterm2.run_forever(_attached, retry=True)

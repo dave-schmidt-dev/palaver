@@ -49,6 +49,7 @@ from typing import TextIO
 
 from palaver.extract.client import ModelClientError
 from palaver.extract.slots import ServerProperties, SlotClient, SlotSaveSupport, SlotState
+from palaver.progress import stderr_status
 
 NAME = "doctor"
 HELP = "report the effective configuration of the running llama-server"
@@ -160,11 +161,6 @@ def add_arguments(parser) -> None:
     )
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def run(
     args,
     *,
@@ -186,7 +182,7 @@ def run(
         command.
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
 
     client = SlotClient(host=args.host, port=args.port, timeout=args.timeout)
 

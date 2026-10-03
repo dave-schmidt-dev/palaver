@@ -34,6 +34,7 @@ from palaver.eval.harness import (
     run_eval,
 )
 from palaver.extract.client import ModelClientError
+from palaver.progress import stderr_status
 from palaver.store.migrate import connect, migrate
 
 NAME = "eval"
@@ -160,11 +161,6 @@ def aggregate_reports(reports: list[EvalReport]) -> EvalReport:
     )
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def run(
     args,
     *,
@@ -185,7 +181,7 @@ def run(
         the E2B server never reporting healthy).
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
     runs = getattr(args, "runs", 3)
     if runs < 2:
         print("palaver eval: --runs must be at least 2 for reportable metrics", file=sys.stderr)

@@ -44,6 +44,7 @@ from palaver.ingest.adapters.codex import CodexAdapter
 from palaver.ingest.cursors import Cursor
 from palaver.observer.signals import Status, Tri, derive_status
 from palaver.observer.turn_boundary import derive_signals_from_events, observe_session
+from palaver.progress import stderr_status
 
 NAME = "status"
 HELP = "show current status for discovered sessions"
@@ -218,11 +219,6 @@ def add_arguments(parser) -> None:
     )
 
 
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
-
-
 def run(
     args,
     *,
@@ -247,7 +243,7 @@ def run(
         has no other mode to fall back to.
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
 
     if not args.once:
         print(

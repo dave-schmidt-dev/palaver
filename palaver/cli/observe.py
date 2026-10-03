@@ -36,6 +36,7 @@ from palaver.ingest.cursors import CursorStore
 from palaver.observer.daemon import DEFAULT_INTERVAL, ObserverDaemon, TickResult
 from palaver.observer.scheduler import TickPlan, plan_tick
 from palaver.observer.socket import SingleWriterError, serve_until, single_writer
+from palaver.progress import stderr_status
 
 NAME = "observe"
 
@@ -113,11 +114,6 @@ def add_arguments(parser) -> None:
         action="store_true",
         help="observe every discoverable session, skipping the recency window",
     )
-
-
-def _stderr_status(message: str) -> None:
-    """Write one progress line to stderr, keeping stdout the result channel."""
-    print(message, file=sys.stderr, flush=True)
 
 
 def render_tick(result: TickResult) -> str:
@@ -198,7 +194,7 @@ def run(
         even open its store raises rather than returning a status.
     """
     out = sys.stdout if out is None else out
-    on_status = _stderr_status if on_status is None else on_status
+    on_status = stderr_status if on_status is None else on_status
 
     adapters = _configured_adapters(args)
     cursor_root = DEFAULT_CURSOR_ROOT if args.cursors is None else args.cursors

@@ -49,7 +49,7 @@ request is still in flight. `on_status` defaults to doing nothing, matching
 `palaver/replay.py` and every `palaver/cli/*.py` entry point: the channel is
 a plain callback, never a stdout write, so a caller that wants console
 output wires its own stderr writer in exactly the way each CLI module's
-`_stderr_status` does. This module never imports `sys` or writes anything to
+`palaver.progress.stderr_status` does. This module never imports `sys` or writes anything to
 either stream itself.
 
 **`model_runs` (task 3.2's schema amendment).** Every call to `complete()`
