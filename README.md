@@ -185,10 +185,17 @@ write the registry behaves exactly as before. Project directories are looked
 up under both spellings Claude Code has used for `_`, since both are on disk.
 
 Automatic Codex joining finds recent root rollouts whose recorded cwd exactly
-matches the pane. When multiple recent rollouts match, the join narrows them to
-the one the live agent process still holds open. If several remain open, it
-waits for a second metadata-only observation and joins only when exactly one
-stable candidate advances; zero, multiple, or regressing candidates remain
+matches the pane. When no explicit session or store root is configured, Palaver
+discovers process-specific `CODEX_HOME` directories (such as alternate
+`~/.codex-secondary` instances) from live agent open file descriptor paths matching
+`tmp/arg0/codex-arg0*/.lock` or canonical `sessions/YYYY/MM/DD/rollout-*.jsonl` stores.
+Process identity is revalidated before using descriptor-derived roots: stale or
+reused PIDs and multiple conflicting homes refuse joining rather than misjoining to
+the wrong account, while the absence of descriptor evidence preserves the default
+fallback (`~/.codex/sessions`). When multiple recent rollouts match in the resolved root,
+the join narrows them to the one the live agent process still holds open. If several
+remain open, it waits for a second metadata-only observation and joins only when exactly
+one stable candidate advances; zero, multiple, or regressing candidates remain
 unjoined. For an intentional directory rename or move, pin the known rollout
 to the pane without focusing it, and clear the override later. Use the
 explicit `--session PANE_ID` forms:

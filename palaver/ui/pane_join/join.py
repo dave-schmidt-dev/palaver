@@ -23,6 +23,7 @@ from .records import PaneJoin, PaneVariables, ProcessTable, SupportedPaneProcess
 from .stores import (
     CodexCandidateProgress,
     _agent_open_store_paths,
+    _codex_homes_from_open_paths,
     _codex_store_candidates,
     _narrow_codex_candidates_by_progress,
     _pinned_store_path,
@@ -189,7 +190,43 @@ def join_pane(
     if agent_cwd is None or (agent_cwd != cwd and parsed_pin is None):
         return None
 
-    root = _root_for_source(source, sessions_root=sessions_root, store_roots=store_roots)
+    fresh_table: ProcessTable | None = None
+    same_process: bool | None = None
+    open_paths: frozenset[Path] | None = None
+
+    if source == CODEX_SOURCE and store_roots is None and sessions_root is None:
+        fresh_table = (
+            (process_table if table is not None else read_process_table())
+            if process_table_reader is None
+            else process_table_reader()
+        )
+        same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
+        if not same_process:
+            return None
+        try:
+            open_paths = open_files_reader(agent.pid)
+        except OSError:
+            return None
+        # File descriptors are evidence only for the process that was just
+        # checked. Re-read after lsof so a reused pid cannot select another
+        # Codex home between the first check and path discovery.
+        fresh_table = (
+            process_table_reader()
+            if process_table_reader is not None
+            else read_process_table() if table is None else table
+        )
+        same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
+        if not same_process:
+            return None
+        homes = _codex_homes_from_open_paths(open_paths)
+        if len(homes) > 1:
+            return None
+        if len(homes) == 1:
+            root = (next(iter(homes)) / "sessions").resolve(strict=False)
+        else:
+            root = _root_for_source(source, sessions_root=None, store_roots=None)
+    else:
+        root = _root_for_source(source, sessions_root=sessions_root, store_roots=store_roots)
     if root is None:
         return None
 
@@ -210,14 +247,19 @@ def join_pane(
             # sessions run here within the hour, not one -- most are from
             # processes that have since exited. Narrow to the one(s) the
             # live agent pid still holds open; a stale rollout cannot be.
-            fresh_table = (
-                (process_table if table is not None else read_process_table())
-                if process_table_reader is None
-                else process_table_reader()
-            )
-            same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
+            if fresh_table is None:
+                fresh_table = (
+                    (process_table if table is not None else read_process_table())
+                    if process_table_reader is None
+                    else process_table_reader()
+                )
+                same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
             if same_process:
-                open_paths = open_files_reader(agent.pid)
+                if open_paths is None:
+                    try:
+                        open_paths = open_files_reader(agent.pid)
+                    except OSError:
+                        open_paths = frozenset()
                 narrowed = tuple(path for path in codex_paths if path in open_paths)
                 if len(narrowed) == 1:
                     codex_paths = narrowed

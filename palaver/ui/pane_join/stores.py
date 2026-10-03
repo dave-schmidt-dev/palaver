@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,6 +92,106 @@ def _root_for_source(
         # Backward-compatible single-root injection used by existing callers.
         return Path(sessions_root)
     return default_store_roots().get(source)
+
+
+def _codex_home_from_lock_path(path: Path) -> Path | None:
+    """Extract a Codex home directory from an exact lockfile path.
+
+    Live Codex processes hold `<home>/tmp/arg0/codex-arg0XXXX/.lock`.
+    Validates the exact ancestor chain and refuses non-absolute paths,
+    malformed ancestors, or root/system directories.
+    """
+    if not isinstance(path, Path):
+        path = Path(path)
+    if not path.is_absolute() or path.name != ".lock":
+        return None
+    parents = path.parents
+    if len(parents) < 4:
+        return None
+    if not parents[0].name.startswith("codex-arg0"):
+        return None
+    if parents[1].name != "arg0":
+        return None
+    if parents[2].name != "tmp":
+        return None
+    home = parents[3].resolve(strict=False)
+    if (
+        home == home.parent
+        or not home.name
+        or str(home)
+        in (
+            "/",
+            "/private",
+            "/var",
+            "/tmp",
+            "/etc",
+            "/usr",
+            "/System",
+            "/Library",
+            "/bin",
+            "/sbin",
+            "/dev",
+        )
+    ):
+        return None
+    return home
+
+
+def _codex_home_from_rollout_path(path: Path) -> Path | None:
+    """Extract a Codex home directory from a canonical rollout file path.
+
+    Accepts `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+    """
+    if not isinstance(path, Path):
+        path = Path(path)
+    if not path.is_absolute():
+        return None
+    if not (path.name.startswith("rollout-") and path.name.endswith(".jsonl")):
+        return None
+    parents = path.parents
+    if len(parents) < 5:
+        return None
+    if len(parents[0].name) != 2 or not parents[0].name.isdigit():
+        return None
+    if len(parents[1].name) != 2 or not parents[1].name.isdigit():
+        return None
+    if len(parents[2].name) != 4 or not parents[2].name.isdigit():
+        return None
+    if parents[3].name != "sessions":
+        return None
+    home = parents[4].resolve(strict=False)
+    if (
+        home == home.parent
+        or not home.name
+        or str(home)
+        in (
+            "/",
+            "/private",
+            "/var",
+            "/tmp",
+            "/etc",
+            "/usr",
+            "/System",
+            "/Library",
+            "/bin",
+            "/sbin",
+            "/dev",
+        )
+    ):
+        return None
+    return home
+
+
+def _codex_homes_from_open_paths(paths: Iterable[Path]) -> set[Path]:
+    """Extract unique validated Codex home directories from open file paths."""
+    homes: set[Path] = set()
+    for path in paths:
+        home = _codex_home_from_lock_path(path)
+        if home is None:
+            home = _codex_home_from_rollout_path(path)
+        if home is not None:
+            homes.add(home)
+    return homes
 
 
 def _readable_file(path: Path) -> bool:
