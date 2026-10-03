@@ -242,3 +242,52 @@ def append_unknown_reason(current: tuple[str, ...], reason: str) -> tuple[str, .
     if reason in current:
         return current
     return (*current, reason)[-MAX_UNKNOWN_REASONS:]
+
+
+def task_collection(
+    items: object, *, label: str, text_key: str, unsupported: str
+) -> CollectionClaim[TaskItem]:
+    """Build a bounded task list from a source's structured plan, or an explicit unknown.
+
+    ``label`` names the source tool in the evidence and in the unknown reasons,
+    ``text_key`` is the per-item text field, and ``unsupported`` is the reason
+    used when ``items`` is not a list at all.
+    """
+    if not isinstance(items, list):
+        return CollectionClaim.unknown(unsupported)
+    if len(items) > MAX_COLLECTION_ITEMS:
+        return CollectionClaim.unknown(f"{label} exceeds bounded task limit")
+    tasks: list[TaskItem] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return CollectionClaim.unknown(f"{label} item is unsupported")
+        text = sanitize_text(item.get(text_key))
+        status = sanitize_text(item.get("status"))
+        if not text or not status:
+            return CollectionClaim.unknown(f"{label} item lacks {text_key} or status")
+        tasks.append(TaskItem(text, status))
+    return CollectionClaim(tuple(tasks), Provenance.EXACT, label)
+
+
+def question_claims(questions: object, label: str, evidence_id: str) -> tuple[Claim, ...] | None:
+    """Build exact question claims from a source's question list, or ``None`` if unusable."""
+    if not isinstance(questions, list) or len(questions) > MAX_COLLECTION_ITEMS:
+        return None
+    claims: list[Claim] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            return None
+        claim = Claim.exact(question.get("question"), label, evidence_id)
+        if claim.provenance is Provenance.UNKNOWN:
+            return None
+        claims.append(claim)
+    return tuple(claims)
+
+
+def pending_questions(snapshot: SummarySnapshot) -> dict[str, tuple[Claim, ...]]:
+    """Group a snapshot's open question claims by the tool call that asked them."""
+    pending: dict[str, tuple[Claim, ...]] = {}
+    for claim in snapshot.questions.items:
+        if claim.evidence_id is not None:
+            pending[claim.evidence_id] = (*pending.get(claim.evidence_id, ()), claim)
+    return pending

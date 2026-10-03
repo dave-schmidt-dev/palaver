@@ -22,7 +22,10 @@ from palaver.summary.model import (
     append_recent,
     append_unknown_reason,
     fold_recent_result,
+    pending_questions,
+    question_claims,
     sanitize_text,
+    task_collection,
 )
 
 SOURCE = "codex"
@@ -51,20 +54,13 @@ def _base_tool_name(name: str) -> str:
 
 
 def _task_snapshot(arguments: dict | None) -> CollectionClaim[TaskItem]:
-    if arguments is None or not isinstance(arguments.get("plan"), list):
-        return CollectionClaim.unknown("update_plan arguments are unsupported")
-    if len(arguments["plan"]) > MAX_COLLECTION_ITEMS:
-        return CollectionClaim.unknown("update_plan exceeds bounded task limit")
-    tasks: list[TaskItem] = []
-    for item in arguments["plan"]:
-        if not isinstance(item, dict):
-            return CollectionClaim.unknown("update_plan item is unsupported")
-        text = sanitize_text(item.get("step"))
-        status = sanitize_text(item.get("status"))
-        if not text or not status:
-            return CollectionClaim.unknown("update_plan item lacks step or status")
-        tasks.append(TaskItem(text, status))
-    return CollectionClaim(tuple(tasks), Provenance.EXACT, "update_plan")
+    plan = arguments.get("plan") if arguments is not None else None
+    return task_collection(
+        plan,
+        label="update_plan",
+        text_key="step",
+        unsupported="update_plan arguments are unsupported",
+    )
 
 
 def _question_claims(
@@ -72,20 +68,7 @@ def _question_claims(
 ) -> tuple[str | None, tuple[Claim, ...] | None]:
     if not isinstance(call_id, str) or not call_id or arguments is None:
         return None, None
-    questions = arguments.get("questions")
-    if not isinstance(questions, list):
-        return call_id, None
-    if len(questions) > MAX_COLLECTION_ITEMS:
-        return call_id, None
-    claims: list[Claim] = []
-    for question in questions:
-        if not isinstance(question, dict):
-            return call_id, None
-        claim = Claim.exact(question.get("question"), "request_user_input", call_id)
-        if claim.provenance is Provenance.UNKNOWN:
-            return call_id, None
-        claims.append(claim)
-    return call_id, tuple(claims)
+    return call_id, question_claims(arguments.get("questions"), "request_user_input", call_id)
 
 
 def _tool_activity(name: str, payload: dict) -> str:
@@ -118,11 +101,7 @@ def reduce_codex_events(
         session_key=session_key,
         command_result=Claim(None, Provenance.STRUCTURAL, "event_stream"),
     )
-    pending: dict[str, tuple[Claim, ...]] = {}
-    for claim in snapshot.questions.items:
-        if claim.evidence_id is not None:
-            pending.setdefault(claim.evidence_id, ())
-            pending[claim.evidence_id] = (*pending[claim.evidence_id], claim)
+    pending = pending_questions(snapshot)
     questions_unknown = snapshot.questions.provenance is Provenance.UNKNOWN
 
     for event in events:

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The Claude Code and Codex summary reducers now share one bounded task-list builder, question-claim builder, and pending-question bootstrap in `palaver/summary/model.py`; snapshots and unknown-reason text are unchanged, and the item cap and reasons are pinned for both sources by `tests/test_summary_collections.py`.
 - Moved the twelve identical per-module `_stderr_status` progress helpers into one `palaver.progress.stderr_status`; progress still goes to stderr and stdout stays the result channel.
 - `palaver ui --pin` now writes the pane pin through `encode_pin`, the encoder paired with the reader's `parse_pin`, instead of a second hand-built JSON string; output bytes and error text are unchanged.
 

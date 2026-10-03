@@ -23,7 +23,10 @@ from palaver.summary.model import (
     TaskItem,
     append_recent,
     fold_recent_result,
+    pending_questions,
+    question_claims,
     sanitize_text,
+    task_collection,
 )
 
 SOURCE = "claude-code"
@@ -100,20 +103,13 @@ def _apply_background_notification(snapshot: SummarySnapshot, record: dict) -> S
 
 
 def _task_snapshot(tool_input: object) -> CollectionClaim[TaskItem]:
-    if not isinstance(tool_input, dict) or not isinstance(tool_input.get("todos"), list):
-        return CollectionClaim.unknown("TodoWrite input is unsupported")
-    if len(tool_input["todos"]) > MAX_COLLECTION_ITEMS:
-        return CollectionClaim.unknown("TodoWrite exceeds bounded task limit")
-    tasks: list[TaskItem] = []
-    for item in tool_input["todos"]:
-        if not isinstance(item, dict):
-            return CollectionClaim.unknown("TodoWrite item is unsupported")
-        text = sanitize_text(item.get("content"))
-        status = sanitize_text(item.get("status"))
-        if not text or not status:
-            return CollectionClaim.unknown("TodoWrite item lacks content or status")
-        tasks.append(TaskItem(text, status))
-    return CollectionClaim(tuple(tasks), Provenance.EXACT, "TodoWrite")
+    todos = tool_input.get("todos") if isinstance(tool_input, dict) else None
+    return task_collection(
+        todos,
+        label="TodoWrite",
+        text_key="content",
+        unsupported="TodoWrite input is unsupported",
+    )
 
 
 def _question_claims(block: dict) -> tuple[str | None, tuple[Claim, ...] | None]:
@@ -121,20 +117,7 @@ def _question_claims(block: dict) -> tuple[str | None, tuple[Claim, ...] | None]
     tool_input = block.get("input")
     if not isinstance(tool_id, str) or not tool_id or not isinstance(tool_input, dict):
         return None, None
-    questions = tool_input.get("questions")
-    if not isinstance(questions, list):
-        return tool_id, None
-    if len(questions) > MAX_COLLECTION_ITEMS:
-        return tool_id, None
-    claims: list[Claim] = []
-    for question in questions:
-        if not isinstance(question, dict):
-            return tool_id, None
-        claim = Claim.exact(question.get("question"), "AskUserQuestion", tool_id)
-        if claim.provenance is Provenance.UNKNOWN:
-            return tool_id, None
-        claims.append(claim)
-    return tool_id, tuple(claims)
+    return tool_id, question_claims(tool_input.get("questions"), "AskUserQuestion", tool_id)
 
 
 def _tool_activity(name: str, tool_input: object) -> str:
@@ -163,11 +146,7 @@ def reduce_claude_events(
         session_key=session_key,
         command_result=Claim(None, Provenance.STRUCTURAL, "event_stream"),
     )
-    pending: dict[str, tuple[Claim, ...]] = {}
-    for claim in snapshot.questions.items:
-        if claim.evidence_id is not None:
-            pending.setdefault(claim.evidence_id, ())
-            pending[claim.evidence_id] = (*pending[claim.evidence_id], claim)
+    pending = pending_questions(snapshot)
     questions_unknown = snapshot.questions.provenance is Provenance.UNKNOWN
 
     for event in events:
