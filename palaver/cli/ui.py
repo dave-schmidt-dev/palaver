@@ -16,7 +16,7 @@ from typing import Any, TextIO
 from palaver.ui.autolaunch import STATE_DIR
 from palaver.ui.companion import CompanionController, make_metadata_reader
 from palaver.ui.connection import UiConnectionError, import_iterm2, preflight
-from palaver.ui.pane_join import CLAUDE_SOURCE, CODEX_SOURCE, PIN_VARIABLE
+from palaver.ui.pane_join import CLAUDE_SOURCE, CODEX_SOURCE, PIN_VARIABLE, encode_pin
 
 NAME = "ui"
 HELP = "manage an iTerm2 pane's session pin or companion"
@@ -56,10 +56,11 @@ async def set_session_pin(
     """Write or clear one pane's pin without selecting or focusing it."""
     if source is None and session_key is None:
         value = ""
-    elif source in {CLAUDE_SOURCE, CODEX_SOURCE} and isinstance(session_key, str) and session_key:
-        value = json.dumps({"source": source, "session_key": session_key}, separators=(",", ":"))
     else:
-        raise ValueError("pin requires a supported source and non-empty session key")
+        try:
+            value = encode_pin(source, session_key)
+        except ValueError:
+            raise ValueError("pin requires a supported source and non-empty session key") from None
     await writer(pane_id, PIN_VARIABLE, value)
     return value
 

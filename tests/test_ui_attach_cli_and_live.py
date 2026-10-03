@@ -29,7 +29,8 @@ from palaver.ui.connection import (
     KEY_ENV,
     resolve_target,
 )
-from palaver.ui.pane_join import PIN_VARIABLE
+from palaver.ui.pane_join import PIN_VARIABLE, PanePin
+from palaver.ui.pane_join.pin import parse_pin
 
 LIVE_ENV = "PALAVER_RUN_LIVE_ITERM_TESTS"
 LIVE_ENABLED = (
@@ -86,6 +87,31 @@ def test_pin_cli_writes_named_pane_without_focus_or_selection_calls():
     assert all(call[1] == PIN_VARIABLE for call in writes.calls)
     source = inspect.getsource(cli_ui.set_session_pin)
     assert all(token not in source for token in (".focus(", ".select(", ".activate("))
+
+
+@pytest.mark.parametrize(
+    ("source", "session_key"),
+    [("codex", "rollout-1"), ("claude-code", "-Users-dave-proj/session-1")],
+)
+def test_pin_cli_output_round_trips_through_the_pane_reader(source, session_key):
+    """The pin the CLI writes is exactly what the pane's strict parser accepts."""
+    writes = _Writes()
+    encoded = asyncio.run(
+        cli_ui.set_session_pin(writes, "named-pane", source=source, session_key=session_key)
+    )
+    assert parse_pin(encoded) == PanePin(source=source, session_key=session_key)
+    assert writes.calls == [("named-pane", PIN_VARIABLE, encoded)]
+
+
+@pytest.mark.parametrize(
+    ("source", "session_key"),
+    [("bogus", "k"), ("codex", ""), ("codex", None), (None, "k"), ("codex", 5)],
+)
+def test_pin_cli_rejects_unsupported_pins_with_its_own_message(source, session_key):
+    with pytest.raises(ValueError, match="pin requires a supported source and non-empty"):
+        asyncio.run(
+            cli_ui.set_session_pin(_Writes(), "named-pane", source=source, session_key=session_key)
+        )
 
 
 @pytest.mark.parametrize(

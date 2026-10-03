@@ -7,5 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `palaver ui --pin` now writes the pane pin through `encode_pin`, the encoder paired with the reader's `parse_pin`, instead of a second hand-built JSON string; output bytes and error text are unchanged.
+
 ### Fixed
 - Fixed companion session joining for alternate `CODEX_HOME` directories by discovering roots from live agent open file descriptor paths (`tmp/arg0/codex-arg0*/.lock` and canonical rollout stores) with process identity revalidation and refusal on conflicting homes or stale PIDs.

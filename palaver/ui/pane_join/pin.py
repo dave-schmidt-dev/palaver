@@ -49,6 +49,10 @@ def parse_pin(raw: object) -> PanePin | None:
 
 def encode_pin(source: str, session_key: str) -> str:
     """Encode a pane pin in the same JSON shape the reader accepts."""
-    if source not in {CLAUDE_SOURCE, CODEX_SOURCE} or not session_key:
+    if (
+        source not in {CLAUDE_SOURCE, CODEX_SOURCE}
+        or not isinstance(session_key, str)
+        or not session_key
+    ):
         raise ValueError("pin source and session_key must identify a supported source")
     return json.dumps({"source": source, "session_key": session_key}, separators=(",", ":"))
