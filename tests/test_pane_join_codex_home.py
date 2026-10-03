@@ -178,9 +178,7 @@ def test_codex_stale_or_reused_pid_refuses_joining(tmp_path):
     assert joined is None
 
 
-def test_codex_default_home_refuses_fallback_when_open_files_lookup_fails(
-    tmp_path, monkeypatch
-):
+def test_codex_default_home_refuses_fallback_when_open_files_lookup_fails(tmp_path, monkeypatch):
     """An unreadable process descriptor scan must not fall back across Codex homes."""
     cwd = tmp_path / "project"
     cwd.mkdir()
@@ -208,9 +206,7 @@ def test_codex_default_home_refuses_fallback_when_open_files_lookup_fails(
 
 
 @pytest.mark.parametrize("post_read_state", ["reused", "absent"])
-def test_codex_home_discovery_revalidates_pid_after_open_files_read(
-    tmp_path, post_read_state
-):
+def test_codex_home_discovery_revalidates_pid_after_open_files_read(tmp_path, post_read_state):
     """A pid that changes or exits during lsof cannot supply a Codex home."""
     cwd = tmp_path / "project"
     cwd.mkdir()

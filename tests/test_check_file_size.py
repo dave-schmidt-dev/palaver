@@ -17,9 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def git(repo: Path, *arguments: str, env: dict[str, str] | None = None) -> None:
     """Run a Git command in an isolated temporary repository."""
-    subprocess.run(
-        ["git", *arguments], cwd=repo, env=env, check=True, capture_output=True
-    )
+    subprocess.run(["git", *arguments], cwd=repo, env=env, check=True, capture_output=True)
 
 
 def repo_at(path: Path) -> Path:
@@ -29,9 +27,7 @@ def repo_at(path: Path) -> Path:
     git(path, "config", "user.email", "test@example.invalid")
     git(path, "config", "user.name", "Palaver Test")
     (path / "scripts").mkdir()
-    shutil.copyfile(
-        ROOT / "scripts/check_file_size.py", path / "scripts/check_file_size.py"
-    )
+    shutil.copyfile(ROOT / "scripts/check_file_size.py", path / "scripts/check_file_size.py")
     return path
 
 
@@ -63,9 +59,7 @@ def check(
     ("lines", "expected_code", "warning"),
     [(500, 0, False), (501, 0, True), (800, 0, True), (801, 1, False)],
 )
-def test_file_thresholds(
-    tmp_path: Path, lines: int, expected_code: int, warning: bool
-) -> None:
+def test_file_thresholds(tmp_path: Path, lines: int, expected_code: int, warning: bool) -> None:
     repo = repo_at(tmp_path / "repo")
     source(repo, "app.py", lines)
     result = check(repo, "app.py")
@@ -137,9 +131,7 @@ def test_exceptions_only_staged_does_not_notice_unchanged_legacy_file(
     tmp_path: Path,
 ) -> None:
     repo = committed_exception_repo(tmp_path / "repo")
-    (repo / ".file-size-exceptions").write_text(
-        "# refreshed policy\nold.py legacy source\n"
-    )
+    (repo / ".file-size-exceptions").write_text("# refreshed policy\nold.py legacy source\n")
     git(repo, "add", ".file-size-exceptions")
 
     result = check(repo, "--staged")
@@ -158,9 +150,7 @@ def test_all_and_nonlegacy_exception_never_print_legacy_notice(
     assert all_result.returncode == 0
     assert all_result.stdout == ""
 
-    (repo / ".file-size-exceptions").write_text(
-        "old.py retained generated interface\n"
-    )
+    (repo / ".file-size-exceptions").write_text("old.py retained generated interface\n")
     file_result = check(repo, "old.py")
     assert file_result.returncode == 0
     assert file_result.stdout == ""
@@ -253,9 +243,7 @@ def test_staged_exception_deletion_rechecks_unchanged_file(tmp_path: Path) -> No
 def test_staged_added_exception_passes(tmp_path: Path) -> None:
     repo = committed_exception_repo(tmp_path / "repo")
     source(repo, "new.py", 801)
-    (repo / ".file-size-exceptions").write_text(
-        "old.py legacy source\nnew.py legacy source\n"
-    )
+    (repo / ".file-size-exceptions").write_text("old.py legacy source\nnew.py legacy source\n")
     git(repo, "add", "new.py", ".file-size-exceptions")
     assert check(repo, "--staged").returncode == 0
 

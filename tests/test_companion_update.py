@@ -219,9 +219,7 @@ def test_unjoined_codex_retries_reuse_one_metadata_observation(tmp_path):
         terminal_windows=[types.SimpleNamespace(tabs=[tab])],
         get_session_by_id=lambda _session_id: agent,
     )
-    ambiguous = PaneJoin(
-        "agent", 10, "codex", tmp_path, "project", ("a", "b"), None, None
-    )
+    ambiguous = PaneJoin("agent", 10, "codex", tmp_path, "project", ("a", "b"), None, None)
 
     async def metadata(_session, _tab):
         return SessionMetadata(

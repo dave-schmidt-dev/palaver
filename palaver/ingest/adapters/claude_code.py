@@ -155,6 +155,7 @@ def active_background_task_ids(records: Iterable[dict | None]) -> frozenset[str]
             active.discard(notification[0])
     return frozenset(active)
 
+
 # `type: "system"` records carry a `subtype` that this adapter maps to an
 # event kind. `compact_boundary` is the one downstream Phase 1 tasks depend
 # on; the rest are corroborating signals or informational passthrough.

@@ -224,8 +224,7 @@ def test_codex_image_attachment_only_preserves_request_and_clears_stale_failure(
         "Command exited 7 this turn",
     ]
     assert all(
-        "<image" not in item.text and "/var/folders" not in item.text
-        for item in snapshot.recent
+        "<image" not in item.text and "/var/folders" not in item.text for item in snapshot.recent
     )
 
 

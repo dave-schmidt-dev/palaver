@@ -62,9 +62,7 @@ def parse_exceptions(contents: bytes, source: str) -> tuple[dict[str, str], list
         if len(fields) == 1 or not fields[1].strip():
             errors.append(f"{source}:{number}: exception entry needs a reason")
         elif fields[1].split(maxsplit=1)[0].isdigit():
-            errors.append(
-                f"{source}:{number}: line caps are no longer supported; remove the cap"
-            )
+            errors.append(f"{source}:{number}: line caps are no longer supported; remove the cap")
         else:
             entries[path] = fields[1].strip()
     return entries, errors
@@ -121,9 +119,7 @@ def inspect_files(
                 else regular_file_contents(path)
             )
         except (RuntimeError, OSError) as error:
-            errors.append(
-                f"{path}: unable to read {'staged blob' if staged else 'file'}: {error}"
-            )
+            errors.append(f"{path}: unable to read {'staged blob' if staged else 'file'}: {error}")
             continue
         if contents is None:
             continue

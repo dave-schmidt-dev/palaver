@@ -142,7 +142,7 @@ class FailureBackoffStore:
             return {}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return {}
         return data if isinstance(data, dict) else {}
 

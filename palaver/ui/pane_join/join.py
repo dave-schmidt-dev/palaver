@@ -213,7 +213,9 @@ def join_pane(
         fresh_table = (
             process_table_reader()
             if process_table_reader is not None
-            else read_process_table() if table is None else table
+            else read_process_table()
+            if table is None
+            else table
         )
         same_process = _same_process_identity(agent, fresh_table.get(agent.pid))
         if not same_process:

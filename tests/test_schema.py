@@ -528,8 +528,11 @@ def test_memory_evidence_child_foreign_key_is_deferred_not_dropped(tmp_path):
         # Positive control: the same insert commits once its parent exists.
         memory_id = _insert_memory(conn, project_id, "a memory whose evidence is written first")
         conn.commit()
-        assert conn.execute(
-            "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?", (memory_id,)
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?", (memory_id,)
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         conn.close()

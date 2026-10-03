@@ -322,9 +322,12 @@ def test_background_task_markers_are_bounded_and_terminal_only():
     assert background_task_notification(completed) == ("bg-1", "timed_out")
     assert "timed_out" in BACKGROUND_TASK_TERMINAL_STATUSES
     assert active_background_task_ids((launch, completed)) == frozenset()
-    assert background_task_notification(
-        {"type": "queue-operation", "content": "<status>queued</status>"}
-    ) is None
+    assert (
+        background_task_notification(
+            {"type": "queue-operation", "content": "<status>queued</status>"}
+        )
+        is None
+    )
     assert background_task_id({"toolUseResult": {"backgroundTaskId": "x" * 200}}) == "x" * 128
 
 

@@ -470,7 +470,7 @@ class ObserverDaemon:
         extracted: list[str] = []
         failed: list[tuple[str, str]] = []
         deferred: list[str] = []
-        now_epoch = (datetime.now().timestamp() if now is None else now.timestamp())
+        now_epoch = datetime.now().timestamp() if now is None else now.timestamp()
         for work in plan.scheduled:
             key = work.ref.session_key
             retry_at = self.backoff.retry_at(key, source=work.ref.source)
