@@ -121,12 +121,6 @@ signal values themselves stay distinct so a caller (and
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence  # noqa: F401
-from dataclasses import dataclass, fields  # noqa: F401
-from enum import Enum  # noqa: F401
-
-from palaver.extract.persist import Extraction  # noqa: F401
-
 from .liveness import Liveness as Liveness
 from .liveness import apply_liveness as apply_liveness
 from .liveness import derive_status_with_liveness as derive_status_with_liveness
@@ -134,8 +128,6 @@ from .payload import FORBIDDEN_PAYLOAD_KEYS as FORBIDDEN_PAYLOAD_KEYS
 from .payload import REFINEMENT_PAYLOAD_KEYS as REFINEMENT_PAYLOAD_KEYS
 from .payload import ExtractionPayloadError as ExtractionPayloadError
 from .payload import ModelSuppliedStatusError as ModelSuppliedStatusError
-from .payload import _normalized_key as _normalized_key
-from .payload import _payload_text as _payload_text
 from .payload import extraction_from_model_payload as extraction_from_model_payload
 from .ranges import LIVE_STATUS_RANGE as LIVE_STATUS_RANGE
 from .ranges import PHASE1_STATUS_RANGE as PHASE1_STATUS_RANGE
@@ -143,9 +135,6 @@ from .ranges import REFINED_STATUS_RANGE as REFINED_STATUS_RANGE
 from .ranges import Status as Status
 from .ranges import Tri as Tri
 from .rules import StatusDerivation as StatusDerivation
-from .rules import _has_content as _has_content
-from .rules import _is_affirmatively_empty as _is_affirmatively_empty
-from .rules import _refine_ended_turn as _refine_ended_turn
 from .rules import derive_status as derive_status
 from .rules import derive_status_for_source as derive_status_for_source
 from .rules import derive_status_with_provenance as derive_status_with_provenance
@@ -153,7 +142,6 @@ from .rules import under_covered as under_covered
 from .signal_set import DEFAULT_COVERAGE_THRESHOLD as DEFAULT_COVERAGE_THRESHOLD
 from .signal_set import SIGNAL_NAMES as SIGNAL_NAMES
 from .signal_set import Signals as Signals
-from .signal_set import SourceCoverage as SourceCoverage
 
 __all__ = [
     "DEFAULT_COVERAGE_THRESHOLD",
@@ -167,15 +155,9 @@ __all__ = [
     "Liveness",
     "ModelSuppliedStatusError",
     "Signals",
-    "SourceCoverage",
     "Status",
     "StatusDerivation",
     "Tri",
-    "_has_content",
-    "_is_affirmatively_empty",
-    "_normalized_key",
-    "_payload_text",
-    "_refine_ended_turn",
     "apply_liveness",
     "derive_status",
     "derive_status_for_source",

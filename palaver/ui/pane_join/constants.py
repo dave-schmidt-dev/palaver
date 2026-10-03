@@ -52,7 +52,6 @@ DEFAULT_ACTIVITY_WINDOW = timedelta(hours=1)
 CLAUDE_SOURCE = "claude-code"
 CODEX_SOURCE = "codex"
 PIN_VARIABLE = "user.palaver_session_pin"
-PANE_PIN_VARIABLE = PIN_VARIABLE
 
 
 def default_registry_root() -> Path:

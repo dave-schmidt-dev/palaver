@@ -70,63 +70,27 @@ This repository is public. Nothing here is derived from a real observed session.
 
 from __future__ import annotations
 
-import resource  # noqa: F401
-import sqlite3  # noqa: F401
-import sys  # noqa: F401
-import threading  # noqa: F401
-import time  # noqa: F401
-from collections.abc import Callable, Iterator, Sequence  # noqa: F401
-from concurrent.futures import ThreadPoolExecutor  # noqa: F401
-from contextlib import contextmanager  # noqa: F401
-from dataclasses import dataclass  # noqa: F401
-from datetime import date  # noqa: F401
-from pathlib import Path  # noqa: F401
-
-from palaver.extract.client import (
-    ModelClient,  # noqa: F401
-    ModelClientError,  # noqa: F401
-    ModelConnectionError,  # noqa: F401
-    ModelResponseError,  # noqa: F401
-    ModelTimeoutError,  # noqa: F401
-)
-from palaver.extract.slots import SlotClient  # noqa: F401
-from palaver.observer.daemon import DEFAULT_INTERVAL, DEFAULT_MODEL, extraction_schema  # noqa: F401
-from palaver.store.migrate import connect, migrate  # noqa: F401
-
-from .driver import _WRITE_LOCK_TIMEOUT as _WRITE_LOCK_TIMEOUT
-from .driver import BENCH_PURPOSE as BENCH_PURPOSE
 from .driver import DEFAULT_SESSIONS as DEFAULT_SESSIONS
 from .driver import DEFAULT_TICK_INTERVAL as DEFAULT_TICK_INTERVAL
-from .driver import _drive_one as _drive_one
-from .driver import _error_kind as _error_kind
-from .driver import _InFlightGauge as _InFlightGauge
-from .driver import _worker_connection as _worker_connection
 from .driver import run_bench as run_bench
 from .driver import synthesize_sessions as synthesize_sessions
-from .growth import _PAGE_BYTES_UNAVAILABLE as _PAGE_BYTES_UNAVAILABLE
 from .growth import GROWTH_TABLES as GROWTH_TABLES
 from .growth import PROJECTION_HORIZONS_DAYS as PROJECTION_HORIZONS_DAYS
-from .growth import _measure_growth as _measure_growth
 from .growth import _page_bytes_by_table as _page_bytes_by_table
-from .growth import _parse_day as _parse_day
 from .growth import growth_samples as growth_samples
 from .growth import measure_tables as measure_tables
 from .growth import project_growth as project_growth
 from .growth import store_bytes as store_bytes
-from .prompt_sizing import _PROMPT_LINE as _PROMPT_LINE
 from .prompt_sizing import DEFAULT_PROMPT_FRACTION as DEFAULT_PROMPT_FRACTION
 from .prompt_sizing import FALLBACK_PROMPT_WORDS as FALLBACK_PROMPT_WORDS
 from .prompt_sizing import TOKENS_PER_WORD as TOKENS_PER_WORD
-from .prompt_sizing import _derive_prompt_words as _derive_prompt_words
 from .prompt_sizing import resolve_prompt_words as resolve_prompt_words
 from .prompt_sizing import synthetic_prompt as synthetic_prompt
 from .records import BenchError as BenchError
 from .records import BenchReport as BenchReport
-from .records import GrowthProjection as GrowthProjection
 from .records import GrowthSample as GrowthSample
 from .records import SessionTiming as SessionTiming
 from .records import SlotFileUsage as SlotFileUsage
-from .records import TableUsage as TableUsage
 from .resource_usage import _RSS_IN_BYTES as _RSS_IN_BYTES
 from .resource_usage import SLOT_PATH_UNKNOWN_NOTE as SLOT_PATH_UNKNOWN_NOTE
 from .resource_usage import measure_slot_files as measure_slot_files
@@ -134,7 +98,6 @@ from .resource_usage import normalize_rss as normalize_rss
 from .resource_usage import peak_rss_bytes as peak_rss_bytes
 
 __all__ = [
-    "BENCH_PURPOSE",
     "DEFAULT_PROMPT_FRACTION",
     "DEFAULT_SESSIONS",
     "DEFAULT_TICK_INTERVAL",
@@ -143,25 +106,13 @@ __all__ = [
     "PROJECTION_HORIZONS_DAYS",
     "SLOT_PATH_UNKNOWN_NOTE",
     "TOKENS_PER_WORD",
-    "_PAGE_BYTES_UNAVAILABLE",
-    "_PROMPT_LINE",
     "_RSS_IN_BYTES",
-    "_WRITE_LOCK_TIMEOUT",
     "BenchError",
     "BenchReport",
-    "GrowthProjection",
     "GrowthSample",
     "SessionTiming",
     "SlotFileUsage",
-    "TableUsage",
-    "_InFlightGauge",
-    "_derive_prompt_words",
-    "_drive_one",
-    "_error_kind",
-    "_measure_growth",
     "_page_bytes_by_table",
-    "_parse_day",
-    "_worker_connection",
     "growth_samples",
     "measure_slot_files",
     "measure_tables",

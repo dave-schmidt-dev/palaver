@@ -81,45 +81,15 @@ the sibling adapter, rather than diverging from it.
 
 from __future__ import annotations
 
-import json  # noqa: F401
-import logging  # noqa: F401
-import re  # noqa: F401
-from collections.abc import Iterable, Sequence  # noqa: F401
-from dataclasses import dataclass  # noqa: F401
-from pathlib import Path  # noqa: F401
-
-from palaver.ingest.adapters.base import (  # noqa: F401
-    Adapter,
-    Event,
-    TailResult,
-    read_complete_records,
-)
-
 # Imported rather than redefined: `CHANNEL_HUMAN`/`CHANNEL_INJECTED` are
 # INV-8's vocabulary, not Claude Code's private spelling, and
 # `palaver.extract.normalize` and `palaver.extract.quote_gate` already read
 # them from there. A second definition here would let the two sources drift
 # into disagreeing about what "human" means.
 from palaver.ingest.adapters.claude_code import CHANNEL_HUMAN, CHANNEL_INJECTED  # noqa: F401
-from palaver.ingest.cursors import Cursor  # noqa: F401
-from palaver.memory.tiers import TIER_OBSERVER_INFERENCE, tier_name  # noqa: F401
 
 from .adapter import CodexAdapter as CodexAdapter
-from .adapter import _event_kind as _event_kind
-from .adapter import _event_msg_kind as _event_msg_kind
-from .adapter import _exec_failed as _exec_failed
-from .adapter import _optional_str as _optional_str
-from .adapter import _tool_call_id as _tool_call_id
 from .classify import codex_role_class as codex_role_class
-from .constants import _REPO_ROOT as _REPO_ROOT
-from .constants import CODEX_IMAGE_ATTACHMENT_MARKER as CODEX_IMAGE_ATTACHMENT_MARKER
-from .constants import COMPACTED_RECORD_TYPE as COMPACTED_RECORD_TYPE
-from .constants import COMPACTION_EVENT_TYPE as COMPACTION_EVENT_TYPE
-from .constants import CORPUS_ROOT as CORPUS_ROOT
-from .constants import ERROR_EVENT_TYPE as ERROR_EVENT_TYPE
-from .constants import EXEC_END_EVENT_TYPE as EXEC_END_EVENT_TYPE
-from .constants import HARNESS_ROLES as HARNESS_ROLES
-from .constants import HUMAN_CANDIDATE_ROLE as HUMAN_CANDIDATE_ROLE
 from .constants import INJECTED_TEXT_PREFIXES as INJECTED_TEXT_PREFIXES
 from .constants import KIND_COMPACTION as KIND_COMPACTION
 from .constants import KIND_ERROR as KIND_ERROR
@@ -128,23 +98,12 @@ from .constants import KIND_SESSION_META as KIND_SESSION_META
 from .constants import KIND_TURN_BOUNDARY as KIND_TURN_BOUNDARY
 from .constants import LABELS_PATH as LABELS_PATH
 from .constants import MEASUREMENT_PATH as MEASUREMENT_PATH
-from .constants import PATCH_END_EVENT_TYPE as PATCH_END_EVENT_TYPE
 from .constants import REQUIRED_LABELLED_RECORDS as REQUIRED_LABELLED_RECORDS
-from .constants import STORE_GLOB as STORE_GLOB
-from .constants import TEXT_BLOCK_TYPES as TEXT_BLOCK_TYPES
-from .constants import TURN_BOUNDARY_EVENT_TYPES as TURN_BOUNDARY_EVENT_TYPES
-from .constants import logger as logger
-from .measurement import _labelled_record as _labelled_record
-from .measurement import load_labels as load_labels
 from .measurement import measure_role_class as measure_role_class
 from .ordering import order_records as order_records
 from .ordering import record_ordinal as record_ordinal
-from .records import CodexIdentity as CodexIdentity
 from .records import CodexTierCapError as CodexTierCapError
 from .records import RoleClassMeasurement as RoleClassMeasurement
-from .records import _message_payload as _message_payload
-from .records import _parse_record as _parse_record
-from .records import _payload as _payload
 from .records import message_role as message_role
 from .records import message_text as message_text
 from .records import strip_codex_image_attachment_markers as strip_codex_image_attachment_markers
@@ -154,14 +113,6 @@ from .tier_cap import load_measurement as load_measurement
 from .tier_cap import require_codex_tier as require_codex_tier
 
 __all__ = [
-    "CODEX_IMAGE_ATTACHMENT_MARKER",
-    "COMPACTED_RECORD_TYPE",
-    "COMPACTION_EVENT_TYPE",
-    "CORPUS_ROOT",
-    "ERROR_EVENT_TYPE",
-    "EXEC_END_EVENT_TYPE",
-    "HARNESS_ROLES",
-    "HUMAN_CANDIDATE_ROLE",
     "INJECTED_TEXT_PREFIXES",
     "KIND_COMPACTION",
     "KIND_ERROR",
@@ -170,31 +121,14 @@ __all__ = [
     "KIND_TURN_BOUNDARY",
     "LABELS_PATH",
     "MEASUREMENT_PATH",
-    "PATCH_END_EVENT_TYPE",
     "REQUIRED_LABELLED_RECORDS",
-    "STORE_GLOB",
-    "TEXT_BLOCK_TYPES",
-    "TURN_BOUNDARY_EVENT_TYPES",
-    "_REPO_ROOT",
     "CodexAdapter",
-    "CodexIdentity",
     "CodexTierCapError",
     "RoleClassMeasurement",
-    "_event_kind",
-    "_event_msg_kind",
-    "_exec_failed",
-    "_labelled_record",
-    "_message_payload",
-    "_optional_str",
-    "_parse_record",
-    "_payload",
-    "_tool_call_id",
     "cap_codex_tier",
     "codex_role_class",
     "codex_tier_cap_lifted",
-    "load_labels",
     "load_measurement",
-    "logger",
     "measure_role_class",
     "message_role",
     "message_text",
