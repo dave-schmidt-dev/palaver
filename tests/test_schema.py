@@ -613,10 +613,21 @@ def test_a_half_migrated_database_never_overwrites_the_existing_good_backup(tmp_
         ro.close()
 
 
-def test_a_backup_is_renamed_into_place_never_left_partial(tmp_path):
+def test_a_backup_is_renamed_into_place_never_left_partial(tmp_path, monkeypatch):
+    """A crash after the snapshot is written but before the rename leaves no file at the
+    backup name for a later run to mistake for a good backup."""
     db_path = tmp_path / "palaver.db"
     migrate(db_path, migrations=(SCHEMA_MIGRATIONS[0],))
     target = tmp_path / "snapshot.bak"
+
+    def _crash(src, dst):
+        raise OSError("simulated crash before the rename")
+
+    monkeypatch.setattr("os.replace", _crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        migrate_module._take_backup(db_path, target)
+    monkeypatch.undo()
+
+    assert not target.exists()
     migrate_module._take_backup(db_path, target)
     assert target.exists()
-    assert not (tmp_path / "snapshot.bak.partial").exists()
