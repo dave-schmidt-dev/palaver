@@ -11,6 +11,7 @@ about snapshot isolation is left implicit or untested.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -35,15 +36,39 @@ def current_version(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _free_backup_path(db_path: Path, from_version: int) -> Path:
+    """Return a backup name that does not exist yet: `.bak-N`, then `.bak-N.1`, ...
+
+    An existing backup is never overwritten. A database left half-migrated by
+    a crash under an older runner sits at the old `user_version` with partial
+    DDL, so the snapshot taken of it on the next start is *worse* than the
+    `.bak-N` already on disk; replacing that file would destroy the only good
+    copy.
+    """
+    candidate = Path(f"{db_path}.bak-{from_version}")
+    suffix = 0
+    while candidate.exists():
+        suffix += 1
+        candidate = Path(f"{db_path}.bak-{from_version}.{suffix}")
+    return candidate
+
+
 def _take_backup(db_path: Path, backup_path: Path) -> None:
-    """Snapshot db_path into backup_path via `VACUUM INTO`, run to completion."""
-    if backup_path.exists():
-        backup_path.unlink()
+    """Snapshot db_path into backup_path via `VACUUM INTO`, run to completion.
+
+    The snapshot is written under a temporary name and renamed into place, so
+    a crash mid-snapshot leaves no truncated file at `backup_path` for a later
+    run to mistake for a backup.
+    """
+    partial = backup_path.with_name(backup_path.name + ".partial")
+    if partial.exists():
+        partial.unlink()
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute("VACUUM INTO ?", (str(backup_path),))
+        conn.execute("VACUUM INTO ?", (str(partial),))
     finally:
         conn.close()
+    os.replace(partial, backup_path)
 
 
 def _verify_backup(backup_path: Path) -> None:
@@ -87,13 +112,14 @@ def migrate(
 ) -> int:
     """Apply pending migrations up to target_version (default: the latest).
 
-    Each migration's statements run one at a time under autocommit, so a
-    failure partway through can leave a subset already committed to disk.
-    Before any DDL for a migration runs, this function takes a VACUUM INTO
-    backup at the migration's starting version and verifies the backup opens
-    and reads successfully. If the migration then raises, the backup is
-    restored over db_path and a MigrationError is raised from the original
-    exception.
+    Each migration's statements and its `user_version` bump run in one
+    transaction, so a failure or crash leaves the database at the old version
+    with none of the migration applied. Before any DDL for a migration runs,
+    this function takes a VACUUM INTO backup at the migration's starting
+    version (never overwriting an existing one) and verifies it opens and
+    reads. If the migration raises, the transaction is rolled back and a
+    MigrationError is raised from the original exception; the backup is
+    restored over db_path only if SQLite cannot roll back.
 
     Args:
         db_path: Path to the SQLite database file. Created if absent.
@@ -126,19 +152,41 @@ def migrate(
             continue
 
         from_version = version
-        backup_path = Path(f"{db_path}.bak-{from_version}")
+        backup_path = _free_backup_path(db_path, from_version)
         _take_backup(db_path, backup_path)
         _verify_backup(backup_path)
 
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
             conn.execute("PRAGMA foreign_keys=ON")
+            # One transaction for the DDL and the version bump (SQLite DDL and
+            # `user_version` are both transactional), so a crash can never leave
+            # partial DDL at the old version. IMMEDIATE takes the write lock
+            # up front, which serializes two processes starting at a schema bump.
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= migration.version:
+                # The other process won the race and already applied it.
+                conn.execute("ROLLBACK")
+                conn.close()
+                version = migration.version
+                continue
             for statement in migration.statements:
                 conn.execute(statement)
             conn.execute(f"PRAGMA user_version={migration.version}")
+            conn.execute("COMMIT")
         except sqlite3.Error as exc:
+            rolled_back = False
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                rolled_back = True
+            except sqlite3.Error:
+                pass
             conn.close()
-            _restore_backup(db_path, backup_path)
+            if not rolled_back:
+                # Only reached when SQLite itself could not roll back: fall
+                # back to the verified snapshot.
+                _restore_backup(db_path, backup_path)
             raise MigrationError(
                 f"migration to version {migration.version} failed and was rolled back"
             ) from exc

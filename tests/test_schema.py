@@ -536,3 +536,87 @@ def test_memory_evidence_child_foreign_key_is_deferred_not_dropped(tmp_path):
         )
     finally:
         conn.close()
+
+
+def test_failed_migration_is_rolled_back_in_place_not_restored_from_backup(tmp_path, monkeypatch):
+    """DDL and the version bump are one transaction (review 2026-10-27, finding 2).
+
+    A restore replaces the file and would discard rows another process
+    committed after the snapshot; a transactional rollback leaves the same
+    file in place.
+    """
+    db_path = tmp_path / "palaver.db"
+    v1 = SCHEMA_MIGRATIONS[0]
+    migrate(db_path, migrations=(v1,))
+    inode_before = db_path.stat().st_ino
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("restored from backup instead of rolling back")
+
+    monkeypatch.setattr(migrate_module, "_restore_backup", _fail)
+
+    broken_v2 = Migration(
+        version=2,
+        description="second statement fails",
+        statements=(
+            "CREATE TABLE half_applied (id INTEGER)",
+            "CREATE TABLE half_applied (id INTEGER)",
+        ),
+    )
+    with pytest.raises(MigrationError):
+        migrate(db_path, migrations=(v1, broken_v2))
+
+    assert db_path.stat().st_ino == inode_before
+    conn = connect(db_path)
+    try:
+        assert current_version(conn) == 1
+        assert "half_applied" not in _table_names(conn)
+    finally:
+        conn.close()
+
+
+def test_a_half_migrated_database_never_overwrites_the_existing_good_backup(tmp_path):
+    """The legacy crash state: partial DDL at the old version, good .bak-N on disk.
+
+    Previously the next start unlinked `.bak-N` and snapshotted the broken
+    database over it, then restored the broken copy over itself.
+    """
+    db_path = tmp_path / "palaver.db"
+    v1 = SCHEMA_MIGRATIONS[0]
+    migrate(db_path, migrations=(v1,))
+    good_backup = tmp_path / "palaver.db.bak-1"
+    migrate_module._take_backup(db_path, good_backup)
+    good_bytes = good_backup.read_bytes()
+
+    # Simulate the crash: the migration's first DDL landed, the version bump did not.
+    conn = connect(db_path)
+    try:
+        conn.execute("CREATE TABLE partial_ddl (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    v2 = Migration(
+        version=2,
+        description="creates the table the crash already created",
+        statements=("CREATE TABLE partial_ddl (id INTEGER)",),
+    )
+    with pytest.raises(MigrationError):
+        migrate(db_path, migrations=(v1, v2))
+
+    assert good_backup.read_bytes() == good_bytes, "the only good backup was overwritten"
+    assert (tmp_path / "palaver.db.bak-1.1").exists()
+    ro = sqlite3.connect(f"{good_backup.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        assert "partial_ddl" not in _table_names(ro)
+    finally:
+        ro.close()
+
+
+def test_a_backup_is_renamed_into_place_never_left_partial(tmp_path):
+    db_path = tmp_path / "palaver.db"
+    migrate(db_path, migrations=(SCHEMA_MIGRATIONS[0],))
+    target = tmp_path / "snapshot.bak"
+    migrate_module._take_backup(db_path, target)
+    assert target.exists()
+    assert not (tmp_path / "snapshot.bak.partial").exists()
