@@ -13,6 +13,19 @@ from typing import Any
 from .core import DEFAULT_TIMEOUT, log
 from .protocol import apply_request
 
+#: Largest request body the daemon will buffer. A correction is a sentence;
+#: a client streaming past this without a newline is broken or hostile.
+MAX_REQUEST_BYTES = 1024 * 1024
+
+#: Wall-clock budget for receiving one whole request. `settimeout` alone
+#: resets on every `recv`, so a client trickling one byte per interval would
+#: hold the single tick-loop thread forever (INV-1: a silent stall).
+REQUEST_DEADLINE_SECONDS = DEFAULT_TIMEOUT
+
+
+class _RequestTooLargeError(Exception):
+    """The request body outgrew `MAX_REQUEST_BYTES` before its newline arrived."""
+
 
 def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> bool:
     """Accept one connection, apply its request, and reply.
@@ -34,28 +47,54 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
         make the daemon's own count of what it did disagree with what is in
         the database.
     """
-    client, _ = server.accept()
+    try:
+        client, _ = server.accept()
+    except OSError as exc:
+        # EMFILE, ECONNABORTED and the like: the pending connection is lost,
+        # not the daemon.
+        log.warning("accept failed: %s", exc)
+        return False
     try:
         client.settimeout(DEFAULT_TIMEOUT)
+        deadline = time.monotonic() + REQUEST_DEADLINE_SECONDS
         chunks = []
+        received = 0
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("request not completed within its deadline")
+            client.settimeout(min(DEFAULT_TIMEOUT, remaining))
             chunk = client.recv(65536)
             if not chunk:
                 break
             chunks.append(chunk)
+            received += len(chunk)
             if chunks[-1].endswith(b"\n"):
                 break
+            if received > MAX_REQUEST_BYTES:
+                raise _RequestTooLargeError(
+                    f"request exceeds {MAX_REQUEST_BYTES} bytes without a newline"
+                )
         body = b"".join(chunks).strip()
         if not body:
             return False
 
         payload: Any = None
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as exc:
-            reply: dict = {"ok": False, "error": "JSONDecodeError", "detail": str(exc)}
+        if len(body) > MAX_REQUEST_BYTES:
+            reply: dict = {
+                "ok": False,
+                "error": "RequestTooLarge",
+                "detail": f"request exceeds {MAX_REQUEST_BYTES} bytes",
+            }
         else:
-            reply = apply_request(conn, payload)
+            try:
+                payload = json.loads(body)
+            except (ValueError, RecursionError) as exc:
+                # ValueError covers JSONDecodeError, UnicodeDecodeError and the
+                # int-digit limit; RecursionError is a deeply nested body.
+                reply = {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:200]}
+            else:
+                reply = apply_request(conn, payload)
 
         try:
             client.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
@@ -65,6 +104,16 @@ def serve_request(server: socket_module.socket, conn: sqlite3.Connection) -> boo
             # durable, and only the receipt had nowhere to go.
             log.debug("reply to %r went unread: %s", payload, exc)
         return True
+    except _RequestTooLargeError as exc:
+        log.warning("write request abandoned: %s", exc)
+        try:
+            client.sendall(
+                json.dumps({"ok": False, "error": "RequestTooLarge", "detail": str(exc)}).encode()
+                + b"\n"
+            )
+        except OSError:
+            pass
+        return False
     except (TimeoutError, ConnectionError, BrokenPipeError) as exc:
         # One client that hangs up or stalls is not the daemon's failure.
         log.warning("write request abandoned: %s", exc)

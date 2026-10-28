@@ -484,6 +484,13 @@ class ObserverDaemon:
             try:
                 self.extractor(work, conn=conn, on_status=self.on_status)
             except Exception as exc:  # noqa: BLE001 - one session must not stop the loop
+                # A partial batch left pending on the shared connection would be
+                # committed by a later session or request, minting the earlier
+                # claims twice when this session retries.
+                try:
+                    conn.rollback()
+                except sqlite3.Error as rollback_exc:
+                    self.on_status(f"tick {tick}: rollback failed: {rollback_exc}")
                 failed.append((key, f"{type(exc).__name__}: {exc}"))
                 retry_at = self.backoff.record_failure(
                     key,

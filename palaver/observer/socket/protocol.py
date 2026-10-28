@@ -59,6 +59,13 @@ def apply_request(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
         the daemon has *crashed*. Two very different situations must not
         produce the same message (INV-7).
     """
+    if not isinstance(payload, Mapping):
+        log.warning("write request refused: payload is %s, not an object", type(payload).__name__)
+        return {
+            "ok": False,
+            "error": "InvalidRequest",
+            "detail": f"a request is a JSON object, got {type(payload).__name__}",
+        }
     op = payload.get("op")
     try:
         if op not in WRITE_OPERATIONS:
@@ -74,7 +81,20 @@ def apply_request(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
         return _correct(conn, payload)
     except Exception as exc:  # noqa: BLE001 - the reply *is* the error channel
         log.warning("write request %r refused: %s", op, exc)
+        # The daemon's connection is shared with every later request and with
+        # extraction. A refusal that leaves its half-written transaction open
+        # lets the next commit persist it (wrong evidence on the next memory)
+        # or trip its deferred foreign key forever.
+        _rollback(conn)
         return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    """Discard any open transaction on `conn`; never raises."""
+    try:
+        conn.rollback()
+    except sqlite3.Error as exc:
+        log.warning("rollback after a refused request failed: %s", exc)
 
 
 def _correct(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> dict:
