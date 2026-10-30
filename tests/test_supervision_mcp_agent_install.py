@@ -304,7 +304,7 @@ def test_the_mcp_agent_service_is_reachable_from_the_real_parser(tmp_path):
     written = plistlib.loads(target.read_bytes())
     assert written["Label"] == MCP_LABEL
     assert written["ProcessType"] == "Standard"
-    assert written["ProgramArguments"][1] == "mcp"
+    assert written["ProgramArguments"][6] == "mcp"
     assert written["ProgramArguments"][-2:] == ["--port", "9999"]
 
 
@@ -331,4 +331,4 @@ def test_the_default_mcp_agent_service_is_still_the_observer(tmp_path):
 
     written = plistlib.loads(target.read_bytes())
     assert written["Label"] == OBSERVE_LABEL
-    assert written["ProgramArguments"][1] == "observe"
+    assert written["ProgramArguments"][6] == "observe"

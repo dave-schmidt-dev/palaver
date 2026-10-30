@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `palaver ui --pin` now writes the pane pin through `encode_pin`, the encoder paired with the reader's `parse_pin`, instead of a second hand-built JSON string; output bytes and error text are unchanged.
 
 ### Fixed
+- Both launchd services now capture stdout/stderr through the shared rotating-log policy, including application startup failures and newline-free floods; ordinary CLI output and MCP HTTP behavior are unchanged. Existing agents require an owner-approved reinstall/reload to adopt the templates.
 - The daemon now rolls back its shared SQLite connection after a refused write request and after a failed extraction, so a refused correction can no longer leave evidence rows pending that attach to the next memory or wedge every later commit.
 - The write socket now caps a request at 1 MiB, bounds total receive time per request, and answers non-object, invalid-UTF-8 and deeply nested bodies with an error reply instead of crashing the observer.
 - Schema migrations now run each migration and its `user_version` bump in one transaction, never overwrite an existing `.bak-N`, and write backups under a temporary name before renaming; a crash mid-migration can no longer destroy the only good backup.

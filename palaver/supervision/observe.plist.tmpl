@@ -61,9 +61,10 @@ ${PROGRAM_ARGUMENTS}
 	<key>WorkingDirectory</key>
 	<string>${WORKING_DIRECTORY}</string>
 
+	<!-- The capture process owns bounded logs; launchd must not append files. -->
 	<key>StandardOutPath</key>
-	<string>${STDOUT_PATH}</string>
+	<string>/dev/null</string>
 	<key>StandardErrorPath</key>
-	<string>${STDERR_PATH}</string>
+	<string>/dev/null</string>
 </dict>
 </plist>

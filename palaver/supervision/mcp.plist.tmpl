@@ -95,15 +95,16 @@ ${PROGRAM_ARGUMENTS}
 
 	<!--
 	  launchd starts jobs in `/`. The server anchors its own log file to the
-	  project root by module path, but its stdout/stderr are launchd's to
-	  place, and relative paths here would land in the filesystem root.
+	  project root by module path. The capture process uses the explicit
+	  output destinations supplied in ProgramArguments.
 	-->
 	<key>WorkingDirectory</key>
 	<string>${WORKING_DIRECTORY}</string>
 
+	<!-- The capture process owns bounded logs; launchd must not append files. -->
 	<key>StandardOutPath</key>
-	<string>${STDOUT_PATH}</string>
+	<string>/dev/null</string>
 	<key>StandardErrorPath</key>
-	<string>${STDERR_PATH}</string>
+	<string>/dev/null</string>
 </dict>
 </plist>

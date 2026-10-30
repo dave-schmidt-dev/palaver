@@ -13,6 +13,16 @@ from pathlib import Path
 #: the project per repo convention, and keeps `.logs/` in its existing
 #: gitignored spot when running from within the repo.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MAX_LOG_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 5
+
+
+def rotating_handler(path: Path) -> logging.handlers.RotatingFileHandler:
+    """Create the shared bounded file sink for app and supervised output."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return logging.handlers.RotatingFileHandler(
+        path, maxBytes=MAX_LOG_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+    )
 
 
 def setup_logging(debug: bool = False) -> logging.Logger:
@@ -42,11 +52,7 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     # Remove any existing handlers to avoid duplicates
     logger.handlers.clear()
 
-    handler = logging.handlers.RotatingFileHandler(
-        str(log_file),
-        maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=5,
-    )
+    handler = rotating_handler(log_file)
     handler.setLevel(level)
 
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")

@@ -268,6 +268,30 @@ agent's blocking tool call. `Adaptive` is not an option for it: launchd
 promotes an Adaptive job out of Background on *XPC* activity, and this one
 speaks HTTP, so it would stay throttled forever.
 
+Both agent templates run the same bounded output capture before the service
+imports. It uses `logging_setup.rotating_handler`: each existing
+`<label>.out.log` and `<label>.err.log` retains at most 10 MiB plus five
+backups (60 MiB per stream). Output is drained without waiting for a newline;
+UTF-8 is preserved and invalid bytes become replacement characters. Startup
+errors, progress, and exit status stay in the stderr log. The application log
+keeps its existing WARNING/default and DEBUG behavior. Ordinary CLI stdout and
+the MCP HTTP endpoint are unchanged. The launchd PID now names the capture
+process, which forwards SIGTERM/SIGINT and exits with the child's status.
+
+Existing installed plists do not change automatically. At an owner-approved
+service maintenance window, save each installed plist, update the checkout
+first, then regenerate each service with `install-agent --service observe` or
+`install-agent --service mcp` using its original flags. Reload only after
+reviewing the rendered arguments. Validate each service's progress/error log
+and observer tick or MCP client query after reload. Both services can migrate
+independently; MCP clients need no configuration changes. To roll back, unload
+the new job and restore/reload the saved plist before reverting the checkout.
+Historical `.gz` logs are retained; pre-existing oversized active logs/backups
+age out through rotation and are not retroactively truncated. Interpreter or
+capture-module startup failures before logging is available require launchd
+status diagnostics; they cannot grow redirected files because the templates
+send the capture process's own streams to `/dev/null`.
+
 `--host` accepts `127.0.0.0/8` and nothing else — not `0.0.0.0`, not a LAN
 address, not `localhost`, and not `::1`. Both `palaver mcp` and
 `install-agent --service mcp` refuse anything else rather than binding it,

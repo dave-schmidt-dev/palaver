@@ -107,7 +107,7 @@ RESTART_WINDOW_SECONDS = 2.0 * THROTTLE_INTERVAL_SECONDS + 5.0
 #: enough that `--reload` does not appear to hang.
 UNLOAD_WINDOW_SECONDS = 10.0
 
-#: Where launchd's captured stdout and stderr land. `.logs/` is the repo's
+#: Where the supervised capture's stdout and stderr logs land. `.logs/` is the repo's
 #: gitignored log directory, which is what the daemon's own file handler
 #: already uses; putting launchd's streams anywhere else would split one
 #: process's output across two conventions.
@@ -299,8 +299,8 @@ def render_plist(
     Args:
         label: launchd label, which is also the plist's filename.
         program_arguments: argv launchd runs; must be non-empty.
-        stdout_path: Where launchd writes the job's stdout.
-        stderr_path: Where launchd writes the job's stderr.
+        stdout_path: Where the bounded capture writes the job's stdout.
+        stderr_path: Where the bounded capture writes the job's stderr.
         working_directory: Directory the job starts in.
         throttle_interval: Seconds launchd waits before a restart.
         template_path: Template to render, for tests that supply their own.
@@ -330,8 +330,13 @@ def render_plist(
             f"cannot read the agent template at {template_path}: {exc}"
         ) from exc
 
+    # Capture before the app imports: even dependency/startup failures rotate.
+    supervised_argv = [
+        sys.executable, "-m", "palaver.supervision.output",
+        str(stdout_path), str(stderr_path), *program_arguments,
+    ]
     argv_block = "\n".join(
-        f"\t\t<string>{escape(argument)}</string>" for argument in program_arguments
+        f"\t\t<string>{escape(argument)}</string>" for argument in supervised_argv
     )
     return template.substitute(
         LABEL=escape(label),
@@ -589,7 +594,7 @@ def add_arguments(parser) -> None:
         "--log-dir",
         type=Path,
         default=None,
-        help=f"directory for launchd's captured streams (default: {DEFAULT_LOG_DIR})",
+        help=f"directory for bounded captured streams (default: {DEFAULT_LOG_DIR})",
     )
     parser.add_argument(
         "--plist-path",

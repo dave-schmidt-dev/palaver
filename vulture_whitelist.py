@@ -59,3 +59,5 @@ wait_for_new_pid  # unused function (palaver/cli/install_agent.py:457)
 reset_library_state  # unused function (palaver/ui/connection.py:256)
 request_cookie_and_key  # unused function (palaver/ui/connection.py:166)
 prune_ephemeral  # unused function (palaver/store/rollup.py:191)
+_.handleError  # logging.Handler calls this override when a supervised sink write fails.
+_.terminator  # logging.StreamHandler.emit reads this to preserve partial output lines.
